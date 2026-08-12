@@ -55,6 +55,8 @@ type Config struct {
 	ScMaxBufferedPosts   string // server only
 	ScMaxEachPostBytes   string
 	ScMinPostsIntervalMs string
+	HTTPVersion          string // server only: "auto"|"1.1"|"2"|"3" (h3 = QUIC/HTTP3)
+	H3WeakNetwork        bool   // server only: tune QUIC for lossy networks
 	ReuseConfig          *ReuseConfig
 	DownloadConfig       *Config
 }
@@ -72,6 +74,27 @@ func (c *Config) NormalizedMode() string {
 		return "auto"
 	}
 	return c.Mode
+}
+
+// HTTPVersionToUse resolves the HTTP version the server should use, based on the
+// configured HTTPVersion and whether TLS is present. Mirrors upstream dev1 so
+// the standalone inbound (and vless/xhttp) can pick HTTP/3 (QUIC).
+func (c *Config) HTTPVersionToUse(hasTLS bool) string {
+	v := strings.TrimSpace(strings.ToLower(c.HTTPVersion))
+	if v == "" || v == "auto" {
+		if hasTLS {
+			return "2"
+		}
+		return "1.1"
+	}
+	switch v {
+	case "3", "h3":
+		return "3"
+	case "2", "h2":
+		return "2"
+	default:
+		return "1.1"
+	}
 }
 
 func (c *Config) EffectiveMode(hasReality bool) string {

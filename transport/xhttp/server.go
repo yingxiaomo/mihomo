@@ -15,6 +15,9 @@ import (
 	N "github.com/metacubex/mihomo/common/net"
 
 	"github.com/metacubex/http"
+	"github.com/metacubex/quic-go"
+	http3 "github.com/metacubex/quic-go/http3"
+	"github.com/metacubex/tls"
 )
 
 type ServerOption struct {
@@ -521,4 +524,79 @@ func equalHost(a, b string) bool {
 	}
 
 	return a == b
+}
+
+// HTTP/3 (QUIC) tuning defaults. Inspired by Hysteria2's QUIC profile.
+const (
+	DefaultH3KeepAlivePeriod         = 10 * time.Second
+	DefaultH3MaxIdleTimeout          = 45 * time.Second
+	DefaultH3InitStreamReceiveWindow = 8 * 1024 * 1024
+	DefaultH3MaxStreamReceiveWindow  = 8 * 1024 * 1024
+	DefaultH3InitConnReceiveWindow   = 20 * 1024 * 1024
+	DefaultH3MaxConnReceiveWindow    = 20 * 1024 * 1024
+)
+
+func resolveH3KeepAlive(keepAlive time.Duration, weakNetwork bool) time.Duration {
+	period := DefaultH3KeepAlivePeriod
+	if keepAlive > 0 && keepAlive < period {
+		period = keepAlive
+	}
+	if weakNetwork && period > 8*time.Second {
+		period = 8 * time.Second
+	}
+	if period <= 0 {
+		period = DefaultH3KeepAlivePeriod
+	}
+	return period
+}
+
+func resolveH3MaxIdleTimeout(keepAlive time.Duration, weakNetwork bool) time.Duration {
+	idle := DefaultH3MaxIdleTimeout
+	if keepAlive > 0 && keepAlive*2 > idle {
+		idle = keepAlive * 2
+	}
+	if weakNetwork && idle < time.Minute {
+		idle = time.Minute
+	}
+	return idle
+}
+
+// NewHTTP3Server builds an HTTP/3 (QUIC) server backed by the same xhttp
+// requestHandler used for HTTP/1.1 and HTTP/2. h3 requires a *tls.Config
+// (QUIC mandates TLS 1.3) and the listener must be a net.PacketConn.
+func NewHTTP3Server(config Config, connHandler func(net.Conn), tlsCfg *tls.Config) (*http3.Server, error) {
+	if tlsCfg == nil {
+		tlsCfg = &tls.Config{
+			MinVersion: tls.VersionTLS13,
+		}
+	}
+	if tlsCfg.MinVersion < tls.VersionTLS13 {
+		tlsCfg.MinVersion = tls.VersionTLS13
+	}
+	if len(tlsCfg.NextProtos) == 0 {
+		tlsCfg.NextProtos = []string{"h3"}
+	}
+	handler, err := NewServerHandler(ServerOption{
+		Config:      config,
+		ConnHandler: connHandler,
+	})
+	if err != nil {
+		return nil, err
+	}
+	weakNetwork := config.H3WeakNetwork
+	quicCfg := &quic.Config{
+		InitialStreamReceiveWindow:     DefaultH3InitStreamReceiveWindow,
+		MaxStreamReceiveWindow:         DefaultH3MaxStreamReceiveWindow,
+		InitialConnectionReceiveWindow: DefaultH3InitConnReceiveWindow,
+		MaxConnectionReceiveWindow:     DefaultH3MaxConnReceiveWindow,
+		KeepAlivePeriod:                resolveH3KeepAlive(0, weakNetwork),
+		MaxIdleTimeout:                 resolveH3MaxIdleTimeout(0, weakNetwork),
+		DisablePathMTUDiscovery:        weakNetwork,
+		MaxIncomingStreams:             1024,
+	}
+	return &http3.Server{
+		Handler:    handler,
+		TLSConfig:  tlsCfg,
+		QUICConfig: quicCfg,
+	}, nil
 }
