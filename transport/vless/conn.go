@@ -166,7 +166,7 @@ func newConn(conn net.Conn, client *Client, dst *DstAddr) (net.Conn, error) {
 
 	if client.Addons != nil {
 		switch client.Addons.Flow {
-		case XRV:
+		case XRV, XRVU:
 			visionConn, err := vision.NewConn(c, conn, c.id)
 			if err != nil {
 				return nil, err

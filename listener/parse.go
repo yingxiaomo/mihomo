@@ -107,6 +107,13 @@ func ParseListener(mapping map[string]any) (C.InboundListener, error) {
 			return nil, err
 		}
 		listener, err = IN.NewTrojan(trojanOption)
+	case "naive":
+		naiveOption := &IN.NaiveOption{}
+		err = decoder.Decode(mapping, naiveOption)
+		if err != nil {
+			return nil, err
+		}
+		listener, err = IN.NewNaive(naiveOption)
 	case "xhttp":
 		xhttpOption := &IN.XhttpOption{}
 		err = decoder.Decode(mapping, xhttpOption)

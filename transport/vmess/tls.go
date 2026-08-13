@@ -31,6 +31,7 @@ type TLSConfig struct {
 	JLS               *jls.Config
 	Reality           *tlsC.RealityConfig
 	TLSMirror         *tlsmirror.Config
+	TLSFragment       *TLSFragmentConfig
 	TLSMirrorDialer   tlsmirror.EnrollmentDialer
 }
 
@@ -49,6 +50,11 @@ func (cfg *TLSConfig) ToStdConfig() (*tls.Config, error) {
 }
 
 func StreamTLSConn(ctx context.Context, conn net.Conn, cfg *TLSConfig) (net.Conn, error) {
+	if cfg.TLSFragment != nil && cfg.Reality == nil {
+		conn = newTLSFragmentConn(conn, cfg.TLSFragment)
+	}
+
+
 	if cfg.ShadowTLS != nil {
 		alpn := cfg.NextProtos
 		if alpn == nil {

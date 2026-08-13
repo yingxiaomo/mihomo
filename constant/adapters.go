@@ -55,6 +55,7 @@ const (
 	Tailscale
 	ZeroTier
 	GostRelay
+	Naive
 )
 
 const (
@@ -66,6 +67,8 @@ const (
 )
 
 var ErrNotSupport = errors.New("no support")
+
+var ErrProxyUnsupported = errors.New("proxy type is not included in this build")
 
 type Connection interface {
 	Chains() Chain
@@ -242,6 +245,8 @@ func (at AdapterType) String() string {
 		return "ZeroTier"
 	case GostRelay:
 		return "GostRelay"
+	case Naive:
+		return "Naive"
 	case Relay:
 		return "Relay"
 	case Selector:

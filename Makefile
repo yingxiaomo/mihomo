@@ -12,7 +12,27 @@ VERSION=$(shell git rev-parse --short HEAD)
 endif
 
 BUILDTIME=$(shell date -u)
-GOBUILD=CGO_ENABLED=0 go build -tags with_gvisor -trimpath -ldflags '-X "github.com/metacubex/mihomo/constant.Version=$(VERSION)" \
+
+# Default build is fully static (no cronet), so binaries run anywhere including
+# musl systems (OpenWrt/Alpine). Naive INBOUND is pure Go and always available.
+# Naive OUTBOUND needs cronet (Chromium, C++) and is opt-in in two flavours:
+#
+#   make WITH_CRONET=1 <target>   purego: dlopens libcronet.so at runtime,
+#                                 CGO-free but requires glibc + the library file.
+#   make WITH_MUSL=1 <target>     musl: links libcronet.a statically, needs
+#                                 CGO=1 and the Chromium toolchain (see
+#                                 cronet-go's build-naive), but the result has
+#                                 no runtime dependency and runs on OpenWrt.
+NAIVE_TAGS=
+CGO=0
+ifeq ($(WITH_CRONET),1)
+NAIVE_TAGS=with_naive_cronet with_purego
+endif
+ifeq ($(WITH_MUSL),1)
+NAIVE_TAGS=with_naive_cronet with_musl
+CGO=1
+endif
+GOBUILD=CGO_ENABLED=$(CGO) go build -tags "with_gvisor $(NAIVE_TAGS)" -trimpath -ldflags '-X "github.com/metacubex/mihomo/constant.Version=$(VERSION)" \
 		-X "github.com/metacubex/mihomo/constant.BuildTime=$(BUILDTIME)" \
 		-w -s -buildid='
 

@@ -48,6 +48,7 @@ type Vmess struct {
 	restlsConfig    *restls.Config
 	jlsConfig       *jls.Config
 	realityConfig   *tlsC.RealityConfig
+	tlsFragment     *mihomoVMess.TLSFragmentConfig
 }
 
 type VmessOption struct {
@@ -86,6 +87,7 @@ type VmessOption struct {
 	GlobalPadding       bool             `proxy:"global-padding,omitempty"`
 	AuthenticatedLength bool             `proxy:"authenticated-length,omitempty"`
 	ClientFingerprint   string           `proxy:"client-fingerprint,omitempty"`
+	TLSFragment         TLSFragmentOptions `proxy:"tls-fragment,omitempty"`
 }
 
 type MKCPOptions struct {
@@ -360,6 +362,7 @@ func (v *Vmess) streamTLSConn(ctx context.Context, conn net.Conn, isH2 bool) (ne
 			Restls:            v.restlsConfig,
 			JLS:               v.jlsConfig,
 			Reality:           v.realityConfig,
+				TLSFragment:       v.tlsFragment,
 			NextProtos:        v.option.ALPN,
 			TLSMirror:         v.option.TLSMirrorOpts.Build(),
 			TLSMirrorDialer:   proxydialer.New(v, false).DialContext,
@@ -526,6 +529,11 @@ func NewVmess(option VmessOption) (*Vmess, error) {
 	if err != nil {
 		return nil, err
 	}
+	v.tlsFragment, err = v.option.TLSFragment.Build()
+	if err != nil {
+		return nil, fmt.Errorf("invalid tls-fragment: %w", err)
+	}
+
 	v.realityConfig, err = v.option.RealityOpts.Parse()
 	if err != nil {
 		return nil, err
@@ -625,6 +633,7 @@ func NewVmess(option VmessOption) (*Vmess, error) {
 				Restls:            v.restlsConfig,
 				JLS:               v.jlsConfig,
 				Reality:           v.realityConfig,
+				TLSFragment:       v.tlsFragment,
 				TLSMirror:         option.TLSMirrorOpts.Build(),
 				TLSMirrorDialer:   proxydialer.New(v, false).DialContext,
 			}

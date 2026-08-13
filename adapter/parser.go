@@ -167,6 +167,13 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 			break
 		}
 		proxy, err = outbound.NewMieru(*mieruOption)
+	case "naive":
+		naiveOption := &outbound.NaiveOption{BasicOption: basicOption}
+		err = decoder.Decode(mapping, naiveOption)
+		if err != nil {
+			break
+		}
+		proxy, err = outbound.NewNaive(*naiveOption)
 	case "anytls":
 		anytlsOption := &outbound.AnyTLSOption{BasicOption: basicOption}
 		err = decoder.Decode(mapping, anytlsOption)

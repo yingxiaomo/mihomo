@@ -52,6 +52,7 @@ type Vless struct {
 	restlsConfig    *restls.Config
 	jlsConfig       *jls.Config
 	realityConfig   *tlsC.RealityConfig
+	tlsFragment     *vmess.TLSFragmentConfig
 }
 
 type VlessOption struct {
@@ -87,6 +88,7 @@ type VlessOption struct {
 	PrivateKey        string            `proxy:"private-key,omitempty"`
 	ServerName        string            `proxy:"servername,omitempty"`
 	ClientFingerprint string            `proxy:"client-fingerprint,omitempty"`
+	TLSFragment       TLSFragmentOptions `proxy:"tls-fragment,omitempty"`
 }
 
 type XHTTPOptions struct {
@@ -319,6 +321,7 @@ func (v *Vless) streamTLSConn(ctx context.Context, conn net.Conn, isH2 bool) (ne
 			Restls:            v.restlsConfig,
 			JLS:               v.jlsConfig,
 			Reality:           v.realityConfig,
+				TLSFragment:       v.tlsFragment,
 			NextProtos:        v.option.ALPN,
 		}
 
@@ -528,6 +531,11 @@ func NewVless(option VlessOption) (*Vless, error) {
 	if err != nil {
 		return nil, err
 	}
+	v.tlsFragment, err = v.option.TLSFragment.Build()
+	if err != nil {
+		return nil, fmt.Errorf("invalid tls-fragment: %w", err)
+	}
+
 	v.realityConfig, err = v.option.RealityOpts.Parse()
 	if err != nil {
 		return nil, err
@@ -595,6 +603,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 				Restls:            v.restlsConfig,
 				JLS:               v.jlsConfig,
 				Reality:           v.realityConfig,
+				TLSFragment:       v.tlsFragment,
 			}
 			if option.ServerName == "" {
 				host, _, _ := net.SplitHostPort(v.addr)
@@ -681,6 +690,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 						ClientFingerprint: v.option.ClientFingerprint,
 						ECH:               v.echConfig,
 						Reality:           v.realityConfig,
+				TLSFragment:       v.tlsFragment,
 						NextProtos:        []string{"h3"},
 					}
 					if v.option.ServerName != "" {
@@ -841,6 +851,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 								Restls:            downloadRestlsConfig,
 								JLS:               downloadJLSConfig,
 								Reality:           downloadRealityCfg,
+								TLSFragment:       v.tlsFragment,
 								NextProtos:        downloadALPN,
 							}
 
@@ -869,6 +880,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 							ClientFingerprint: downloadClientFingerprint,
 							ECH:               downloadEchConfig,
 							Reality:           downloadRealityCfg,
+								TLSFragment:       v.tlsFragment,
 							NextProtos:        []string{"h3"},
 						}
 						if downloadServerName != "" {
