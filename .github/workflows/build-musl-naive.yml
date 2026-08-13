@@ -34,12 +34,13 @@ jobs:
     strategy:
       fail-fast: false
       # All musl targets cronet-go's build-naive supports (openwrt musl
-      # toolchains). mips64le and mipsle are intentionally absent: neither has a
-      # usable musl path in cronet-go — mips64le has no musl clang target, and
-      # mipsle's prebuilt libcronet.a is hard-float while the openwrt musl
-      # toolchain is soft-float, so linking always fails with an FP ABI mismatch.
+      # toolchains). amd64-v1/v2/v3 and arm 5/6/7 reuse the same chromium
+      # toolchain (GOAMD64/GOARM are a Go-link-time concern), so we build every
+      # variant the main Build workflow ships on linux. mips/mips64 (big-endian),
+      # s390x and ppc64le are absent: cronet's allTargets has no entry for them,
+      # so chromium cannot cross-compile libcronet for those CPUs.
       matrix:
-        arch: [amd64, amd64-v2, amd64-v3, arm64, 386, arm, loong64, riscv64]
+        arch: [amd64, amd64-v2, amd64-v3, arm64, arm5, arm6, arm7, 386, mipsle, mips64le, loong64, riscv64]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -113,8 +114,10 @@ jobs:
           set -xeuo pipefail
           cd ~/cronet-go
           TARGET_ARCH="${{ matrix.arch }}"
-          # Map v2/v3 back to base arch for Chromium toolchain fetch
+          # Map Go arch variants (amd64-v2/v3, arm5/6/7) back to the base
+          # chromium target: they reuse one toolchain each.
           if [[ "$TARGET_ARCH" == amd64* ]]; then TARGET_ARCH="amd64"; fi
+          if [[ "$TARGET_ARCH" == arm* ]]; then TARGET_ARCH="arm"; fi
           go run ./cmd/build-naive --target=linux/${TARGET_ARCH} --libc=musl download-toolchain
         shell: bash
 
@@ -124,6 +127,7 @@ jobs:
           cd ~/cronet-go
           TARGET_ARCH="${{ matrix.arch }}"
           if [[ "$TARGET_ARCH" == amd64* ]]; then TARGET_ARCH="amd64"; fi
+          if [[ "$TARGET_ARCH" == arm* ]]; then TARGET_ARCH="arm"; fi
           go run ./cmd/build-naive --target=linux/${TARGET_ARCH} --libc=musl env >> $GITHUB_ENV
         shell: bash
 
@@ -149,6 +153,14 @@ jobs:
           elif [[ "$TARGET_ARCH" == "amd64-v3" ]]; then
             export GOARCH="amd64"
             export GOAMD64="v3"
+          elif [[ "$TARGET_ARCH" == arm* ]]; then
+            export GOARCH="arm"
+            export GOARM="${TARGET_ARCH#arm}"
+          elif [[ "$TARGET_ARCH" == "mipsle" ]]; then
+            # cronet's prebuilt libcronet.a for mipsel is hard-float, so pin
+            # GOMIPS to match or linking fails with an FP ABI mismatch.
+            export GOARCH="mipsle"
+            export GOMIPS="hardfloat"
           fi
 
           go env
