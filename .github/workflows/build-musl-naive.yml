@@ -1,0 +1,232 @@
+name: Build musl-naive
+
+# Standalone workflow for the static musl+naive binaries. Split out of the main
+# Build workflow so the heavyweight Chromium musl cross-toolchain builds (one
+# per architecture) never hold up or break the regular release, and so users who
+# only need the naive outbound can grab the binaries from their own tag
+# (naive-musl-<branch>) instead of the main prerelease page.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag version to release"
+        required: false
+  push:
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+      - ".github/ISSUE_TEMPLATE/**"
+    branches:
+      - dev
+      - dev-smart
+
+concurrency:
+  group: "musl-naive-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-musl-naive:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # All musl targets cronet-go's build-naive supports (openwrt musl
+      # toolchains). mips64le and mipsle are intentionally absent: neither has a
+      # usable musl path in cronet-go — mips64le has no musl clang target, and
+      # mipsle's prebuilt libcronet.a is hard-float while the openwrt musl
+      # toolchain is soft-float, so linking always fails with an FP ABI mismatch.
+      matrix:
+        arch: [amd64, amd64-v2, amd64-v3, arm64, 386, arm, loong64, riscv64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: '1.26'
+
+      - name: Set variables
+        run: |
+          VERSION="${GITHUB_REF_NAME,,}-smart-$(git rev-parse --short HEAD)"
+          VERSION="${VERSION//\//-}"
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION=${{ github.event.inputs.version }}
+          fi
+          FILE_VERSION="smart-$(git rev-parse --short HEAD)"
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            FILE_VERSION="${VERSION}"
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "FILE_VERSION=${FILE_VERSION}" >> $GITHUB_ENV
+          echo "BUILDTIME=$(date)" >> $GITHUB_ENV
+          echo "GOTOOLCHAIN=local" >> $GITHUB_ENV
+          # Pin cronet-go to the exact commit go.mod depends on, so the toolchain
+          # matches the prebuilt libcronet.a the go module resolves to. go.mod's
+          # pseudo-version only carries a 12-char SHA, but `git fetch <sha>` needs
+          # the full 40-char one, so expand it through the API.
+          CRONET_SHORT=$(grep 'sagernet/cronet-go ' go.mod | head -1 | awk '{print $2}' | sed 's/.*-//')
+          CRONET_GO_VERSION=$(curl -fsSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/sagernet/cronet-go/commits/${CRONET_SHORT}" | jq -r .sha)
+          if [ -z "$CRONET_GO_VERSION" ] || [ "$CRONET_GO_VERSION" = "null" ]; then
+            echo "failed to resolve cronet-go commit ${CRONET_SHORT}" >&2
+            exit 1
+          fi
+          echo "CRONET_GO_VERSION=${CRONET_GO_VERSION}" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Clone cronet-go
+        run: |
+          set -xeuo pipefail
+          git init ~/cronet-go
+          git -C ~/cronet-go remote add origin https://github.com/sagernet/cronet-go.git
+          git -C ~/cronet-go fetch --depth=1 origin "$CRONET_GO_VERSION"
+          git -C ~/cronet-go checkout FETCH_HEAD
+          git -C ~/cronet-go submodule update --init --recursive --depth=1
+        shell: bash
+
+      - name: Cache Chromium toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/cronet-go/naiveproxy/src/third_party/llvm-build/
+            ~/cronet-go/naiveproxy/src/gn/out/
+            ~/cronet-go/naiveproxy/src/chrome/build/pgo_profiles/
+            ~/cronet-go/naiveproxy/src/out/sysroot-build/
+          key: chromium-toolchain-${{ matrix.arch }}-musl-${{ env.CRONET_GO_VERSION }}
+
+      - name: Regenerate Debian keyring
+        run: |
+          set -xeuo pipefail
+          rm -f ~/cronet-go/naiveproxy/src/build/linux/sysroot_scripts/keyring.gpg
+          cd ~/cronet-go
+          GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh
+        shell: bash
+
+      - name: Download Chromium toolchain
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          TARGET_ARCH="${{ matrix.arch }}"
+          # Map v2/v3 back to base arch for Chromium toolchain fetch
+          if [[ "$TARGET_ARCH" == amd64* ]]; then TARGET_ARCH="amd64"; fi
+          go run ./cmd/build-naive --target=linux/${TARGET_ARCH} --libc=musl download-toolchain
+        shell: bash
+
+      - name: Set Chromium toolchain environment
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          TARGET_ARCH="${{ matrix.arch }}"
+          if [[ "$TARGET_ARCH" == amd64* ]]; then TARGET_ARCH="amd64"; fi
+          go run ./cmd/build-naive --target=linux/${TARGET_ARCH} --libc=musl env >> $GITHUB_ENV
+        shell: bash
+
+      - name: Update CA
+        run: |
+          sudo apt-get update && sudo apt-get install ca-certificates
+          sudo update-ca-certificates
+          cp -f /etc/ssl/certs/ca-certificates.crt component/ca/ca-certificates.crt
+
+      - name: Build core (musl + naive)
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+        run: |
+          set -xeuo pipefail
+
+          # Handle Go arch variants
+          TARGET_ARCH="${{ matrix.arch }}"
+          export GOARCH="$TARGET_ARCH"
+          if [[ "$TARGET_ARCH" == "amd64-v2" ]]; then
+            export GOARCH="amd64"
+            export GOAMD64="v2"
+          elif [[ "$TARGET_ARCH" == "amd64-v3" ]]; then
+            export GOARCH="amd64"
+            export GOAMD64="v3"
+          fi
+
+          go env
+          go build -v -tags "with_gvisor with_naive_cronet with_musl" -trimpath \
+            -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
+          # Fail loudly if the result is not static: the whole point of this
+          # variant is running on musl systems with no runtime dependency.
+          file mihomo
+          file mihomo | grep -q "statically linked"
+          cp mihomo mihomo-linux-${{ matrix.arch }}-musl-naive
+          gzip -c mihomo-linux-${{ matrix.arch }}-musl-naive > naive-mihomo-linux-${{ matrix.arch }}-musl-${FILE_VERSION}.gz
+          rm mihomo-linux-${{ matrix.arch }}-musl-naive
+        shell: bash
+
+      - name: Archive production artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: "linux-${{ matrix.arch }}-musl-naive"
+          path: |
+            naive-mihomo*.gz
+
+  Upload-naive-musl:
+    permissions: write-all
+    if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' && github.ref_type == 'branch' }}
+    needs: [build-musl-naive]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download all musl-naive artifacts
+      uses: actions/download-artifact@v8
+      with:
+        path: bin/
+        merge-multiple: true
+
+    - name: Calculate checksums
+      run: |
+        cd bin/
+        find . -type f -not -name "checksums.*" | sort | xargs sha256sum > checksums.txt
+        cat checksums.txt
+      shell: bash
+
+    - name: Delete current release assets
+      uses: 8Mi-Tech/delete-release-assets-action@main
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        tag: naive-musl-${{ github.ref_name }}
+        deleteOnlyFromDrafts: false
+
+    - name: Set Env
+      run: |
+        echo "BUILDTIME=$(TZ=Asia/Shanghai date)" >> $GITHUB_ENV
+      shell: bash
+
+    - name: Tag Repo
+      uses: richardsimko/update-tag@v1
+      with:
+        tag_name: naive-musl-${{ github.ref_name }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - run: |
+        cat > release.txt << 'EOF'
+        **[naive-musl]** 本 tag 仅发布静态 **musl + NaïveProxy 出站** 二进制。
+        静态编译、内置 cronet（保留 Chromium TLS 指纹），OpenWrt/Alpine 及 glibc 系统均可直接运行，无运行时依赖。
+
+        常规二进制（含或不含 naive 入站、不含 naive 出站）在主发布页：
+        https://github.com/yingxiaomo/mihomo/releases
+
+        构建时间：${{ env.BUILDTIME }}
+        同步 ${{ github.ref_name }} 分支代码更新，仅保留最新版本
+        EOF
+
+    - name: Upload naive-musl release
+      uses: softprops/action-gh-release@v3
+      if: ${{ success() }}
+      with:
+        tag_name: naive-musl-${{ github.ref_name }}
+        name: "Mihomo ${{ github.ref_name }} musl + Naive outbound"
+        files: |
+          bin/naive-mihomo-*.gz
+        prerelease: true
+        body_path: release.txt
