@@ -18,6 +18,7 @@ import (
 	"github.com/metacubex/mihomo/component/resource"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 
 	"github.com/dlclark/regexp2"
@@ -448,6 +449,13 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 
 				proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(tunnel), adapter.WithProviderName(pdName))
 				if err != nil {
+					// A subscription may carry protocols this binary was not built
+					// with. Those are the provider's business, not the user's, so
+					// drop just that proxy instead of the whole subscription.
+					if errors.Is(err, C.ErrProxyUnsupported) {
+						log.Warnln("[Provider] %s: skip proxy %d (%s): %v", pdName, idx, name, err)
+						continue
+					}
 					return nil, fmt.Errorf("proxy %d error: %w", idx, err)
 				}
 

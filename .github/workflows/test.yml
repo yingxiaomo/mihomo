@@ -29,13 +29,11 @@ jobs:
           - 'windows-11-arm' # arm64 windows
           - 'macos-26-intel' # amd64 macos
         go-version:
+          # go.mod (via golang.org/x/*) requires Go >= 1.24, so older toolchains
+          # cannot build the module and were removed from the test matrix.
           - '1.26'
           - '1.25'
           - '1.24'
-          - '1.23'
-          - '1.22'
-          - '1.21'
-          - '1.20'
       fail-fast: false
     runs-on: ${{ matrix.os }}
     defaults:

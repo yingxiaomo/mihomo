@@ -106,33 +106,9 @@ jobs:
           - { goos: windows, goarch: amd64, goamd64: v2, output: amd64-v2-go124, goversion: '1.24' }
           - { goos: windows, goarch: amd64, goamd64: v3, output: amd64-v3-go124, goversion: '1.24' }
 
-          # Go 1.23 with special patch can work on Windows 7
-          # https://github.com/MetaCubeX/go/commits/release-branch.go1.23/
-          - { goos: windows, goarch: '386', output: '386-go123', goversion: '1.23' }
-          - { goos: windows, goarch: amd64, goamd64: v1, output: amd64-v1-go123, goversion: '1.23' }
-          - { goos: windows, goarch: amd64, goamd64: v2, output: amd64-v2-go123, goversion: '1.23' }
-          - { goos: windows, goarch: amd64, goamd64: v3, output: amd64-v3-go123, goversion: '1.23' }
-
-          # Go 1.22 with special patch can work on Windows 7
-          # https://github.com/MetaCubeX/go/commits/release-branch.go1.22/
-          - { goos: windows, goarch: '386', output: '386-go122', goversion: '1.22' }
-          - { goos: windows, goarch: amd64, goamd64: v1, output: amd64-v1-go122, goversion: '1.22' }
-          - { goos: windows, goarch: amd64, goamd64: v2, output: amd64-v2-go122, goversion: '1.22' }
-          - { goos: windows, goarch: amd64, goamd64: v3, output: amd64-v3-go122, goversion: '1.22' }
-
-          # Go 1.21 can revert commit `9e4385` to work on Windows 7
-          # https://github.com/golang/go/issues/64622#issuecomment-1847475161
-          # (OR we can just use golang1.21.4 which unneeded any patch)
-          - { goos: windows, goarch: '386', output: '386-go121', goversion: '1.21' }
-          - { goos: windows, goarch: amd64, goamd64: v1, output: amd64-v1-go121, goversion: '1.21' }
-          - { goos: windows, goarch: amd64, goamd64: v2, output: amd64-v2-go121, goversion: '1.21' }
-          - { goos: windows, goarch: amd64, goamd64: v3, output: amd64-v3-go121, goversion: '1.21' }
-
-          # Go 1.20 is the last release that will run on any release of Windows 7, 8, Server 2008 and Server 2012. Go 1.21 will require at least Windows 10 or Server 2016.
-          - { goos: windows, goarch: '386', output: '386-go120', goversion: '1.20' }
-          - { goos: windows, goarch: amd64, goamd64: v1, output: amd64-v1-go120, goversion: '1.20' }
-          - { goos: windows, goarch: amd64, goamd64: v2, output: amd64-v2-go120, goversion: '1.20' }
-          - { goos: windows, goarch: amd64, goamd64: v3, output: amd64-v3-go120, goversion: '1.20' }
+          # Older Go (1.20-1.23) Windows targets were removed: the golang.org/x/*
+          # dependencies now require Go 1.24, which those toolchains cannot build.
+          # Windows 7 remains covered by the patched go1.24 / go1.25 builds above.
 
           # Go 1.24 is the last release that will run on macOS 11 Big Sur. Go 1.25 will require macOS 12 Monterey or later.
           - { goos: darwin, goarch: arm64, output: arm64-go124, goversion: '1.24' }
@@ -140,29 +116,10 @@ jobs:
           - { goos: darwin, goarch: amd64, goamd64: v2, output: amd64-v2-go124, goversion: '1.24' }
           - { goos: darwin, goarch: amd64, goamd64: v3, output: amd64-v3-go124, goversion: '1.24' }
 
-          # Go 1.22 is the last release that will run on macOS 10.15 Catalina. Go 1.23 will require macOS 11 Big Sur or later.
-          - { goos: darwin, goarch: arm64, output: arm64-go122, goversion: '1.22' }
-          - { goos: darwin, goarch: amd64, goamd64: v1, output: amd64-v1-go122, goversion: '1.22' }
-          - { goos: darwin, goarch: amd64, goamd64: v2, output: amd64-v2-go122, goversion: '1.22' }
-          - { goos: darwin, goarch: amd64, goamd64: v3, output: amd64-v3-go122, goversion: '1.22' }
-
-          # Go 1.20 is the last release that will run on macOS 10.13 High Sierra or 10.14 Mojave. Go 1.21 will require macOS 10.15 Catalina or later.
-          - { goos: darwin, goarch: arm64, output: arm64-go120, goversion: '1.20' }
-          - { goos: darwin, goarch: amd64, goamd64: v1, output: amd64-v1-go120, goversion: '1.20' }
-          - { goos: darwin, goarch: amd64, goamd64: v2, output: amd64-v2-go120, goversion: '1.20' }
-          - { goos: darwin, goarch: amd64, goamd64: v3, output: amd64-v3-go120, goversion: '1.20' }
-
-          # Go 1.23 is the last release that requires Linux kernel version 2.6.32 or later. Go 1.24 will require Linux kernel version 3.2 or later.
-          - { goos: linux, goarch: '386', output: '386-go123', goversion: '1.23' }
-          - { goos: linux, goarch: amd64, goamd64: v1, output: amd64-v1-go123, goversion: '1.23', test: test }
-          - { goos: linux, goarch: amd64, goamd64: v2, output: amd64-v2-go123, goversion: '1.23' }
-          - { goos: linux, goarch: amd64, goamd64: v3, output: amd64-v3-go123, goversion: '1.23' }
-
-          # only for test
-          - { goos: linux, goarch: '386', output: '386-go120', goversion: '1.20' }
-          - { goos: linux, goarch: amd64, goamd64: v1, output: amd64-v1-go120, goversion: '1.20', test: test }
-          - { goos: linux, goarch: amd64, goamd64: v2, output: amd64-v2-go120, goversion: '1.20' }
-          - { goos: linux, goarch: amd64, goamd64: v3, output: amd64-v3-go120, goversion: '1.20' }
+          # Older Go (1.20-1.23) darwin and linux targets were removed for the same
+          # reason as the Windows ones above: golang.org/x/* now requires Go 1.24,
+          # which those toolchains cannot build. "go test" still runs via the
+          # default-toolchain amd64-v1 entry above and the separate Test workflow.
 
     steps:
     - uses: actions/checkout@v6
@@ -203,7 +160,15 @@ jobs:
           VERSION=${{ github.event.inputs.version }}
           PackageVersion="${VERSION#v}"
         fi
+        # Release assets are listed in upload order, so with ~90 files the only
+        # thing that makes them scannable is a short name: keep the full VERSION
+        # for the binary's -v output, but suffix filenames with just smart-<sha>.
+        FILE_VERSION="smart-$(git rev-parse --short HEAD)"
+        if [ -n "${{ github.event.inputs.version }}" ]; then
+          FILE_VERSION="${VERSION}"
+        fi
         echo "VERSION=${VERSION}" >> $GITHUB_ENV
+        echo "FILE_VERSION=${FILE_VERSION}" >> $GITHUB_ENV
         echo "PackageVersion=${PackageVersion}-smart" >> $GITHUB_ENV
       
         echo "BUILDTIME=$(date)" >> $GITHUB_ENV
@@ -253,10 +218,10 @@ jobs:
         go build -v -tags "with_gvisor" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
         if [ "${{matrix.jobs.goos}}" = "windows" ]; then
           cp mihomo.exe mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe
-          zip -r mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.zip mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe
+          zip -r mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${FILE_VERSION}.zip mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe
         else
           cp mihomo mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}
-          gzip -c mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}} > mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.gz
+          gzip -c mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}} > mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${FILE_VERSION}.gz
           rm mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}
         fi
 
@@ -269,7 +234,7 @@ jobs:
 
         fpm -t deb \
           -v "${PackageVersion}" \
-          -p "mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.deb" \
+          -p "mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${FILE_VERSION}.deb" \
           --architecture ${{ matrix.jobs.debian }} \
           mihomo=/usr/bin/mihomo
 
@@ -282,7 +247,7 @@ jobs:
 
         fpm -t rpm \
           -v "${PackageVersion}" \
-          -p "mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.rpm" \
+          -p "mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${FILE_VERSION}.rpm" \
           --architecture ${{ matrix.jobs.rpm }} \
           mihomo=/usr/bin/mihomo
 
@@ -296,7 +261,7 @@ jobs:
 
         fpm -t pacman \
           -v "${PackageVersion}" \
-          -p "mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.pkg.tar.zst" \
+          -p "mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${FILE_VERSION}.pkg.tar.zst" \
           --architecture ${{ matrix.jobs.pacman }} \
           mihomo=/usr/bin/mihomo
 
@@ -315,10 +280,14 @@ jobs:
         go mod vendor
         tar -czf $GITHUB_WORKSPACE/vendor.tar.gz vendor
 
-    - name: Save version
-      run: |
-        echo ${VERSION} > version.txt
-      shell: bash
+    - name: Archive toolchain artifacts
+      if: ${{ matrix.jobs.goversion == '' && matrix.jobs.tarball == 'tarball' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: toolchain-vendor
+        path: |
+          toolchain.tar.gz
+          vendor.tar.gz
 
     - name: Archive production artifacts
       uses: actions/upload-artifact@v7
@@ -330,14 +299,15 @@ jobs:
           mihomo*.rpm
           mihomo*.pkg.tar.zst
           mihomo*.zip
-          toolchain.tar.gz
-          vendor.tar.gz
-          version.txt
-          checksums.txt
 
+  # NaiveProxy OUTBOUND needs cronet (Chromium's network stack), which is C++ and
+  # cannot be built with CGO_ENABLED=0. The musl variant links libcronet.a
+  # statically, so unlike the glibc/purego variants the result has no runtime
+  # dependency and runs on musl systems (OpenWrt/Alpine) as well as glibc ones.
+  # Mirrors sing-box's musl+naive build (its own OpenWrt/Alpine target).
   Upload-Prerelease:
     permissions: write-all
-    if: ${{ github.event_name != 'workflow_dispatch' && github.ref_type == 'branch' && !startsWith(github.event_name, 'pull_request') }}
+    if: ${{ !cancelled() && needs.build.result == 'success' && github.event_name != 'workflow_dispatch' && github.ref_type == 'branch' && !startsWith(github.event_name, 'pull_request') }}
     needs: [build]
     runs-on: ubuntu-latest
     steps:
@@ -350,7 +320,7 @@ jobs:
     - name: Calculate checksums
       run: |
         cd bin/
-        find . -type f -not -name "checksums.*" -not -name "version.txt" | sort | xargs sha256sum > checksums.txt
+        find . -type f -not -name "checksums.*" | sort | xargs sha256sum > checksums.txt
         cat checksums.txt
       shell: bash
 
@@ -374,18 +344,20 @@ jobs:
       
     - run: |
         cat > release.txt << 'EOF'
-        **[声明]** 本分支是在上游代码的基础上增加Smart策略组功能，关于Smart策略组的任何问题均与上游无关!
-        **[Announcement]** This branch is based on the upstream code to add Smart Groups functionality, any questions about Smart Groups are not related to the upstream!
+        **[声明]** 本分支是在上游代码的基础上增加Smart策略组功能，关于Smart策略组的任何问题均与上游无关！
 
-        Release created at  ${{ env.BUILDTIME }}
-        Synchronize ${{ github.ref_name }} branch code updates, keeping only the latest version
+        构建时间：${{ env.BUILDTIME }}
+        同步 ${{ github.ref_name }} 分支代码更新，仅保留最新版本
         <br>
-        [我应该下载哪个文件? / Which file should I download?](https://github.com/MetaCubeX/mihomo/wiki/FAQ)
-        [二进制文件筛选 / Binary file selector](https://metacubex.github.io/Meta-Docs/startup/#_1)
-        [查看文档 / Docs](https://metacubex.github.io/Meta-Docs/)
+        [我应该下载哪个文件？](https://github.com/MetaCubeX/mihomo/wiki/FAQ)
+        [二进制文件筛选](https://metacubex.github.io/Meta-Docs/startup/#_1)
+        [查看文档](https://metacubex.github.io/Meta-Docs/)
 
-        [Smart 策略组使用 / Smart Group Introduce](https://github.com/vernesong/OpenClash/releases/tag/mihomo)
+        [Smart 策略组使用说明](https://github.com/vernesong/OpenClash/releases/tag/mihomo)
 
+        **NaiveProxy 说明：** 常规二进制为**静态编译**，任意 Linux 都能跑（含 OpenWrt/Alpine），**包含 naive 入站、不含 naive 出站**。
+        需要 naive **出站**（客户端）请前往**独立构建页**下载：https://github.com/yingxiaomo/mmihos/releases/tag/naive-musl-${{ github.ref_name }}
+        同样静态、无运行时依赖、内置 cronet（保留 Chromium TLS 指纹），OpenWrt/Alpine 可直接使用。
         EOF
 
     - name: Upload Prerelease
@@ -395,14 +367,23 @@ jobs:
         tag_name: Prerelease-${{ github.ref_name }}
         name: "Mihomo ${{ github.ref_name }} with Smart Group"
         files: |
-          bin/*
+          bin/mihomo-android-*.gz
+          bin/mihomo-darwin-*.gz
+          bin/mihomo-darwin-*.zip
+          bin/mihomo-freebsd-*.gz
+          bin/mihomo-freebsd-*.zip
+          bin/mihomo-linux-*.gz
+          bin/mihomo-linux-*.deb
+          bin/mihomo-linux-*.rpm
+          bin/mihomo-linux-*.pkg.tar.zst
+          bin/mihomo-windows-*.zip
         prerelease: true
         generate_release_notes: true
         body_path: release.txt
 
   Upload-Release:
     permissions: write-all
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
+    if: ${{ !cancelled() && needs.build.result == 'success' && github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
     needs: [build]
     runs-on: ubuntu-latest
     steps:
@@ -450,106 +431,28 @@ jobs:
       - name: Display structure of downloaded files
         run: ls -R
         working-directory: bin
+
+      - name: Calculate checksums
+        run: |
+          cd bin/
+          find . -type f -not -name "checksums.*" | sort | xargs sha256sum > checksums.txt
+          cat checksums.txt
+        shell: bash
   
       - name: Upload Release
         uses: softprops/action-gh-release@v3
         if: ${{ success() }}
         with:
           tag_name: ${{ github.event.inputs.version }}
-          files: bin/*
+          files: |
+            bin/mihomo-android-*.gz
+            bin/mihomo-darwin-*.gz
+            bin/mihomo-darwin-*.zip
+            bin/mihomo-freebsd-*.gz
+            bin/mihomo-freebsd-*.zip
+            bin/mihomo-linux-*.gz
+            bin/mihomo-linux-*.deb
+            bin/mihomo-linux-*.rpm
+            bin/mihomo-linux-*.pkg.tar.zst
+            bin/mihomo-windows-*.zip
           body_path: release.md
-
-  Docker:
-    if: ${{ !startsWith(github.event_name, 'pull_request') }}
-    permissions: write-all
-    needs: [build]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - uses: actions/download-artifact@v8
-        with:
-          path: bin/
-          merge-multiple: true
-
-      - name: Display structure of downloaded files
-        run: ls -R
-        working-directory: bin
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      - name: Setup Docker buildx
-        uses: docker/setup-buildx-action@v4
-        with:
-          version: latest
-      
-      # Extract metadata (tags, labels) for Docker
-      # https://github.com/docker/metadata-action
-      - name: Extract Docker metadata
-        if: ${{ github.event_name != 'workflow_dispatch' }}
-        id: meta_alpha
-        uses: docker/metadata-action@v6
-        with:
-          images: '${{ env.REGISTRY }}/${{ github.repository }}'
-      
-      # Extract metadata (tags, labels) for Docker
-      # https://github.com/docker/metadata-action
-      - name: Extract Docker metadata
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
-        id: meta_release
-        uses: docker/metadata-action@v6
-        with:
-          images: '${{ env.REGISTRY }}/${{ github.repository }}'
-          tags: |
-            ${{ github.event.inputs.version }}
-          flavor: |
-            latest=true
-          labels: org.opencontainers.image.version=${{ github.event.inputs.version }}
-      
-      - name: Show files
-        run: |
-          ls .
-          ls bin/
-      
-      - name: login to docker REGISTRY
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Build and push Docker image with Buildx (don't push on PR)
-      # https://github.com/docker/build-push-action
-      - name: Build and push Docker image
-        if: ${{ github.event_name != 'workflow_dispatch' }}
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ./Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          platforms: |
-            linux/386
-            linux/amd64
-            linux/arm64
-            linux/arm/v7
-          tags: ${{ steps.meta_alpha.outputs.tags }}
-          labels: ${{ steps.meta_alpha.outputs.labels }}
-      
-      - name: Build and push Docker image
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ./Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          platforms: |
-            linux/386
-            linux/amd64
-            linux/arm64
-            linux/arm/v7
-          tags: ${{ steps.meta_release.outputs.tags }}
-          labels: ${{ steps.meta_release.outputs.labels }}
