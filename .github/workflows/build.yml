@@ -12,11 +12,15 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
     branches:
       - Alpha
+      - dev
+      - dev-smart
     tags:
       - "v*"
   pull_request:
     branches:
       - Alpha
+      - dev
+      - dev-smart
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
   cancel-in-progress: true

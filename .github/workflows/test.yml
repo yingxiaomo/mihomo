@@ -7,11 +7,15 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
     branches:
       - Alpha
+      - dev
+      - dev-smart
     tags:
       - "v*"
   pull_request:
     branches:
       - Alpha
+      - dev
+      - dev-smart
 
 jobs:
   test:
