@@ -36,11 +36,13 @@ jobs:
       # All musl targets cronet-go's build-naive supports (openwrt musl
       # toolchains). amd64-v1/v2/v3 and arm 5/6/7 reuse the same chromium
       # toolchain (GOAMD64/GOARM are a Go-link-time concern), so we build every
-      # variant the main Build workflow ships on linux. mips/mips64 (big-endian),
-      # s390x and ppc64le are absent: cronet's allTargets has no entry for them,
-      # so chromium cannot cross-compile libcronet for those CPUs.
+      # variant the main Build workflow ships on linux. mips64le and mips/mips64
+      # (big-endian), s390x and ppc64le are absent: cronet-go's getOpenwrtConfig
+      # has no mips64el entry (OpenWrt ships no musl mips64le SDK), and the other
+      # ISAs have no allTargets entry at all, so chromium cannot cross-compile
+      # libcronet for those CPUs.
       matrix:
-        arch: [amd64, amd64-v2, amd64-v3, arm64, arm5, arm6, arm7, 386, mipsle, mips64le, loong64, riscv64]
+        arch: [amd64, amd64-v2, amd64-v3, arm64, arm5, arm6, arm7, 386, mipsle, loong64, riscv64]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -157,10 +159,11 @@ jobs:
             export GOARCH="arm"
             export GOARM="${TARGET_ARCH#arm}"
           elif [[ "$TARGET_ARCH" == "mipsle" ]]; then
-            # cronet's prebuilt libcronet.a for mipsel is hard-float, so pin
-            # GOMIPS to match or linking fails with an FP ABI mismatch.
+            # cronet-go builds its musl mipsel libcronet from the OpenWrt ramips
+            # SDK (mipsel_24kc = MIPS32R2 soft-float), so pin GOMIPS to softfloat
+            # to match or linking fails with an FP ABI mismatch.
             export GOARCH="mipsle"
-            export GOMIPS="hardfloat"
+            export GOMIPS="softfloat"
           fi
 
           go env
