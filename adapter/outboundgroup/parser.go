@@ -222,6 +222,13 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 			return nil, err
 		}
 		return NewSmart(groupOption, opt, emptyFallback, providers)
+	case "smart-pld":
+		opt := SmartPLDOption{}
+		err = decoder.Decode(config, &opt)
+		if err != nil {
+			return nil, err
+		}
+		return NewSmartPLD(groupOption, opt, emptyFallback, providers)
 	default:
 		return nil, fmt.Errorf("%w: %s", errType, groupOption.Type)
 	}

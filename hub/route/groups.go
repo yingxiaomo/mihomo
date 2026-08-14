@@ -100,8 +100,15 @@ func getGroupDelay(w http.ResponseWriter, r *http.Request) {
 
 func getGroupWeights(w http.ResponseWriter, r *http.Request) {
 	proxy := r.Context().Value(CtxKeyProxy).(C.Proxy)
-	smartGroup, ok := proxy.Adapter().(*outboundgroup.Smart)
-	if !ok {
+	var configName, groupName string
+	switch a := proxy.Adapter().(type) {
+	case *outboundgroup.Smart:
+		configName = a.GetConfigFilename()
+		groupName = a.Name()
+	case *outboundgroup.SmartPLD:
+		configName = a.GetConfigFilename()
+		groupName = a.Name()
+	default:
 		log.Debugln("[Smart] Failed to request weight ranking: Not a Smart group (actual type: %T)", proxy.Adapter())
 		render.Status(r, http.StatusBadRequest)
 		render.JSON(w, r, render.M{
@@ -110,9 +117,6 @@ func getGroupWeights(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-
-	configName := smartGroup.GetConfigFilename()
-	groupName := smartGroup.Name()
 
 	smartStore := cachefile.GetSmartStore()
 	if smartStore == nil {
@@ -170,13 +174,17 @@ func getAllGroupWeights(w http.ResponseWriter, r *http.Request) {
 	)
 
 	for _, p := range tunnel.Proxies() {
-		sg, ok := p.Adapter().(*outboundgroup.Smart)
-		if !ok {
+		var configName, groupName string
+		switch a := p.Adapter().(type) {
+		case *outboundgroup.Smart:
+			configName = a.GetConfigFilename()
+			groupName = a.Name()
+		case *outboundgroup.SmartPLD:
+			configName = a.GetConfigFilename()
+			groupName = a.Name()
+		default:
 			continue
 		}
-
-		configName := sg.GetConfigFilename()
-		groupName := sg.Name()
 
 		wg.Add(1)
 		sem <- struct{}{}

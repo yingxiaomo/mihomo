@@ -31,6 +31,7 @@ const (
 	URLTest
 	LoadBalance
 	Smart
+	SmartPLD
 
 	Shadowsocks
 	ShadowsocksR
@@ -259,6 +260,8 @@ func (at AdapterType) String() string {
 		return "LoadBalance"
 	case Smart:
 		return "Smart"
+	case SmartPLD:
+		return "SmartPLD"
 	default:
 		return "Unknown"
 	}

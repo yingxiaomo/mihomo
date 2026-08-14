@@ -541,10 +541,16 @@ func updateIPTables(cfg *config.Config) {
 
 func closeSmart() {
 	for _, proxy := range tunnel.Proxies() {
-		if proxy.Type() == C.Smart {
+		switch proxy.Type() {
+		case C.Smart:
 			adapter := proxy.Adapter()
 			if smart, ok := adapter.(*outboundgroup.Smart); ok {
 				smart.Close()
+			}
+		case C.SmartPLD:
+			adapter := proxy.Adapter()
+			if pld, ok := adapter.(*outboundgroup.SmartPLD); ok {
+				pld.Close()
 			}
 		}
 	}

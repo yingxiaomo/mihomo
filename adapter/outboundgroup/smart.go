@@ -959,7 +959,7 @@ func (s *Smart) cleanupOrphanedGroups() {
 	existingSmartGroups := make(map[string]bool)
 
 	for name, proxy := range allProxies {
-		if proxy.Type() == C.Smart {
+		if proxy.Type() == C.Smart || proxy.Type() == C.SmartPLD {
 			existingSmartGroups[name] = true
 		}
 	}
