@@ -260,3 +260,10 @@ func (p *path) SmartModel() string {
 	}
 	return P.Join(p.homeDir, "Model.bin")
 }
+
+// SmartPriorModel returns the PLD prior model path. Kept separate from the
+// official weight model (Model.bin): the two models use different feature
+// orders and must not share one file.
+func (p *path) SmartPriorModel() string {
+	return P.Join(p.homeDir, "PriorModel.bin")
+}

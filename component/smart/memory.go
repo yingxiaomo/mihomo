@@ -234,17 +234,45 @@ func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber
 		names[i] = p.Name()
 	}
 
-	// SmartTarget (same ruleset = same node)
+	// SmartTarget (same ruleset = same node)。merge 而非覆盖：连接成功只
+	// 并入本次节点，不挤掉已有候选——否则 unwrap 缓存长期只剩最近成功的
+	// 单节点，PLD 重排无候选可选（日志恒 Rank(1)）。union 去重后长度有界
+	// (≤ 组内节点数)，TTL 600s 自动过期。
 	targetKey := FormatDBKey(config, group, target)
-	unwrapCache.Set(targetKey, UnwrapMap{Proxies: names})
+	merged := names
+	if existing, found := unwrapCache.Get(targetKey); found && len(existing.Proxies) > 0 {
+		merged = mergeProxyNames(existing.Proxies, names)
+	}
+	unwrapCache.Set(targetKey, UnwrapMap{Proxies: merged})
 
-	// ASN sharing (CDN excluded): first-writer-wins
+	// ASN sharing (CDN excluded): first-writer-wins（保持原语义，避免
+	// 共享 ASN 的候选列表被每个域名都塞一份）
 	if asnNumber != "" && !CdnASNs[asnNumber] {
 		asnKey := FormatDBKey(config, group, asnNumber)
 		if existing, _, found := unwrapCache.GetWithExpire(asnKey); !found || len(existing.Proxies) == 0 {
 			unwrapCache.Set(asnKey, UnwrapMap{Proxies: names})
 		}
 	}
+}
+
+// mergeProxyNames merges two node-name lists, deduplicated, preserving the
+// existing order first then appending unseen incoming names.
+func mergeProxyNames(existing, incoming []string) []string {
+	seen := make(map[string]struct{}, len(existing)+len(incoming))
+	out := make([]string, 0, len(existing)+len(incoming))
+	for _, n := range existing {
+		if _, ok := seen[n]; !ok {
+			seen[n] = struct{}{}
+			out = append(out, n)
+		}
+	}
+	for _, n := range incoming {
+		if _, ok := seen[n]; !ok {
+			seen[n] = struct{}{}
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 func (s *Store) GetUnwrapResult(group, config, target, asnNumber string, wildcardTarget string) (proxies []string, expired bool) {
