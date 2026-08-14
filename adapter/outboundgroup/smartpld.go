@@ -20,6 +20,7 @@ import (
 	"github.com/dlclark/regexp2"
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/callback"
+	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/common/xsync"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/geodata"
@@ -87,6 +88,10 @@ type SmartPLD struct {
 	// under the independent "pld:" key namespace of the shared smart.db.
 	pldRecordMu    sync.Mutex
 	pldRecordCache map[string]*smart.PLDRecord
+
+	// healthChecking guards the proactive group-wide URLTest so concurrent
+	// first connections don't fire duplicate full-group probes.
+	healthChecking atomic.Bool
 }
 
 func NewSmartPLD(option GroupCommonOption, smartOption SmartPLDOption, emptyFallback C.Proxy, providers []provider.ProxyProvider) (*SmartPLD, error) {
@@ -920,6 +925,10 @@ func (s *SmartPLD) InitSmart() {
 	})
 
 	s.startTimedTask(10*time.Minute, cleanupInterval, "Group orphaned nodes clean up", s.cleanupOrphanedNodeCache, true)
+	// Proactive group-wide health check: prime every node's delay/alive state
+	// right after startup (5s) and keep it fresh (5min), so cold-start routing
+	// never falls back to blind selection over untested nodes.
+	s.startTimedTask(5*time.Second, 5*time.Minute, "Group nodes health check", s.runPLDHealthCheck, false)
 	s.startTimedTask(5*time.Minute, prefetchInterval, "Group targets prefetch", s.runPrefetch, false)
 	s.startTimedTask(5*time.Minute, checkInterval, "Group nodes stable check", s.checkNodesStable, false)
 	s.startTimedTask(5*time.Minute, rankingInterval, "Group nodes Ranking", s.updateNodeRanking, false)
@@ -954,6 +963,42 @@ func (s *SmartPLD) InitSmart() {
 		log.Infoln("[PLD] group %s enabled (prior=%.2f decayK=%.1f explore=%.2f)",
 			s.Name(), s.priorWeight, s.priorDecayK, s.exploreStrength)
 	}
+}
+
+// runPLDHealthCheck proactively measures every node's delay against the group
+// test URL so filterProxies' AliveForTestUrl gate has real data to work with.
+// Without it, a cold-start group (or a group whose providers were never lazily
+// tested) filters out every node and falls back to blind alphabetical selection.
+// The measured delays also let LastDelayForTestUrl return sane values that the
+// defaultSort tie-breaks and the PLD-Track trail can rely on.
+func (s *SmartPLD) runPLDHealthCheck() {
+	if s.healthChecking.Load() {
+		return
+	}
+	s.healthChecking.Store(true)
+	defer s.healthChecking.Store(false)
+
+	expected, _ := utils.NewUnsignedRanges[uint16](s.expectedStatus)
+	// NewUnsignedRanges returns (range, error) — call through the same shape the
+	// parser uses; empty expectedStatus is fine (matches any non-error response).
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.testTimeout)*time.Millisecond+30*time.Second)
+	defer cancel()
+
+	mp, err := s.URLTest(ctx, s.testUrl, expected)
+	if err != nil {
+		log.Debugln("[PLD] group %s health check: %v", s.Name(), err)
+		return
+	}
+	aliveCnt, timeoutCnt := 0, 0
+	for _, d := range mp {
+		if d > 0 && d < 0xffff {
+			aliveCnt++
+		} else {
+			timeoutCnt++
+		}
+	}
+	log.Debugln("[PLD] group %s health check done: %d alive, %d timeout (of %d)",
+		s.Name(), aliveCnt, timeoutCnt, len(mp))
 }
 
 // task run after tunnel.Running
