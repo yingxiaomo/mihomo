@@ -77,7 +77,7 @@ type TrojanSSOption struct {
 
 func (t *Trojan) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.Metadata) (_ net.Conn, err error) {
 	switch t.option.Network {
-	case "ws":
+	case "ws", "httpupgrade":
 		host, port, _ := net.SplitHostPort(t.addr)
 
 		wsOpts := &vmess.WebsocketConfig{

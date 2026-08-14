@@ -109,6 +109,10 @@ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy m
 		wsOpts["path"] = query.Get("path")
 		wsOpts["headers"] = headers
 
+		if network == "httpupgrade" {
+			wsOpts["v2ray-http-upgrade"] = true
+		}
+
 		if earlyData := query.Get("ed"); earlyData != "" {
 			med, err := strconv.Atoi(earlyData)
 			if err != nil {

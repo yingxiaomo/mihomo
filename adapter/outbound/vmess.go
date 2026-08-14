@@ -175,7 +175,7 @@ type WSOptions struct {
 
 func (v *Vmess) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.Metadata) (_ net.Conn, err error) {
 	switch v.option.Network {
-	case "ws":
+	case "ws", "httpupgrade":
 		host, port, _ := net.SplitHostPort(v.addr)
 		wsOpts := &mihomoVMess.WebsocketConfig{
 			Host:                     host,
