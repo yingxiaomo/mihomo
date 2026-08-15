@@ -283,3 +283,36 @@ func TestConvertsV2RayVmessBase64HTTPRemappedToH2Transport(t *testing.T) {
 	_, err = adapter.ParseProxy(proxies[0])
 	assert.NoError(t, err)
 }
+
+func TestConvertsV2RayVlessHTTPUpgrade(t *testing.T) {
+	vlessTest := "vless://uuid@example.com:443?security=tls&type=httpupgrade&host=cdn.example.com&path=%2Fupgrade#vless-httpupgrade"
+
+	proxies, err := ConvertsV2Ray([]byte(vlessTest))
+
+	assert.Nil(t, err)
+	assert.Len(t, proxies, 1)
+	assert.Equal(t, "httpupgrade", proxies[0]["network"])
+	wsOpts := proxies[0]["ws-opts"].(map[string]any)
+	assert.Equal(t, true, wsOpts["v2ray-http-upgrade"])
+	assert.Equal(t, "/upgrade", wsOpts["path"])
+	assert.Equal(t, "cdn.example.com", wsOpts["headers"].(map[string]any)["Host"])
+
+	_, err = adapter.ParseProxy(proxies[0])
+	assert.NoError(t, err)
+}
+
+func TestConvertsV2RayVlessHTTPUpgradeFastOpen(t *testing.T) {
+	vlessTest := "vless://uuid@example.com:443?security=tls&type=httpupgrade&host=cdn.example.com&path=%2Fupgrade&ed=256#vless-httpupgrade-fastopen"
+
+	proxies, err := ConvertsV2Ray([]byte(vlessTest))
+
+	assert.Nil(t, err)
+	assert.Len(t, proxies, 1)
+	assert.Equal(t, "httpupgrade", proxies[0]["network"])
+	wsOpts := proxies[0]["ws-opts"].(map[string]any)
+	assert.Equal(t, true, wsOpts["v2ray-http-upgrade"])
+	assert.Equal(t, true, wsOpts["v2ray-http-upgrade-fast-open"])
+
+	_, err = adapter.ParseProxy(proxies[0])
+	assert.NoError(t, err)
+}
