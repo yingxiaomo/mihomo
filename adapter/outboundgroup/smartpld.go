@@ -578,6 +578,27 @@ func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, na
 
 	checkNodeUsed := make(map[string]bool, len(names)+len(wtFailNodes))
 
+	// softFailed marks nodes whose PLD reward EMA for this target is negative:
+	// they have been failing recently (e.g. Cloudflare-fronted nodes that cannot
+	// reach certain destinations) even though url-test still reports them alive.
+	// Unwrap/pool candidates that keep selecting such nodes cause per-request
+	// timeouts and connection churn, so exclude them from both the ranked names
+	// and the fill-up pool (the full fallbackAll keeps them as a last resort).
+	softFailed := func(name string) bool {
+		if !s.usePLD {
+			return false
+		}
+		target := metadata.SmartTarget
+		if target == "" {
+			target = wildcardTarget
+		}
+		rec := s.getPLDRecord(target, name)
+		if rec.SampleCount < 2 {
+			return false // keep cold / exploratory nodes
+		}
+		return rec.Reward < 0
+	}
+
 	selected := make([]C.Proxy, 0, minCount+1)
 	var failedSelected []C.Proxy
 
@@ -585,6 +606,9 @@ func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, na
 		checkNodeUsed[name] = true
 		proxy := proxyByName[name]
 		if proxy == nil || blockedNodes[name] || !proxy.AliveForTestUrl(s.testUrl) || (isUDP && !proxy.SupportUDP()) {
+			continue
+		}
+		if softFailed(name) {
 			continue
 		}
 		w := 0.0
@@ -690,6 +714,9 @@ func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, na
 			continue
 		}
 		if !p.AliveForTestUrl(s.testUrl) || (isUDP && !p.SupportUDP()) {
+			continue
+		}
+		if softFailed(name) {
 			continue
 		}
 		filteredAll = append(filteredAll, p)
