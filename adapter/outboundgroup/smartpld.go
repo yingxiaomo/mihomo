@@ -297,65 +297,116 @@ func (s *SmartPLD) DialContext(ctx context.Context, metadata *C.Metadata) (C.Con
 
 	proxies, asnNumber := s.selectProxies(metadata, s.GetProxies(true))
 
-	return tryDial(proxies, asnNumber)
+	// The unwrap cache pins the previously-selected single node. If that node
+	// just went down (it stays "alive" until the next health check marks it
+	// dead), the first attempt has no other candidate to fall back to and every
+	// request fails. Drop the stale unwrap result and re-select over the full
+	// healthy pool before giving up.
+	conn, err := tryDial(proxies, asnNumber)
+	if err != nil && !tunnel.ShouldStopRetry(err) && len(proxies) < maxSelected {
+		fallbackProxies := s.selectProxiesFull(metadata, s.GetProxies(true))
+		if len(fallbackProxies) > len(proxies) {
+			log.Debugln("[PLD] group [%s] target [%s]: %d-candidate selection failed (%v), retrying over %d-node full pool",
+				s.Name(), metadata.SmartTarget, len(proxies), err, len(fallbackProxies))
+			fallbackConn, fallbackErr := tryDial(fallbackProxies, asnNumber)
+			if fallbackErr == nil {
+				return fallbackConn, nil
+			}
+			if !tunnel.ShouldStopRetry(fallbackErr) {
+				err = fallbackErr
+			}
+		}
+	}
+
+	return conn, err
 }
 
-func (s *SmartPLD) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (pc C.PacketConn, err error) {
-	var finalErr error
+// selectProxiesFull bypasses the unwrap / prefetch / best-node caches and builds
+// a candidate list from the entire healthy proxy pool. Used as a fallback when a
+// short (unwrap-pinned, single-node) candidate list fails to connect.
+func (s *SmartPLD) selectProxiesFull(metadata *C.Metadata, proxies []C.Proxy) []C.Proxy {
+	wildcardTarget := smart.GetEffectiveTarget(metadata.Host, metadata.DstIP.String())
+	isUDP := metadata.NetWork == C.UDP
+	return s.filterProxies(metadata, wildcardTarget, nil, nil, proxies, maxSelected, isUDP)
+}
+
+func (s *SmartPLD) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
+	tryPacket := func(proxies []C.Proxy, asnNumber string) (C.PacketConn, error) {
+		var finalErr error
+		limit := len(proxies)
+		if limit > maxSelected {
+			limit = maxSelected
+		}
+
+		singleProxyRetry := (len(proxies) == 1)
+
+		for i := 0; i < limit; i++ {
+			proxy := proxies[i]
+			attempts := 1
+			if singleProxyRetry {
+				attempts = maxRetries
+			}
+
+			for a := 0; a < attempts; a++ {
+				historyConnectTime := s.getHistoryConnectStats(metadata, proxy)
+				var timeout time.Duration
+				if historyConnectTime > 0 {
+					timeout = time.Duration(float64(historyConnectTime)*connectThreshold) * time.Millisecond
+				}
+				if timeout > C.DefaultUDPTimeout || timeout <= 0 {
+					timeout = C.DefaultUDPTimeout
+				}
+				ctxDial, cancel := context.WithTimeout(ctx, timeout)
+				start := time.Now()
+				pc, err := proxy.ListenPacketContext(ctxDial, metadata)
+				cancel()
+				connectTime := time.Since(start).Milliseconds()
+
+				if err != nil {
+					if tunnel.ShouldStopRetry(err) {
+						return nil, err
+					}
+					finalErr = err
+					go s.recordConnectionStats(metadata, proxy, connectTime, 0, 0, 0, 0, 0, 0, nil, 0, err)
+					continue
+				}
+
+				s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{proxy})
+				s.closeSameConnection(metadata, proxy.Name(), metadata.SmartTarget, asnNumber, false)
+				return s.WrapPacketConnWithMetric(pc, proxy, metadata, connectTime), nil
+			}
+
+			if singleProxyRetry {
+				break
+			}
+		}
+
+		s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
+
+		return nil, finalErr
+	}
 
 	proxies, asnNumber := s.selectProxies(metadata, s.GetProxies(true))
 
-	limit := len(proxies)
-	if limit > maxSelected {
-		limit = maxSelected
-	}
-
-	singleProxyRetry := (len(proxies) == 1)
-
-	for i := 0; i < limit; i++ {
-		proxy := proxies[i]
-		attempts := 1
-		if singleProxyRetry {
-			attempts = maxRetries
-		}
-
-		for a := 0; a < attempts; a++ {
-			historyConnectTime := s.getHistoryConnectStats(metadata, proxy)
-			var timeout time.Duration
-			if historyConnectTime > 0 {
-				timeout = time.Duration(float64(historyConnectTime)*connectThreshold) * time.Millisecond
+	// Same single-node unwrap-cache pitfall as DialContext: fall back to the
+	// full healthy pool when the pinned node cannot establish a packet conn.
+	pc, err := tryPacket(proxies, asnNumber)
+	if err != nil && !tunnel.ShouldStopRetry(err) && len(proxies) < maxSelected {
+		fallbackProxies := s.selectProxiesFull(metadata, s.GetProxies(true))
+		if len(fallbackProxies) > len(proxies) {
+			log.Debugln("[PLD] group [%s] target [%s]: %d-candidate UDP selection failed (%v), retrying over %d-node full pool",
+				s.Name(), metadata.SmartTarget, len(proxies), err, len(fallbackProxies))
+			fallbackPC, fallbackErr := tryPacket(fallbackProxies, asnNumber)
+			if fallbackErr == nil {
+				return fallbackPC, nil
 			}
-			if timeout > C.DefaultUDPTimeout || timeout <= 0 {
-				timeout = C.DefaultUDPTimeout
+			if !tunnel.ShouldStopRetry(fallbackErr) {
+				err = fallbackErr
 			}
-			ctxDial, cancel := context.WithTimeout(ctx, timeout)
-			start := time.Now()
-			pc, err = proxy.ListenPacketContext(ctxDial, metadata)
-			cancel()
-			connectTime := time.Since(start).Milliseconds()
-
-			if err != nil {
-				if tunnel.ShouldStopRetry(err) {
-					return nil, err
-				}
-				finalErr = err
-				go s.recordConnectionStats(metadata, proxy, connectTime, 0, 0, 0, 0, 0, 0, nil, 0, err)
-				continue
-			}
-
-			s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{proxy})
-			s.closeSameConnection(metadata, proxy.Name(), metadata.SmartTarget, asnNumber, false)
-			return s.WrapPacketConnWithMetric(pc, proxy, metadata, connectTime), nil
-		}
-
-		if singleProxyRetry {
-			break
 		}
 	}
 
-	s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
-
-	return nil, finalErr
+	return pc, err
 }
 
 func (s *SmartPLD) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {

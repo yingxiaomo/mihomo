@@ -1345,7 +1345,6 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 		}
 	}
 
-	oldLastFailure := hs.LastFailure
 	currentCode := -1
 
 	for code, codeSet := range hs.Codes {
@@ -1426,12 +1425,13 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 			if codeSet.FailCounts == nil {
 				codeSet.FailCounts = make(map[string]int)
 			}
-			count := codeSet.FailCounts[name]
-			if oldLastFailure == 0 || now-oldLastFailure > 300 {
-				count = 1
-			} else {
-				count++
-			}
+			// Count consecutive failures only; a checked success (state-code
+			// probe or the recovery check) clears the counter above. Do not
+			// reset on a 5-minute wall-clock gap: with a dead node pinned by
+			// long-lived connections, failures are sparse (few new requests)
+			// and would never accumulate to maxFailedTimes, so the node could
+			// never be blocked.
+			count := codeSet.FailCounts[name] + 1
 			if count >= maxFailedTimes {
 				codeSet.Nodes[name] = time.Now().Add(HostFailureNodeTTL).Unix()
 				delete(codeSet.FailCounts, name)
