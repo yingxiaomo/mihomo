@@ -239,9 +239,14 @@ func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber
 	// 单节点，PLD 重排无候选可选（日志恒 Rank(1)）。union 去重后长度有界
 	// (≤ 组内节点数)，TTL 600s 自动过期。
 	targetKey := FormatDBKey(config, group, target)
-	merged := names
+	// Most-recent-winner first: keep the node that just succeeded at the head
+	// of the merged candidate list, so selection for the same target prefers
+	// the node that already works (stable long-lived connections) while the
+	// rest remain ranked fallbacks. mergeProxyNames preserves the first
+	// argument's order, so pass the fresh names first.
+	merged := mergeProxyNames(names, nil)
 	if existing, found := unwrapCache.Get(targetKey); found && len(existing.Proxies) > 0 {
-		merged = mergeProxyNames(existing.Proxies, names)
+		merged = mergeProxyNames(names, existing.Proxies)
 	}
 	unwrapCache.Set(targetKey, UnwrapMap{Proxies: merged})
 

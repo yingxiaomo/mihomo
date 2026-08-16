@@ -848,6 +848,17 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 	isUDP := metadata.NetWork == C.UDP
 	resultNames, resultWeights := trySelector(isUDP)
 
+	// Keep the primary node stable: the merged unwrap candidate list leads
+	// with the most-recent winner for this target. After the PLD re-rank,
+	// restore it to the head so concurrent connections to the same target
+	// converge on one node instead of thrashing between close-scored nodes —
+	// thrashing makes closeSameConnection kill each other's long-lived
+	// connections (spinning/constant reconnects).
+	var primary string
+	if len(resultNames) > 0 {
+		primary = resultNames[0]
+	}
+
 	// PLD: always re-rank the candidate nodes by the hybrid D-UCB score
 	// (prior + EWMA reward + exploration bonus) when enabled — even on
 	// unwrap-cache hits. The cache only saves the bbolt ranking lookup;
@@ -855,6 +866,22 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 	// should be visible in the dashboard logs for every selection.
 	if s.usePLD && len(resultNames) > 0 {
 		resultNames, resultWeights = s.computePLDWeights(metadata, resultNames, proxies)
+	}
+
+	if primary != "" && len(resultNames) > 1 && resultNames[0] != primary {
+		for i, n := range resultNames {
+			if n == primary {
+				resultNames = append(resultNames[:i], resultNames[i+1:]...)
+				if resultWeights != nil {
+					resultWeights = append(resultWeights[:i], resultWeights[i+1:]...)
+				}
+				resultNames = append([]string{primary}, resultNames...)
+				if resultWeights != nil {
+					resultWeights = append([]float64{1.0}, resultWeights...)
+				}
+				break
+			}
+		}
 	}
 
 	result := s.filterProxies(metadata, wildcardTarget, resultNames, resultWeights, proxies, maxSelected, isUDP)
