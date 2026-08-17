@@ -55,9 +55,17 @@ type SmartPLDOption struct {
 	// OfficialWeight blends the official rule weight (CalculateWeight, built on
 	// historical success/connectTime/latency/traffic stats) into the PLD rank:
 	//   final = (1-O)*PLD_FinalWeight + O*officialWeight,  O in [0,1].
-	// 0/unset → default 0.3: PLD leads (explore+learn), official weights act as
-	// a rule-based constraint on top.
+	// 0/unset = off (default): the official weight is a high-frequency feedback
+	// signal, blending it into selection made rankings drift (reverted).
+	// The official system still verifies post-connect quality via the
+	// first-byte gate below and checkNodeQuality.
 	OfficialWeight float64 `group:"official-weight,omitempty"`
+	// FirstByteGateMs is the post-connect "select with PLD, verify with the
+	// official system" quality gate: if the first response byte does not
+	// arrive within this many ms, the node is marked failed for the target
+	// (official verdict) and the unwrap primary is reset so the next attempt
+	// picks another candidate. 0 = off; default 5000.
+	FirstByteGateMs int `group:"first-byte-gate-ms,omitempty"`
 }
 
 type SmartPLD struct {
@@ -89,7 +97,8 @@ type SmartPLD struct {
 	priorWeight       float64
 	priorDecayK       float64
 	exploreStrength   float64
-	officialWeight    float64 // cooperative blend with official CalculateWeight (0~1, default 0.3)
+	officialWeight    float64 // cooperative blend with official CalculateWeight (0~1, off by default)
+	firstByteGateMs   int    // post-connect first-byte quality gate (ms, 0=off, default 5000)
 
 	// pldRecordCache caches per-(target,node) reward state in memory; persisted
 	// under the independent "pld:" key namespace of the shared smart.db.
@@ -149,13 +158,22 @@ func NewSmartPLD(option GroupCommonOption, smartOption SmartPLDOption, emptyFall
 	// high-frequency feedback signal (updated on every closed connection), so
 	// blending it into the selection score made fresh-path rankings drift and
 	// long-lived connections churn (see 483d66d4 revert). Set
-	// official-weight: 0.4 (0~1) explicitly to enable it again. The official
-	// rule weight still guards post-connection quality via checkNodeQuality.
+	// official-weight: 0.4 (0~1) explicitly to enable it again.
 	if s.officialWeight < 0 {
 		s.officialWeight = 0
 	}
 	if s.officialWeight > 1 {
 		s.officialWeight = 1
+	}
+
+	// Post-connect first-byte quality gate: "select with PLD, verify with the
+	// official system". Default 5s; 0 disables.
+	s.firstByteGateMs = smartOption.FirstByteGateMs
+	if s.firstByteGateMs == 0 {
+		s.firstByteGateMs = 5000
+	}
+	if s.firstByteGateMs < 0 {
+		s.firstByteGateMs = 0
 	}
 
 	if smartOption.PolicyPriority != "" {
@@ -488,6 +506,30 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 	if s.usePLD {
 		pp = callback.NewPacketPairCallBackConn(c)
 		c = pp
+	}
+
+	// "Select with PLD, verify with the official system": post-connect
+	// first-byte quality gate. If the first response byte does not arrive
+	// within firstByteGateMs, the official verdict is "poor for this target":
+	// mark the node failed for the target and reset the unwrap primary so the
+	// next attempt picks another candidate. A healthy first byte (<= gate)
+	// leaves the connection completely untouched; we never force-close here to
+	// avoid killing other long-lived connections.
+	if s.firstByteGateMs > 0 {
+		gate := time.Duration(s.firstByteGateMs) * time.Millisecond
+		time.AfterFunc(gate, func() {
+			if firstReadLatency.Load() > 0 {
+				return // first byte arrived in time — connection is fine
+			}
+			tracker := statistic.DefaultManager.Get(metadata.UUID)
+			if tracker == nil {
+				return // connection already gone
+			}
+			log.Debugln("[PLD] Group: [%s] Node: [%s] Target: [%s] no first byte within %d ms, official quality gate fired",
+				s.Name(), proxy.Name(), metadata.SmartTarget, s.firstByteGateMs)
+			s.markNodeFailure(metadata, proxy.Name(), true, true, 3)
+			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, s.getASNCode(metadata), metadata.WildcardTarget)
+		})
 	}
 
 	return s.registerClosureMetricsCallback(
