@@ -609,11 +609,14 @@ func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, na
 			continue
 		}
 		// The ranked names on this path are the unwrap primary / fresh winners:
-		// trust them (official smart semantics — most-recent success should be
-		// tried first), leave soft-fail to the fill-up pool and fallbacks so a
-		// mildly-negative but real winner isn't skipped every request, which
-		// would make fallbackAll thrash between close-scored nodes and kill
-		// long-lived connections.
+		// fully trust them (official smart semantics — most-recent success is
+		// tried first). No soft-fail / wtFailNodes demotion here: a mildly
+		// negative but real winner must not be skipped every request, which
+		// makes the fill-up pool / fallbackAll thrash between close-scored
+		// nodes and kills long-lived connections. Broken nodes are still
+		// removed via blockedNodes (failure-count block) and AliveForTestUrl
+		// (health check); the fill-up pool and fallbacks keep the soft-fail
+		// guard for exploration.
 		w := 0.0
 		if weights != nil && i < len(weights) {
 			w = weights[i]
@@ -630,11 +633,7 @@ func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, na
 				continue
 			}
 		}
-		if wtFailNodes[name] != 0 {
-			failedSelected = append(failedSelected, proxy)
-		} else {
-			selected = append(selected, proxy)
-		}
+		selected = append(selected, proxy)
 	}
 
 	if wtBlocked {
