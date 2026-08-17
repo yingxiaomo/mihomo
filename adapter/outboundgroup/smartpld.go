@@ -823,14 +823,13 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		for _, p := range allProxies {
 			proxyByName[p.Name()] = p
 		}
-		resultProxies := make([]C.Proxy, 0, len(names))
-		for _, name := range names {
-			if p, ok := proxyByName[name]; ok {
-				resultProxies = append(resultProxies, p)
-			}
-		}
-		if len(resultProxies) > 0 {
-			s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, resultProxies)
+		// Only refresh the primary (first ranked) node into the unwrap cache:
+		// unwrap must stay single-node (official smart semantics) so same-target
+		// connections converge on one node. Writing the full fresh list here
+		// would let the PLD F-score re-rank thrash between close-scored nodes
+		// and closeSameConnection would kill each other's long-lived conns.
+		if p, ok := proxyByName[names[0]]; ok {
+			s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{p})
 		}
 	}
 
