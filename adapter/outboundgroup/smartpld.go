@@ -52,6 +52,12 @@ type SmartPLDOption struct {
 	PriorWeight     float64 `group:"prior-weight,omitempty"`  // α0 default 0.6
 	PriorDecayK     float64 `group:"prior-decay-k,omitempty"` // default 10
 	ExploreStrength float64 `group:"explore-strength,omitempty"` // default 0.05
+	// OfficialWeight blends the official rule weight (CalculateWeight, built on
+	// historical success/connectTime/latency/traffic stats) into the PLD rank:
+	//   final = (1-O)*PLD_FinalWeight + O*officialWeight,  O in [0,1].
+	// 0/unset → default 0.3: PLD leads (explore+learn), official weights act as
+	// a rule-based constraint on top.
+	OfficialWeight float64 `group:"official-weight,omitempty"`
 }
 
 type SmartPLD struct {
@@ -83,6 +89,7 @@ type SmartPLD struct {
 	priorWeight       float64
 	priorDecayK       float64
 	exploreStrength   float64
+	officialWeight    float64 // cooperative blend with official CalculateWeight (0~1, default 0.3)
 
 	// pldRecordCache caches per-(target,node) reward state in memory; persisted
 	// under the independent "pld:" key namespace of the shared smart.db.
@@ -135,6 +142,14 @@ func NewSmartPLD(option GroupCommonOption, smartOption SmartPLDOption, emptyFall
 
 	if smartOption.SampleRate > 0 && smartOption.SampleRate <= 1 {
 		s.sampleRate = smartOption.SampleRate
+	}
+
+	s.officialWeight = smartOption.OfficialWeight
+	if s.officialWeight <= 0 {
+		s.officialWeight = 0.3 // default cooperative blend (0 means unset → default)
+	}
+	if s.officialWeight > 1 {
+		s.officialWeight = 1
 	}
 
 	if smartOption.PolicyPriority != "" {
@@ -903,9 +918,11 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 	target := metadata.SmartTarget
 
 	type scoreEntry struct {
-		name  string
-		prior float64 // 阶段一：PriorModel 先验分（无模型时为 flat 0.5）
-		w     float64 // 阶段二：D-UCB FinalWeight（prior + reward EMA + explore）
+		name     string
+		prior    float64 // 阶段一：PriorModel 先验分（无模型时为 flat 0.5）
+		pld      float64 // 阶段二：D-UCB FinalWeight（prior + reward EMA + explore）
+		official float64 // 官方规则权重（CalculateWeight，历史统计）
+		w        float64 // 排序分：cooperative blend of pld & official
 	}
 	entries := make([]scoreEntry, 0, len(names))
 
@@ -971,7 +988,24 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 		}
 		w := smart.FinalWeight(prior, rewards[name], int64(counts[name]), totalSamples,
 			s.priorWeight, s.priorDecayK, s.exploreStrength)
-		entries = append(entries, scoreEntry{name: name, prior: prior, w: w})
+
+		// Cooperative scoring: blend the official rule weight (historical
+		// stats: success/connectTime/latency/traffic/loss) into the PLD score.
+		// Cold nodes (samples < DefaultMinSampleCount) yield officialWeight 0,
+		// so they fall back to pure PLD. officialWeight==0 keeps pure PLD.
+		var officialW float64
+		if s.officialWeight > 0 {
+			cacheKey := smart.FormatDBKey(smart.KeyTypeStats, s.configName, s.Name(), target, name)
+			rec := s.store.GetOrCreateAtomicRecord(cacheKey, s.Name(), s.configName, target, name)
+			input := lightgbm.CreateModelInputFromStatsRecord(rec, metadata,
+				0, 0, 0, 0, 0, metadata.WildcardTarget, 0, 0)
+			officialW, _ = smart.CalculateWeight(input, s.getPriorityFactor(name))
+		}
+		merged := w
+		if s.officialWeight > 0 && officialW > 0 {
+			merged = (1-s.officialWeight)*w + s.officialWeight*officialW
+		}
+		entries = append(entries, scoreEntry{name: name, prior: prior, pld: w, official: officialW, w: merged})
 	}
 
 	sort.SliceStable(entries, func(i, j int) bool {
@@ -982,11 +1016,10 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 	})
 
 	// PLD debug：选路热路径上的追踪日志（debug 级别，不刷生产日志）。
-	// 每个节点同时给出阶段一 prior 分（P，PriorModel 输出）与阶段二 D-UCB
-	// 融合分（F，FinalWeight），证明模型确实主导了本次排序；无模型时
-	// P=0.500（flat prior），F 只剩在线奖励 + 探索项。
-	// DomainLevel 为 feature 20 域名流量档位（0=unknown 1=small 2=medium 3=heavy），
-	// 让日志面板能直接看到"域名 → 流量档位"先验在选路中生效。
+	// 每节点给出：P（PriorModel 先验，无模型 0.5）、F（PLD D-UCB 分）、
+	// O（官方规则权重 CalculateWeight，样本不足=0）、C（cooperative 排序分）。
+	// official-weight>0 时 C=(1-O)*F+O*官方分，即"PLD 主导 + 官方规则约束"。
+	// DomainLevel 为 feature 20 域名流量档位（0=unknown 1=small 2=medium 3=heavy）。
 	if len(entries) > 0 {
 		top := 5
 		if len(entries) < top {
@@ -997,7 +1030,8 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 			if i > 0 {
 				b.WriteString(" | ")
 			}
-			fmt.Fprintf(&b, "%s(P:%.3f,F:%.3f)", entries[i].name, entries[i].prior, entries[i].w)
+			fmt.Fprintf(&b, "%s(P:%.3f,F:%.3f,O:%.3f,C:%.3f)",
+				entries[i].name, entries[i].prior, entries[i].pld, entries[i].official, entries[i].w)
 		}
 		log.Debugln("[PLD-Track] Group: [%s] Target: [%s] DomainLevel:[%d] Rank(%d): %s",
 			s.Name(), target, int(features.DomainTrafficLevel), len(entries), b.String())
