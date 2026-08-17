@@ -608,9 +608,12 @@ func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, na
 		if proxy == nil || blockedNodes[name] || !proxy.AliveForTestUrl(s.testUrl) || (isUDP && !proxy.SupportUDP()) {
 			continue
 		}
-		if softFailed(name) {
-			continue
-		}
+		// The ranked names on this path are the unwrap primary / fresh winners:
+		// trust them (official smart semantics — most-recent success should be
+		// tried first), leave soft-fail to the fill-up pool and fallbacks so a
+		// mildly-negative but real winner isn't skipped every request, which
+		// would make fallbackAll thrash between close-scored nodes and kill
+		// long-lived connections.
 		w := 0.0
 		if weights != nil && i < len(weights) {
 			w = weights[i]
