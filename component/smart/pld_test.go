@@ -76,29 +76,6 @@ func TestComputeRewardLargeTransfer(t *testing.T) {
 	}
 }
 
-func TestMergeProxyNames(t *testing.T) {
-	// 新节点并入已有，保持顺序
-	merged := mergeProxyNames([]string{"A", "B"}, []string{"C"})
-	if len(merged) != 3 || merged[0] != "A" || merged[1] != "B" || merged[2] != "C" {
-		t.Fatalf("merge append: %v", merged)
-	}
-	// 重复并入去重
-	merged = mergeProxyNames([]string{"A", "B"}, []string{"B", "A"})
-	if len(merged) != 2 {
-		t.Fatalf("merge dedup: %v", merged)
-	}
-	// 空初始
-	merged = mergeProxyNames(nil, []string{"X", "Y"})
-	if len(merged) != 2 || merged[0] != "X" {
-		t.Fatalf("merge from empty: %v", merged)
-	}
-	// 有界：合并结果不超过两列表并集长度
-	merged = mergeProxyNames([]string{"A", "B", "C"}, []string{"B", "D", "E"})
-	if len(merged) != 5 {
-		t.Fatalf("merge bounds: %v", merged)
-	}
-}
-
 func TestFinalWeightColdStart(t *testing.T) {
 	// Cold node (n=0) with flat prior 0.5: leans on prior.
 	w := FinalWeight(0.5, 0, 0, 100, 0.6, 10, 0.05)

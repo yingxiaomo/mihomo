@@ -848,12 +848,13 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 	isUDP := metadata.NetWork == C.UDP
 	resultNames, resultWeights := trySelector(isUDP)
 
-	// Keep the primary node stable: the merged unwrap candidate list leads
-	// with the most-recent winner for this target. After the PLD re-rank,
-	// restore it to the head so concurrent connections to the same target
-	// converge on one node instead of thrashing between close-scored nodes —
-	// thrashing makes closeSameConnection kill each other's long-lived
-	// connections (spinning/constant reconnects).
+	// Keep the primary node stable: unwrap now stores the single most-recent
+	// winner per target, but the fresh path (prefetch/best-node caches) can
+	// still yield a multi-node list. After the PLD re-rank, restore the head
+	// to the top so concurrent connections to the same target converge on one
+	// node instead of thrashing between close-scored nodes — thrashing makes
+	// closeSameConnection kill each other's long-lived connections
+	// (spinning/constant reconnects).
 	var primary string
 	if len(resultNames) > 0 {
 		primary = resultNames[0]

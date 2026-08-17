@@ -234,21 +234,16 @@ func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber
 		names[i] = p.Name()
 	}
 
-	// SmartTarget (same ruleset = same node)。merge 而非覆盖：连接成功只
-	// 并入本次节点，不挤掉已有候选——否则 unwrap 缓存长期只剩最近成功的
-	// 单节点，PLD 重排无候选可选（日志恒 Rank(1)）。union 去重后长度有界
-	// (≤ 组内节点数)，TTL 600s 自动过期。
+	// SmartTarget (same ruleset = same node)：覆盖为本次成功节点（单节点）。
+	// 这是原版 smart 平衡"切换 vs 长连接"的核心：同 target 的所有连接首选
+	// 恒为最近成功的节点，closeSameConnection 检查 Contains(chains, 该节点)
+	// 恒成立 → 长连接不被误杀；节点失效时拨号失败被排除，fallback 新节点
+	// 成功后覆盖 unwrap → 平滑切换。PLD 的多候选探索由 computeFreshNodes
+	// （Prefetch/Best 缓存）与 unwrap TTL 过期后的 fresh 路径提供，unwrap
+	// 命中保持单节点稳定，而不是 merge 累积（merge 会让 PLD 首选在相近
+	// 分数节点间抖动，并发连接互杀长连接——见连接抖动修复）。
 	targetKey := FormatDBKey(config, group, target)
-	// Most-recent-winner first: keep the node that just succeeded at the head
-	// of the merged candidate list, so selection for the same target prefers
-	// the node that already works (stable long-lived connections) while the
-	// rest remain ranked fallbacks. mergeProxyNames preserves the first
-	// argument's order, so pass the fresh names first.
-	merged := mergeProxyNames(names, nil)
-	if existing, found := unwrapCache.Get(targetKey); found && len(existing.Proxies) > 0 {
-		merged = mergeProxyNames(names, existing.Proxies)
-	}
-	unwrapCache.Set(targetKey, UnwrapMap{Proxies: merged})
+	unwrapCache.Set(targetKey, UnwrapMap{Proxies: names})
 
 	// ASN sharing (CDN excluded): first-writer-wins（保持原语义，避免
 	// 共享 ASN 的候选列表被每个域名都塞一份）
@@ -260,25 +255,9 @@ func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber
 	}
 }
 
-// mergeProxyNames merges two node-name lists, deduplicated, preserving the
-// existing order first then appending unseen incoming names.
-func mergeProxyNames(existing, incoming []string) []string {
-	seen := make(map[string]struct{}, len(existing)+len(incoming))
-	out := make([]string, 0, len(existing)+len(incoming))
-	for _, n := range existing {
-		if _, ok := seen[n]; !ok {
-			seen[n] = struct{}{}
-			out = append(out, n)
-		}
-	}
-	for _, n := range incoming {
-		if _, ok := seen[n]; !ok {
-			seen[n] = struct{}{}
-			out = append(out, n)
-		}
-	}
-	return out
-}
+// placeholder removed: unwrap cache is single-node overwrite again
+// (see StoreUnwrapResult); mergeProxyNames was the PLD-era multi-node merge
+// helper that caused same-target connection churn.
 
 func (s *Store) GetUnwrapResult(group, config, target, asnNumber string, wildcardTarget string) (proxies []string, expired bool) {
 	if target == "" {
