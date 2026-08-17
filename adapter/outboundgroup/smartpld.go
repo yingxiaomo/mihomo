@@ -525,10 +525,47 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 			if tracker == nil {
 				return // connection already gone
 			}
+			target := metadata.SmartTarget
+			if target == "" {
+				target = metadata.WildcardTarget
+			}
 			log.Debugln("[PLD] Group: [%s] Node: [%s] Target: [%s] no first byte within %d ms, official quality gate fired",
-				s.Name(), proxy.Name(), metadata.SmartTarget, s.firstByteGateMs)
+				s.Name(), proxy.Name(), target, s.firstByteGateMs)
 			s.markNodeFailure(metadata, proxy.Name(), true, true, 3)
-			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, s.getASNCode(metadata), metadata.WildcardTarget)
+			s.store.DeleteUnwrapResult(s.Name(), s.configName, target, s.getASNCode(metadata), metadata.WildcardTarget)
+
+			// Hard-punish the node for this target: drop its PLD reward exactly
+			// like a dial failure, so the fresh re-rank stops preferring it even
+			// though dialing the node "succeeds" (TCP up, but the target is
+			// unreachable/broken through it). Without this, DialContext's
+			// successful dial did StoreUnwrapResult and rewrote the dying node
+			// back as the target's primary — every next request selected it again
+			// and the node never got switched (the recurring "won't switch"
+			// symptom: node looks alive, connection hangs, never recovers).
+			rec := s.getPLDRecord(target, proxy.Name())
+			rew, _ := smart.ComputeRewardDetail(smart.RewardedMetrics{Failed: true})
+			newR, _, newCnt := smart.UpdateRewardEMA(rec.Reward, rec.RewardVar, rec.SampleCount, rew)
+			rec.Reward = newR
+			rec.SampleCount = newCnt
+			s.savePLDRecord(target, proxy.Name(), rec)
+
+			// Close this node's residual same-target connections so apps
+			// reconnect through the fresh selection instead of half-alive
+			// sockets that will never deliver data.
+			statistic.DefaultManager.RangeSmartTarget(target, func(id string) bool {
+				if id == metadata.UUID {
+					return true
+				}
+				t := statistic.DefaultManager.Get(id)
+				if t == nil {
+					return true
+				}
+				if !lo.Contains(t.Chains(), proxy.Name()) {
+					return true
+				}
+				_ = t.Close()
+				return true
+			})
 		})
 	}
 
