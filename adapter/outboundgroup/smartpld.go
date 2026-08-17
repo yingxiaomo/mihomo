@@ -145,8 +145,14 @@ func NewSmartPLD(option GroupCommonOption, smartOption SmartPLDOption, emptyFall
 	}
 
 	s.officialWeight = smartOption.OfficialWeight
-	if s.officialWeight <= 0 {
-		s.officialWeight = 0.3 // default cooperative blend (0 means unset → default)
+	// Cooperative scoring is OFF by default: the official CalculateWeight is a
+	// high-frequency feedback signal (updated on every closed connection), so
+	// blending it into the selection score made fresh-path rankings drift and
+	// long-lived connections churn (see 483d66d4 revert). Set
+	// official-weight: 0.4 (0~1) explicitly to enable it again. The official
+	// rule weight still guards post-connection quality via checkNodeQuality.
+	if s.officialWeight < 0 {
+		s.officialWeight = 0
 	}
 	if s.officialWeight > 1 {
 		s.officialWeight = 1
