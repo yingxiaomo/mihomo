@@ -37,7 +37,7 @@ type PLDDataCollector struct {
 
 const (
 	defaultPLDCollectorSize = 100 * 1024 * 1024
-	expectedPLDColumns           = MaxFeatureSize + 14
+	expectedPLDColumns           = MaxFeatureSize + 15
 )
 
 func InitPLDCollector(collectSize float64) {
@@ -58,7 +58,7 @@ func GetPLDCollector() *PLDDataCollector {
 	return pldSmartCollector
 }
 
-func (c *PLDDataCollector) AddSample(input *smart.ModelInput, metadata *C.Metadata, actualWeight, reward float64, weightSource string, nodeDelayMs int64, nodeType float64) {
+func (c *PLDDataCollector) AddSample(input *smart.ModelInput, metadata *C.Metadata, actualWeight, reward float64, weightSource string, nodeDelayMs int64, nodeType float64, sampleWeight float64) {
 	if c == nil {
 		return
 	}
@@ -164,6 +164,7 @@ func (c *PLDDataCollector) AddSample(input *smart.ModelInput, metadata *C.Metada
 		strconv.FormatFloat(actualWeight, 'f', 6, 64),
 		standardizedSource,
 		strconv.FormatFloat(reward, 'f', 6, 64),
+		strconv.FormatFloat(sampleWeight, 'f', 6, 64), // 训练样本权重（大流量对数加权）
 		time.Now().Format(time.RFC3339),
 	)
 
@@ -212,6 +213,7 @@ func (c *PLDDataCollector) initializeWriter() error {
 				hasReward := false
 				hasTarget := false
 				hasNodeDelay := false
+				hasSampleWeight := false
 				for _, h := range headers {
 					if h == "cumul_loss_rate" {
 						hasMax = true
@@ -225,8 +227,11 @@ func (c *PLDDataCollector) initializeWriter() error {
 					if h == "node_delay" {
 						hasNodeDelay = true
 					}
+					if h == "sample_weight" {
+						hasSampleWeight = true
+					}
 				}
-				if !hasMax || !hasReward || !hasTarget || !hasNodeDelay {
+				if !hasMax || !hasReward || !hasTarget || !hasNodeDelay || !hasSampleWeight {
 					needUpgrade = true
 				}
 			}
@@ -296,7 +301,7 @@ func (c *PLDDataCollector) initializeWriter() error {
 			"group_name", "node_name", "target",
 			"node_delay", "node_type",
 			"asn_raw", "host_raw", "ip_raw", "port_raw", "geoip_raw",
-			"weight", "weight_source", "reward", "timestamp",
+			"weight", "weight_source", "reward", "sample_weight", "timestamp",
 		}
 
 		if err := c.writer.Write(headers); err != nil {

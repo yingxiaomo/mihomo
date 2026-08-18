@@ -66,6 +66,17 @@ type SmartPLDOption struct {
 	// (official verdict) and the unwrap primary is reset so the next attempt
 	// picks another candidate. 0 = off; default 5000.
 	FirstByteGateMs int `group:"first-byte-gate-ms,omitempty"`
+	// SwitchMargin is the hysteresis gate for replacing the current unwrap
+	// primary: a challenger must outscore the current node by at least this
+	// factor before the primary switches (default 1.15 = 15% lead). Below the
+	// margin the current node stays, preventing A→B→A thrashing between
+	// close-scored candidates.
+	SwitchMargin float64 `group:"switch-margin,omitempty"`
+	// SwitchCooldownSec is how long the group refuses another primary switch
+	// for the same target after one happened (default 180s). A switch only
+	// ignores the cooldown when the current primary collapsed (negative
+	// reward for the target) — broken nodes must be abandoned immediately.
+	SwitchCooldownSec int `group:"switch-cooldown-sec,omitempty"`
 }
 
 type SmartPLD struct {
@@ -99,11 +110,18 @@ type SmartPLD struct {
 	exploreStrength   float64
 	officialWeight    float64 // cooperative blend with official CalculateWeight (0~1, off by default)
 	firstByteGateMs   int    // post-connect first-byte quality gate (ms, 0=off, default 5000)
+	switchMargin      float64 // hysteresis: challenger must outscore primary by ≥ this factor (default 1.15)
+	switchCooldown    time.Duration // minimum interval between primary switches per target (default 3min)
 
 	// pldRecordCache caches per-(target,node) reward state in memory; persisted
 	// under the independent "pld:" key namespace of the shared smart.db.
 	pldRecordMu    sync.Mutex
 	pldRecordCache map[string]*smart.PLDRecord
+
+	// lastSwitchAt tracks the last primary-switch time per target, enforcing
+	// the switch cooldown (broken-primary collapses bypass it).
+	switchMu     sync.Mutex
+	lastSwitchAt map[string]time.Time
 
 	// healthChecking guards the proactive group-wide URLTest so concurrent
 	// first connections don't fire duplicate full-group probes.
@@ -145,6 +163,7 @@ func NewSmartPLD(option GroupCommonOption, smartOption SmartPLDOption, emptyFall
 		priorDecayK:          smartOption.PriorDecayK,
 		exploreStrength:      smartOption.ExploreStrength,
 		pldRecordCache:       make(map[string]*smart.PLDRecord),
+		lastSwitchAt:         make(map[string]time.Time),
 	}
 
 	s.hostFailLimit = s.maxFailedTimes
@@ -174,6 +193,25 @@ func NewSmartPLD(option GroupCommonOption, smartOption SmartPLDOption, emptyFall
 	}
 	if s.firstByteGateMs < 0 {
 		s.firstByteGateMs = 0
+	}
+
+	// Switch hysteresis: a challenger must outscore the current primary by ≥
+	// switch-margin (default 15%), and primary switches are rate-limited per
+	// target by switch-cooldown-sec (default 3 min) unless the primary
+	// collapsed for the target (negative reward).
+	s.switchMargin = smartOption.SwitchMargin
+	if s.switchMargin <= 1 {
+		s.switchMargin = 1.15
+	}
+	if s.switchMargin > 3 {
+		s.switchMargin = 3 // sanity clamp: never demand a 3x+ lead
+	}
+	s.switchCooldown = time.Duration(smartOption.SwitchCooldownSec) * time.Second
+	if s.switchCooldown <= 0 {
+		s.switchCooldown = 3 * time.Minute
+	}
+	if s.switchCooldown > 30*time.Minute {
+		s.switchCooldown = 30 * time.Minute
 	}
 
 	if smartOption.PolicyPriority != "" {
@@ -543,10 +581,7 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 			// and the node never got switched (the recurring "won't switch"
 			// symptom: node looks alive, connection hangs, never recovers).
 			rec := s.getPLDRecord(target, proxy.Name())
-			rew, _ := smart.ComputeRewardDetail(smart.RewardedMetrics{Failed: true})
-			newR, _, newCnt := smart.UpdateRewardEMA(rec.Reward, rec.RewardVar, rec.SampleCount, rew)
-			rec.Reward = newR
-			rec.SampleCount = newCnt
+			rec.FillFailure()
 			s.savePLDRecord(target, proxy.Name(), rec)
 
 			// Close this node's residual same-target connections so apps
@@ -894,6 +929,10 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 	if metadata.SmartTarget == "" {
 		metadata.SmartTarget = wildcardTarget
 	}
+	target := metadata.SmartTarget
+	if target == "" {
+		target = wildcardTarget
+	}
 
 	if s.selected != "" {
 		for _, p := range proxies {
@@ -970,18 +1009,60 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		resultNames, resultWeights = s.computePLDWeights(metadata, resultNames, proxies)
 	}
 
+		// 滞回切换：PLD 重排后的新首位只有满足下列任一条件才允许替换当前
+	// primary —— (a) primary 已被候选排除（blocked/dead/soft-fail）、(b)
+	// primary 对该 target 已负分崩溃、(c) 新首位领先 ≥ switch-margin（默认
+	// 15%）且该 target 的切换冷却已过。否则把 primary 钉回首位：同一 target
+	// 的并发连接收敛单节点（避免 closeSameConnection 互杀长连接），同时避免
+	// A→B→A 抖动。
 	if primary != "" && len(resultNames) > 1 && resultNames[0] != primary {
+		switchIdx := -1
 		for i, n := range resultNames {
 			if n == primary {
-				resultNames = append(resultNames[:i], resultNames[i+1:]...)
-				if resultWeights != nil {
-					resultWeights = append(resultWeights[:i], resultWeights[i+1:]...)
-				}
-				resultNames = append([]string{primary}, resultNames...)
-				if resultWeights != nil {
-					resultWeights = append([]float64{1.0}, resultWeights...)
-				}
+				switchIdx = i
 				break
+			}
+		}
+		allowSwitch := false
+		switch {
+		case switchIdx < 0:
+			// primary 已被 filter 排除（blocked/dead/soft-fail）→ 直接切
+			allowSwitch = true
+			log.Debugln("[PLD] Group: [%s] Target: [%s] primary [%s] dropped from candidates, switching to [%s]",
+				s.Name(), target, primary, resultNames[0])
+		case switchIdx > 0:
+			var wNew, wCur float64
+			if resultWeights != nil && len(resultWeights) > switchIdx {
+				wNew = resultWeights[0]
+				wCur = resultWeights[switchIdx]
+			}
+			if wCur <= 0 {
+				// 当前 primary 对该 target 负分（连续失败/硬惩罚）→ 立即弃用
+				allowSwitch = true
+				log.Debugln("[PLD] Group: [%s] Target: [%s] primary [%s] collapsed (score %.3f), switching to [%s]",
+					s.Name(), target, primary, wCur, resultNames[0])
+			} else if wNew > wCur*s.switchMargin && s.switchCooldownElapsed(target) {
+				allowSwitch = true
+				log.Debugln("[PLD] Group: [%s] Target: [%s] switch [%s](%.3f) -> [%s](%.3f) (lead %.2fx >= %.2fx)",
+					s.Name(), target, primary, wCur, resultNames[0], wNew, wNew/wCur, s.switchMargin)
+			}
+		}
+		if allowSwitch {
+			s.markPrimarySwitch(target)
+		} else {
+			// 保持当前 primary：把 primary 移回首位（若它仍在候选里）
+			for i, n := range resultNames {
+				if n == primary {
+					resultNames = append(resultNames[:i], resultNames[i+1:]...)
+					if resultWeights != nil {
+						resultWeights = append(resultWeights[:i], resultWeights[i+1:]...)
+					}
+					resultNames = append([]string{primary}, resultNames...)
+					if resultWeights != nil {
+						resultWeights = append([]float64{1.0}, resultWeights...)
+					}
+					break
+				}
 			}
 		}
 	}
@@ -1001,6 +1082,10 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 
 	features := lightgbm.BuildRequestFeatures(metadata, s.Name(), time.Now())
 	target := metadata.SmartTarget
+	// 双通道决策：按本次请求的流量类型选通道。大流量档（视频/下载）用吞吐
+	// 通道（RewardLarge + 吞吐档案），网页/交互用延迟通道（Reward），
+	// 独立 EWMA 互不污染 —— 刷网页再多也不会稀释"谁下载快"。
+	largeMode := smart.PreferLargeFlowChannel(features.DomainTrafficLevel, features.TrafficClass)
 
 	type scoreEntry struct {
 		name     string
@@ -1017,6 +1102,7 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 	rewardVars := make(map[string]float64, len(names))
 	delays := make(map[string]float64, len(names))
 	nodeTypes := make(map[string]float64, len(names))
+	thrByName := make(map[string]float64, len(names))
 
 	// 该 target 的累计流量统计（画像聚合用）：所有候选节点记录的
 	// downloadTotal / sampleCount / maxDownloadRate 汇总 → 平均单次下载量。
@@ -1032,13 +1118,15 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 	for _, name := range names {
 		// reward state comes from PLD's own key namespace; the official record
 		// still supplies downloadTotal/maxDownloadRate for the traffic profile.
+		// ChannelStats picks the flow-channel-matched reward state so the
+		// D-UCB rank for this request never mixes latency and throughput
+		// feedback.
 		pldRec := s.getPLDRecord(target, name)
-		rew := pldRec.Reward
-		cnt := pldRec.SampleCount
-		rv := pldRec.RewardVar
+		rew, rv, cnt := pldRec.ChannelStats(largeMode)
 		rewards[name] = rew
 		counts[name] = float64(cnt)
 		rewardVars[name] = rv
+		thrByName[name] = pldRec.ThrKBps()
 		totalSamples += cnt
 		cntTotal += cnt
 		cacheKey := smart.FormatDBKey(smart.KeyTypeStats, s.configName, s.Name(), target, name)
@@ -1102,24 +1190,29 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 
 	// PLD debug：选路热路径上的追踪日志（debug 级别，不刷生产日志）。
 	// 每节点给出：P（PriorModel 先验，无模型 0.5）、F（PLD D-UCB 分）、
-	// O（官方规则权重 CalculateWeight，样本不足=0）、C（cooperative 排序分）。
-	// official-weight>0 时 C=(1-O)*F+O*官方分，即"PLD 主导 + 官方规则约束"。
+	// T（吞吐档案 KB/s，含 packet-pair 冷启动兜底）、O（官方规则权重，
+	// 样本不足=0）、C（cooperative 排序分）。
+	// Ch 为本次请求命中的通道（large=吞吐主导 / small=延迟主导），
 	// DomainLevel 为 feature 20 域名流量档位（0=unknown 1=small 2=medium 3=heavy）。
 	if len(entries) > 0 {
 		top := 5
 		if len(entries) < top {
 			top = len(entries)
 		}
+		chStr := "small"
+		if largeMode {
+			chStr = "large"
+		}
 		var b strings.Builder
 		for i := 0; i < top; i++ {
 			if i > 0 {
 				b.WriteString(" | ")
 			}
-			fmt.Fprintf(&b, "%s(P:%.3f,F:%.3f,O:%.3f,C:%.3f)",
-				entries[i].name, entries[i].prior, entries[i].pld, entries[i].official, entries[i].w)
+			fmt.Fprintf(&b, "%s(P:%.3f,F:%.3f,T:%.0f,O:%.3f,C:%.3f)",
+				entries[i].name, entries[i].prior, entries[i].pld, thrByName[entries[i].name], entries[i].official, entries[i].w)
 		}
-		log.Debugln("[PLD-Track] Group: [%s] Target: [%s] DomainLevel:[%d] Rank(%d): %s",
-			s.Name(), target, int(features.DomainTrafficLevel), len(entries), b.String())
+		log.Debugln("[PLD-Track] Group: [%s] Target: [%s] Ch:[%s] DomainLevel:[%d] Rank(%d): %s",
+			s.Name(), target, chStr, int(features.DomainTrafficLevel), len(entries), b.String())
 	}
 
 	outNames := make([]string, len(entries))
@@ -1750,7 +1843,7 @@ func (s *SmartPLD) logConnectionStats(err error, record *smart.StatsRecord, meta
 		} else if pldParts.SmallFlow {
 			flowStr = "small"
 		}
-		pldDetailStr = fmt.Sprintf("Reward: [%.3f], Flow: [%s], RTT: [%.3f], TTFR: [%.3f], Pair: [%.3f], Thr: [%s], LossPen: [%.3f] -> EMA: (Reward: [%.3f], Var: [%.3f], Samples: [%d], BWCeil: [%s])",
+		pldDetailStr = fmt.Sprintf("Reward: [%.3f], Flow: [%s], RTT: [%.3f], TTFR: [%.3f], Pair: [%.3f], Thr: [%s], LossPen: [%.3f] -> EMA: (Reward: [%.3f], Var: [%.3f], Samples: [%d], ThrKBps: [%s])",
 			pldReward, flowStr,
 			pldParts.ConnectScore, pldParts.TTFRScore, pldParts.PairScore,
 			formatTrafficUnit(pldParts.ThrKBps*1024, true),
@@ -1789,7 +1882,7 @@ func (s *SmartPLD) logConnectionStats(err error, record *smart.StatsRecord, meta
 
 // 数据收集
 func (s *SmartPLD) collectConnectionData(input *smart.ModelInput, metadata *C.Metadata,
-	baseWeight, reward float64, proxyName string, ModelPredicted bool, nodeDelayMs int64, nodeType float64) {
+	baseWeight, reward float64, proxyName string, ModelPredicted bool, nodeDelayMs int64, nodeType float64, sampleWeight float64) {
 
 	// 采样率控制
 	if s.sampleRate < 1.0 && rand.Float64() > s.sampleRate {
@@ -1804,7 +1897,7 @@ func (s *SmartPLD) collectConnectionData(input *smart.ModelInput, metadata *C.Me
 		weightSource = "LightGBM"
 	}
 
-	s.dataCollector.AddSample(input, metadata, baseWeight, reward, weightSource, nodeDelayMs, nodeType)
+	s.dataCollector.AddSample(input, metadata, baseWeight, reward, weightSource, nodeDelayMs, nodeType, sampleWeight)
 }
 
 
@@ -1965,7 +2058,10 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	var pldBWCeilKBps float64
 	if s.usePLD {
 		// PLD reward state lives under its own "pld:" key namespace — the
-		// official smart implementation never reads or writes it.
+		// official smart implementation never reads or writes it. The record
+		// routes this connection to the channel-appropriate state: failures go
+		// to BOTH channels, small transfers update only the latency channel,
+		// large transfers only the throughput channel + throughput archive.
 		rec := s.getPLDRecord(target, proxyName)
 		rm := smart.RewardedMetrics{
 			IsUDP:         isUDP,
@@ -1979,22 +2075,13 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 			Failed:        err != nil,
 			FailureCount:  rec.SampleCount,
 		}
-		r, parts := smart.ComputeRewardDetail(rm)
-		newR, newVar, newCnt := smart.UpdateRewardEMA(rec.Reward, rec.RewardVar, rec.SampleCount, r)
-		rec.Reward = newR
-		rec.RewardVar = newVar
-		rec.SampleCount = newCnt
-		if !rm.Failed && bytesTo64KMs > 0 {
-			// keep bandwidth ceiling useful only on successful transfers
-			rec.BWCeilingKBps = 64.0 / (float64(bytesTo64KMs)/1000.0)
-		}
+		r, parts := rec.UpdateWithMetrics(rm)
 		s.savePLDRecord(target, proxyName, rec)
 		pldReward = r
 		pldParts = &parts
-		pldEMA = newR
-		pldVar = newVar
-		pldSamples = newCnt
-		pldBWCeilKBps = rec.BWCeilingKBps
+		largeFlow := rm.SmallFlow() == false && !rm.Failed
+		pldEMA, pldVar, pldSamples = rec.ChannelStats(largeFlow)
+		pldBWCeilKBps = rec.ThrKBps()
 	}
 
 	statsSnapshot := atomicRecord.CreateStatsSnapshot(cacheKey)
@@ -2012,10 +2099,14 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 				}
 			}
 		}
-		reward := s.getPLDRecord(target, proxyName).Reward
+		// 训练 label 取本次连接所属通道的 reward EMA：小流量 = 延迟通道，
+		// 大流量 = 吞吐通道。这样双通道状态下训练先验与在线决策通道一致。
+		rec := s.getPLDRecord(target, proxyName)
+		largeFlow := downloadTotalMB >= smart.SmallTransferKB/1024.0
+		labelReward, _, _ := rec.ChannelStats(largeFlow)
 		nodeDelayMs := int64(proxy.LastDelayForTestUrl(s.testUrl))
 		nodeType := float64(proxy.Type())
-		s.collectConnectionData(input, metadata, collectedWeight, reward, proxyName, ModelPredicted, nodeDelayMs, nodeType)
+		s.collectConnectionData(input, metadata, collectedWeight, labelReward, proxyName, ModelPredicted, nodeDelayMs, nodeType, smart.SampleWeightFromMB(downloadTotalMB))
 	}
 
 	s.logConnectionStats(err, statsSnapshot, metadata, calculatedWeight / priorityFactor, priorityFactor, addressDisplay, proxyName,
@@ -2371,6 +2462,26 @@ func (s *SmartPLD) savePLDRecord(target, node string, rec *smart.PLDRecord) {
 	if err := s.store.DBBatchPutItem(key, data); err != nil {
 		log.Warnln("[PLD] record save failed for key %s: %v", key, err)
 	}
+}
+
+// switchCooldownElapsed reports whether enough time has passed since the last
+// primary switch for this target (default cooldown 3 minutes).
+func (s *SmartPLD) switchCooldownElapsed(target string) bool {
+	s.switchMu.Lock()
+	defer s.switchMu.Unlock()
+	last, ok := s.lastSwitchAt[target]
+	if !ok {
+		return true
+	}
+	return time.Since(last) >= s.switchCooldown
+}
+
+// markPrimarySwitch records the primary-switch time for a target so the switch
+// cooldown applies to the next challenger.
+func (s *SmartPLD) markPrimarySwitch(target string) {
+	s.switchMu.Lock()
+	s.lastSwitchAt[target] = time.Now()
+	s.switchMu.Unlock()
 }
 
 // applyPolicyPriorityPLD parses the smart-pld policy-priority option. It is the

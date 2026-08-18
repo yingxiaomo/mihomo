@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS samples (
 	node_delay INTEGER, node_type REAL,
 	asn_raw TEXT, host_raw TEXT, ip_raw TEXT, port_raw TEXT, geoip_raw TEXT,
 	weight REAL, weight_source TEXT, reward REAL,
+	sample_weight REAL NOT NULL DEFAULT 1.0,
 	ts INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts);
@@ -84,8 +85,8 @@ INSERT INTO samples (
 	asn_hash, host_hash, ip_hash, geoip_hash,
 	group_name, node_name, target, node_delay, node_type,
 	asn_raw, host_raw, ip_raw, port_raw, geoip_raw,
-	weight, weight_source, reward, ts
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	weight, weight_source, reward, sample_weight, ts
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 func InitPLDCollector(collectSize float64) {
 	var pldSmartCollectorSize int64
@@ -105,7 +106,7 @@ func GetPLDCollector() *PLDDataCollector {
 	return pldSmartCollector
 }
 
-func (c *PLDDataCollector) AddSample(input *smart.ModelInput, metadata *C.Metadata, actualWeight, reward float64, weightSource string, nodeDelayMs int64, nodeType float64) {
+func (c *PLDDataCollector) AddSample(input *smart.ModelInput, metadata *C.Metadata, actualWeight, reward float64, weightSource string, nodeDelayMs int64, nodeType float64, sampleWeight float64) {
 	if c == nil {
 		return
 	}
@@ -200,6 +201,7 @@ func (c *PLDDataCollector) AddSample(input *smart.ModelInput, metadata *C.Metada
 		actualWeight,
 		standardizedSource,
 		reward,
+		sampleWeight,
 		time.Now().Unix(),
 	)
 
@@ -243,6 +245,16 @@ func (c *PLDDataCollector) initializeDB() error {
 	if _, err := db.Exec(createTableSQL); err != nil {
 		db.Close()
 		return err
+	}
+
+	// 老库兼容：早期 smart_samples.db 没有 sample_weight 列（新 INSERT 语句会
+	// 失败），这里在线补列。历史行取默认 1.0（等权），新样本写入时覆盖为按
+	// 流量计算的对数权重。duplicate-column 错误说明列已存在，忽略即可。
+	if _, err := db.Exec(`ALTER TABLE samples ADD COLUMN sample_weight REAL NOT NULL DEFAULT 1.0`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") &&
+			!strings.Contains(err.Error(), "already exists") {
+			log.Debugln("[Smart] ALTER samples add sample_weight skipped: %v", err)
+		}
 	}
 
 	// 保留两周期（14 天），更早的样本按时间戳清理

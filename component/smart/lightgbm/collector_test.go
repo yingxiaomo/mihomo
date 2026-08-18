@@ -23,7 +23,7 @@ func TestCollectorSQLiteRoundTrip(t *testing.T) {
 	}
 	defer c.Close()
 
-	// 写一条完整 44 列样本
+	// 写一条完整 45 列样本（30 特征 + 14 元数据 + sample_weight）
 	features := make([]interface{}, 30)
 	for i := range features {
 		features[i] = float64(i + 1)
@@ -32,7 +32,7 @@ func TestCollectorSQLiteRoundTrip(t *testing.T) {
 		"group-a", "node-1", "example.com",
 		int64(120), float64(10),
 		"as13335", "www.example.com", "1.2.3.4", uint64(443), "US|CA",
-		0.5, "Traditional", 0.3, time.Now().Unix(),
+		0.5, "Traditional", 0.3, 2.0, time.Now().Unix(),
 	)
 	if _, err := c.db.Exec(insertSampleSQL, args...); err != nil {
 		t.Fatalf("insert: %v", err)
@@ -42,10 +42,11 @@ func TestCollectorSQLiteRoundTrip(t *testing.T) {
 	var (
 		group, node, target, host string
 		download, reward          float64
+		sampleWeight              float64
 		ts                        int64
 	)
-	err := c.db.QueryRow(`SELECT group_name, node_name, target, host_raw, download_mb, reward, ts FROM samples`).
-		Scan(&group, &node, &target, &host, &download, &reward, &ts)
+	err := c.db.QueryRow(`SELECT group_name, node_name, target, host_raw, download_mb, reward, sample_weight, ts FROM samples`).
+		Scan(&group, &node, &target, &host, &download, &reward, &sampleWeight, &ts)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -57,6 +58,9 @@ func TestCollectorSQLiteRoundTrip(t *testing.T) {
 	}
 	if reward != 0.3 {
 		t.Fatalf("reward=%v want 0.3", reward)
+	}
+	if sampleWeight != 2.0 {
+		t.Fatalf("sample_weight=%v want 2.0", sampleWeight)
 	}
 	if ts <= 0 {
 		t.Fatalf("ts=%v want unix seconds", ts)

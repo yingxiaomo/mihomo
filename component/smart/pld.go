@@ -4,7 +4,10 @@
 // PLD is purely additive and decoupled from the official files.
 package smart
 
-import "math"
+import (
+	"math"
+	"time"
+)
 
 // Default PLD tuning knobs. Flat constants so runtime config can override.
 const (
@@ -209,13 +212,153 @@ func FinalWeight(prior, rewardEMA float64, nNode, nTotal int64, alpha0, k, c flo
 // ---------------------------------------------------------------------------
 
 // PLDRecord is the persisted per-(target,node) reward state owned by PLD only.
+//
+// The state is split into two independent feedback channels so that small
+// (latency-dominated) transfers can never pollute throughput decisions and
+// vice versa:
+//
+//   - Reward / RewardVar / SampleCount (the latency channel): updated by
+//     small successful transfers (< SmallTransferKB) and by failures. Drives
+//     web-browsing / interactive selection, and keeps the soft-fail semantics
+//     (Reward < 0 → candidate excluded for this target).
+//   - RewardLarge / RewardLargeVar / SampleCountLarge (the throughput
+//     channel): updated ONLY by large successful transfers (>= SmallTransferKB)
+//     and by failures. Drives video-streaming / bulk-download selection. Small
+//     transfers never touch it, so thousands of page loads cannot dilute "how
+//     fast does this node download".
+//   - ThrKBpsEMA / ThrVar / ThrCount: the explicit sustained-throughput
+//     archive (KB/s) learned from large successful transfers. It is the
+//     physical "how fast does this node actually download" estimate, distinct
+//     from the normalized reward.
+//
+// Failures are applied to BOTH channels: a node that cannot reach the target
+// must not be selected under either flow priority.
 type PLDRecord struct {
 	Reward        float64 `json:"reward,omitempty"`
 	RewardVar     float64 `json:"reward_var,omitempty"`
 	SampleCount   int64   `json:"sample_count,omitempty"`
+
+	RewardLarge      float64 `json:"reward_large,omitempty"`
+	RewardLargeVar   float64 `json:"reward_large_var,omitempty"`
+	SampleCountLarge int64   `json:"sample_count_large,omitempty"`
+
+	ThrKBpsEMA float64 `json:"thr_kbps_ema,omitempty"`
+	ThrVar     float64 `json:"thr_var,omitempty"`
+	ThrCount   int64   `json:"thr_count,omitempty"`
+
 	FirstByteMs   int64   `json:"first_byte_ms,omitempty"`
 	BWCeilingKBps float64 `json:"bw_ceiling_kbps,omitempty"`
 	LastUpdated   int64   `json:"last_updated,omitempty"`
+}
+
+// FillFailure applies a hard failure reward (-2) to BOTH channels: a node that
+// fails the target (dial error, first-byte gate timeout, abnormal response)
+// must drop out of ranking for latency-sensitive and throughput-sensitive
+// requests alike.
+func (r *PLDRecord) FillFailure() {
+	rew := -2.0
+	newR, newVar, newCnt := UpdateRewardEMA(r.Reward, r.RewardVar, r.SampleCount, rew)
+	r.Reward, r.RewardVar, r.SampleCount = newR, newVar, newCnt
+	newRL, newVarL, newCntL := UpdateRewardEMA(r.RewardLarge, r.RewardLargeVar, r.SampleCountLarge, rew)
+	r.RewardLarge, r.RewardLargeVar, r.SampleCountLarge = newRL, newVarL, newCntL
+	r.LastUpdated = time.Now().Unix()
+}
+
+// UpdateWithMetrics folds one completed connection into the channel-appropriate
+// reward state:
+//
+//   - failure        → FillFailure (both channels)
+//   - small transfer → latency channel only (throughput channel untouched)
+//   - large transfer → throughput channel + sustained-throughput archive
+//     (latency channel untouched)
+//
+// It returns the scalar reward and its physical breakdown for logging/training.
+func (r *PLDRecord) UpdateWithMetrics(m RewardedMetrics) (float64, RewardParts) {
+	scalar, parts := ComputeRewardDetail(m)
+	if m.Failed {
+		r.FillFailure()
+		return scalar, parts
+	}
+	if !m.SmallFlow() {
+		// Large-flow channel: throughput reward + explicit throughput archive.
+		newR, newVar, newCnt := UpdateRewardEMA(r.RewardLarge, r.RewardLargeVar, r.SampleCountLarge, scalar)
+		r.RewardLarge, r.RewardLargeVar, r.SampleCountLarge = newR, newVar, newCnt
+		if parts.ThrKBps > 0 {
+			nThr, vThr, cThr := UpdateRewardEMA(r.ThrKBpsEMA, r.ThrVar, r.ThrCount, parts.ThrKBps)
+			r.ThrKBpsEMA, r.ThrVar, r.ThrCount = nThr, vThr, cThr
+		}
+	} else {
+		// Small-flow channel: latency-dominated reward.
+		newR, newVar, newCnt := UpdateRewardEMA(r.Reward, r.RewardVar, r.SampleCount, scalar)
+		r.Reward, r.RewardVar, r.SampleCount = newR, newVar, newCnt
+	}
+	// Packet-pair ceiling stays useful on any successful transfer that
+	// crossed 64KiB (cold-throughput fallback for the large-flow channel).
+	if !m.Failed && m.BytesTo64KMs > 0 {
+		r.BWCeilingKBps = 64.0 / (float64(m.BytesTo64KMs) / 1000.0)
+	}
+	r.LastUpdated = time.Now().Unix()
+	return scalar, parts
+}
+
+// SmallFlow reports whether the transfer is below the small-transfer threshold.
+func (m RewardedMetrics) SmallFlow() bool {
+	return m.DownloadMB < SmallTransferKB/1024.0
+}
+
+// ChannelStats returns the reward state (EMA, variance, sample count) for the
+// selected flow channel: large==true picks the throughput channel, otherwise
+// the latency channel.
+func (r *PLDRecord) ChannelStats(large bool) (float64, float64, int64) {
+	if large {
+		return r.RewardLarge, r.RewardLargeVar, r.SampleCountLarge
+	}
+	return r.Reward, r.RewardVar, r.SampleCount
+}
+
+// ThrKBps returns the sustained-throughput estimate (KB/s) for this node,
+// falling back to the packet-pair 64KiB ceiling when no large-flow samples
+// exist yet (cold throughput channel).
+func (r *PLDRecord) ThrKBps() float64 {
+	if r.ThrCount > 0 {
+		return r.ThrKBpsEMA
+	}
+	return r.BWCeilingKBps
+}
+
+// PreferLargeFlowChannel decides whether a request should be ranked by the
+// throughput channel (video streaming / bulk download) instead of the latency
+// channel (web browsing / interactive). destLevel is the target's data-driven
+// traffic profile (feature 20: 0=unknown, 1=small, 2=medium, 3=heavy);
+// trafficClass is the cheap request heuristic (0=web, 1=stream, 2=transfer,
+// 3=interactive). A medium/heavy profile dominates (real usage data beats
+// heuristics); otherwise QUIC-media and bulk-port heuristics opt into the
+// throughput channel.
+func PreferLargeFlowChannel(destLevel, trafficClass float64) bool {
+	if destLevel >= 2 {
+		return true
+	}
+	return trafficClass == 1 || trafficClass == 2
+}
+
+// SampleWeightFromMB returns the training sample weight for a connection of
+// downloadMB MiB. Small transfers keep a 0.5 floor so latency-channel signal
+// survives in the training data; large transfers dominate through a log scale
+// (512KiB→1.0, 5MB→3.5, 100MB→6.7, 1GB→11.0) so "big transfers are gold" is
+// actually reflected in the LightGBM fit.
+func SampleWeightFromMB(downloadMB float64) float64 {
+	mb := downloadMB
+	if mb < 0 {
+		mb = 0
+	}
+	w := math.Log2(mb*2 + 1)
+	if w < 0.5 {
+		w = 0.5
+	}
+	if w > 12 {
+		w = 12
+	}
+	return w
 }
 
 // PLDKeyPrefix is the independent key namespace under the shared smart.db
