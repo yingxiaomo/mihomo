@@ -636,24 +636,15 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 			rec := s.getPLDRecord(target, proxy.Name())
 			rec.FillFailure()
 			s.savePLDRecord(target, proxy.Name(), rec)
-
-			// Close this node's residual same-target connections so apps
-			// reconnect through the fresh selection instead of half-alive
-			// sockets that will never deliver data.
-			statistic.DefaultManager.RangeSmartTarget(target, func(id string) bool {
-				if id == metadata.UUID {
-					return true
-				}
-				t := statistic.DefaultManager.Get(id)
-				if t == nil {
-					return true
-				}
-				if !lo.Contains(t.Chains(), proxy.Name()) {
-					return true
-				}
-				_ = t.Close()
-				return true
-			})
+			// NOTE: deliberately NOT force-closing the node's same-target
+			// connections here. The official smart group never closes
+			// established connections on a quality signal — it only re-selects
+			// for NEW connections. Force-closing every residual conn made the
+			// app (Telegram) reconnect in a burst, each reconnect hit the same
+			// gate again on a still-slow node, and the gate closed the next
+			// batch: an exponential reconnect storm ("keeps spinning"). The
+			// stale conns time out on their own; new connections re-select via
+			// the unwrap reset + cool-off + re-rank above.
 		})
 	}
 
@@ -696,23 +687,12 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 				rec := s.getPLDRecord(target, proxy.Name())
 				rec.FillFailure()
 				s.savePLDRecord(target, proxy.Name(), rec)
-				// Close this node's residual same-target connections so apps
-				// reconnect through the fresh selection instead of half-alive
-				// sockets that will never deliver data.
-				statistic.DefaultManager.RangeSmartTarget(target, func(id string) bool {
-					if id == metadata.UUID {
-						return true
-					}
-					t := statistic.DefaultManager.Get(id)
-					if t == nil {
-						return true
-					}
-					if !lo.Contains(t.Chains(), proxy.Name()) {
-						return true
-					}
-					_ = t.Close()
-					return true
-				})
+				// NOTE: same as the first-byte gate — no force-closing of the
+				// node's same-target connections. The official smart group never
+				// closes established connections on a quality signal; force-closing
+				// here caused reconnect bursts on slow-but-recovering nodes
+				// (Telegram "keeps spinning"). Stale conns time out on their own,
+				// new connections re-select via unwrap reset + cool-off + block.
 			})
 		})
 	}
@@ -2203,9 +2183,15 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	// 针对具体 域名/IP 屏蔽节点（wildcardTarget + SmartTarget 双级记录）
 	failedBlock := s.markNodeFailure(metadata, proxyName, isDegraded, checked, blockCode)
 
-	if isDegraded || failedBlock {
-		s.closeSameConnection(metadata, proxyName, target, asnNumber, true)
-	}
+	// NOTE: no force-closing of same-target connections on degrade/block.
+	// The official smart group never closes established connections on a
+	// quality signal — degraded nodes are skipped by NEW selections (unwrap
+	// reset + cool-off + block), while existing conns finish/time out on
+	// their own. Force-closing here made Telegram-style apps reconnect all
+	// their connections in a burst; each reconnect hit the same gate on a
+	// still-slow node and closed the next batch — the "keeps spinning"
+	// reconnect storm. Convergence (closeSameConnection non-force on a real
+	// primary switch inside DialContext) is unaffected.
 
 	// 平均权重(适应 target 调整为 rule based 和 asn based 的情况)
 	newWeight := updateEMAFloat(oldWeight, adjWeight)
