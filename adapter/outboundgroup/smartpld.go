@@ -691,7 +691,7 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 				}
 				log.Debugln("[PLD] Group: [%s] Node: [%s] Target: [%s] zero progress (%d bytes up, 0 down after %s), zero-progress gate fired",
 					s.Name(), proxy.Name(), target, upload1, time.Since(firstSample).Round(time.Second))
-				s.markNodeFailure(metadata, proxy.Name(), true, true, 4)
+				s.markNodeFailure(metadata, proxy.Name(), true, true, 7)
 				s.store.DeleteUnwrapResult(s.Name(), s.configName, target, s.getASNCode(metadata), metadata.WildcardTarget)
 				rec := s.getPLDRecord(target, proxy.Name())
 				rec.FillFailure()
@@ -882,18 +882,20 @@ func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, na
 	for i, name := range names {
 		checkNodeUsed[name] = true
 		proxy := proxyByName[name]
-		if proxy == nil || blockedNodes[name] || !proxy.AliveForTestUrl(s.testUrl) || (isUDP && !proxy.SupportUDP()) || inCooldown(name) {
+		if proxy == nil || blockedNodes[name] || !proxy.AliveForTestUrl(s.testUrl) || (isUDP && !proxy.SupportUDP()) || inCooldown(name) || softFailed(name) {
 			continue
 		}
-		// The ranked names on this path are the unwrap primary / fresh winners:
-		// fully trust them (official smart semantics — most-recent success is
-		// tried first). No soft-fail / wtFailNodes demotion here: a mildly
-		// negative but real winner must not be skipped every request, which
-		// makes the fill-up pool / fallbackAll thrash between close-scored
-		// nodes and kills long-lived connections. Broken nodes are still
-		// removed via blockedNodes (failure-count block) and AliveForTestUrl
-		// (health check); the fill-up pool and fallbacks keep the soft-fail
-		// guard for exploration.
+		// The ranked names on this path are the unwrap primary / fresh winners,
+		// but a node whose EWMA reward for this target is negative (softFailed:
+		// ≥2 samples, Reward < 0) must not be served as the primary either —
+		// it kept winning "just because it was pinned", making the fill-up pool
+		// and fallbacks select around it while every request through it hung
+		// (the recurring "won't switch" symptom). Cold nodes (<2 samples) stay
+		// exempt so exploration is never starved. Broken nodes are removed via
+		// blockedNodes (failure-count block), AliveForTestUrl (health check),
+		// inCooldown (post-failure cool-off) and softFailed (historical
+		// negatives); the full fallbackAll keeps even soft-failed nodes as a
+		// last resort so a mildly negative but sole viable node is still used.
 		w := 0.0
 		if weights != nil && i < len(weights) {
 			w = weights[i]
@@ -1095,56 +1097,50 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		return nil, nil
 	}
 
-	// 异步更新过期缓存（stale-while-revalidate）
+	// 异步续期过期 unwrap：unwrap 是"该 target 当前 primary 钉住直到被失败
+	// 信号击落"的收敛锚，TTL 到期只做两件事——
+	//   (1) 旧 primary 仍健康（filter 通过：未 block/dead/冷却/soft-fail）
+	//       → 续期保留，绝不主动换人（换人 = 掐长连接 = 用户"一直切换"）；
+	//   (2) 旧 primary 已不在候选 → 删 unwrap，让下一个请求走全池重选
+	//       （失败冷却/block 是唯一允许快速换 primary 的通道）。
+	// 注意这里**不跑 PLD 重排**：fresh path（prefetch/best-node 缓存）与
+	// selectProxies 的实时 D-UCB 排名可能不一致，用它换人会让 primary 与
+	// PLD 决策脱节；primary 的变更只由 失败信号（冷却/block 排除）或
+	// selectProxies 的滞回切换（领先 ≥switch-margin）驱动。
 	refreshUnwrapCache := func(isUDP bool) {
-		names, weights := computeFreshNodes(isUDP)
-		if len(names) == 0 {
+		old, _ := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
+		if len(old) == 0 {
 			return
 		}
 		allProxies := s.GetProxies(true)
-		proxyByName := make(map[string]C.Proxy, len(allProxies))
+		var proxy C.Proxy
 		for _, p := range allProxies {
-			proxyByName[p.Name()] = p
-		}
-		// Apply the same hysteresis as selectProxies: keep the current primary
-		// unless the fresh best clearly outranks it (>= switch-margin) or the
-		// current primary dropped out of the candidates. Without this the
-		// stale-while-revalidate refresh rewrote the unwrap primary on every TTL
-		// expiry (60s), closeSameConnection then killed the previous primary's
-		// long-lived conns (Telegram-style keep-alive) and clients spun
-		// reconnecting through a rotating node — "always switching, no stable
-		// connection".
-		freshBest := names[0]
-		if old, _ := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget); len(old) > 0 && old[0] != freshBest {
-			oldIdx := -1
-			for i, n := range names {
-				if n == old[0] {
-					oldIdx = i
-					break
-				}
-			}
-			var wNew, wCur float64
-			if oldIdx >= 0 && weights != nil && len(weights) > oldIdx {
-				wNew = weights[0]
-				wCur = weights[oldIdx]
-			}
-			if oldIdx >= 0 && (weights == nil || len(weights) <= oldIdx || wCur <= 0 || wNew <= wCur*s.switchMargin) {
-				// Current primary still a candidate and not clearly outranked:
-				// keep it pinned. (weights nil => no reliable comparison => keep.)
-				if p, ok := proxyByName[old[0]]; ok {
-					s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{p})
-					return
-				}
+			if p.Name() == old[0] {
+				proxy = p
+				break
 			}
 		}
-		// Only refresh the primary (first ranked) node into the unwrap cache:
-		// unwrap must stay single-node (official smart semantics) so same-target
-		// connections converge on one node. Writing the full fresh list here
-		// would let the PLD F-score re-rank thrash between close-scored nodes
-		// and closeSameConnection would kill each other's long-lived conns.
-		if p, ok := proxyByName[freshBest]; ok {
-			s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{p})
+		if proxy == nil || !proxy.AliveForTestUrl(s.testUrl) || (isUDP && !proxy.SupportUDP()) {
+			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
+			return
 		}
+		wildcard := metadata.WildcardTarget
+		if blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName); blockedNodes[old[0]] {
+			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, wildcard)
+			return
+		}
+		target := metadata.SmartTarget
+		if target == "" {
+			target = wildcard
+		}
+		if rec := s.getPLDRecord(target, old[0]); rec.InFailureCooldown(time.Now().Unix()) {
+			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, wildcard)
+			return
+		}
+		// Old primary still healthy for this target: renew the unwrap entry so
+		// the TTL does not expire again on the very next request (avoids a
+		// refresh goroutine storm when a target is constantly hit).
+		s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{proxy})
 	}
 
 	trySelector := func(isUDP bool) ([]string, []float64) {
@@ -2461,6 +2457,11 @@ func (s *SmartPLD) closeSameConnection(metadata *C.Metadata, proxyName, target, 
 			_ = tracker.Close()
 		} else if proxyName != "" {
 			if !lo.Contains(tracker.Chains(), proxyName) {
+				// Mark the closed conn "degraded" so its close-callback skips the
+				// quality check (checkNodeQuality returns early on degraded):
+				// a connection closed by convergence is NOT a node failure and
+				// must not bump the node's failure count / block timer.
+				tracker.Info().Metadata.SmartBlock = "degraded"
 				_ = tracker.Close()
 			}
 		}
