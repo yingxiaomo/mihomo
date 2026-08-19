@@ -403,18 +403,31 @@ func (s *SmartPLD) DialContext(ctx context.Context, metadata *C.Metadata) (C.Con
 				finalErr = err
 			} else {
 				// Only converge same-target connections when the unwrap primary
-				// actually changed. If the primary is unchanged (e.g. a TTL
-				// refresh re-dialed the same node, or a parallel fallback retry),
-				// the existing long-lived conns already ride this node — closing
-				// them anyway would kill Telegram-style keep-alive connections
-				// (endless reconnects / spinning) for no gain.
+				// actually changed AND the old primary is DEAD for this target
+				// (post-failure cool-off / blocked). Converging on a mere
+				// hysteresis/soft-fail switch closed the old primary's healthy
+				// keep-alive conns (Telegram etc.), which made apps reconnect
+				// in bursts — each reconnect re-hit the same gate on a still
+				// slow node, an exponential reconnect storm ("keeps spinning").
+				// A dead old primary legitimately gets its residual conns
+				// closed so clients re-establish through the fresh node;
+				// a merely outranked old primary keeps its conns (both
+				// coexist briefly, new conns ride the fresh node).
 				oldPrimary := ""
 				if old, _ := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget); len(old) > 0 {
 					oldPrimary = old[0]
 				}
 				s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{p})
 				if oldPrimary != "" && oldPrimary != p.Name() {
-					s.closeSameConnection(metadata, p.Name(), metadata.SmartTarget, asnNumber, false)
+					target := metadata.SmartTarget
+					if target == "" {
+						target = metadata.WildcardTarget
+					}
+					rec := s.getPLDRecord(target, oldPrimary)
+					blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName)
+					if rec.InFailureCooldown(time.Now().Unix()) || blockedNodes[oldPrimary] {
+						s.closeSameConnection(metadata, p.Name(), metadata.SmartTarget, asnNumber, false)
+					}
 				}
 				return s.WrapConnWithMetric(c, p, metadata, connectTime), nil
 			}
@@ -501,8 +514,26 @@ func (s *SmartPLD) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 					continue
 				}
 
+				oldPrimary := ""
+				if old, _ := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget); len(old) > 0 {
+					oldPrimary = old[0]
+				}
 				s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{proxy})
-				s.closeSameConnection(metadata, proxy.Name(), metadata.SmartTarget, asnNumber, false)
+				// Converge only when the old primary is dead for this target
+				// (cool-off/blocked) — same rationale as DialContext: closing
+				// live keep-alive conns on a mere switch caused reconnect
+				// storms; a dead primary's residual conns are freed instead.
+				if oldPrimary != "" && oldPrimary != proxy.Name() {
+					target := metadata.SmartTarget
+					if target == "" {
+						target = metadata.WildcardTarget
+					}
+					rec := s.getPLDRecord(target, oldPrimary)
+					blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName)
+					if rec.InFailureCooldown(time.Now().Unix()) || blockedNodes[oldPrimary] {
+						s.closeSameConnection(metadata, proxy.Name(), metadata.SmartTarget, asnNumber, false)
+					}
+				}
 				return s.WrapPacketConnWithMetric(pc, proxy, metadata, connectTime), nil
 			}
 
