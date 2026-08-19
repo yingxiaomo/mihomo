@@ -20,9 +20,9 @@ import (
 	"github.com/dlclark/regexp2"
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/callback"
+	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/common/xsync"
-	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/component/mmdb"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
@@ -48,9 +48,9 @@ type SmartPLDOption struct {
 	Tolerance      uint16  `group:"tolerance,omitempty"`
 
 	// PLD-specific switches and tuning knobs.
-	PldCollect      bool    `group:"pld-collect,omitempty"`   // PLD 数据收集（SQLite/CSV 样本），独立于官方 collectdata
-	PriorWeight     float64 `group:"prior-weight,omitempty"`  // α0 default 0.6
-	PriorDecayK     float64 `group:"prior-decay-k,omitempty"` // default 10
+	PldCollect      bool    `group:"pld-collect,omitempty"`      // PLD 数据收集（SQLite/CSV 样本），独立于官方 collectdata
+	PriorWeight     float64 `group:"prior-weight,omitempty"`     // α0 default 0.6
+	PriorDecayK     float64 `group:"prior-decay-k,omitempty"`    // default 10
 	ExploreStrength float64 `group:"explore-strength,omitempty"` // default 0.05
 	// OfficialWeight blends the official rule weight (CalculateWeight, built on
 	// historical success/connectTime/latency/traffic stats) into the PLD rank:
@@ -77,41 +77,52 @@ type SmartPLDOption struct {
 	// ignores the cooldown when the current primary collapsed (negative
 	// reward for the target) — broken nodes must be abandoned immediately.
 	SwitchCooldownSec int `group:"switch-cooldown-sec,omitempty"`
+	// ZeroProgressMs is the second-stage post-connect quality gate. The
+	// first-byte gate only checks that SOME byte arrived; a half-broken node
+	// (TCP/HTTPS handshake up but forwarding stalled — e.g. an IPv6 path that
+	// pings fine yet blackholes data) can still deliver a response header and
+	// then never send the body, hanging every connection. ZeroProgressMs
+	// samples the connection: if the client sent request bytes (upload>0),
+	// the server still delivered ZERO download bytes and the client stopped
+	// sending too, the node is treated as failed for this target (reset
+	// unwrap + hard-punish). 0 = off; default 10000.
+	ZeroProgressMs int `group:"zero-progress-ms,omitempty"`
 }
 
 type SmartPLD struct {
 	*GroupBase
-	store                  *smart.Store
+	store *smart.Store
 
-	wg                     sync.WaitGroup
-	ctx                    context.Context
-	cancel                 context.CancelFunc
+	wg     sync.WaitGroup
+	ctx    context.Context
+	cancel context.CancelFunc
 
-	configName             string
-	selected               string
-	testUrl                string
-	expectedStatus         string
-	disableUDP             bool
+	configName     string
+	selected       string
+	testUrl        string
+	expectedStatus string
+	disableUDP     bool
 
-	dataCollector          *lightgbm.PLDDataCollector
-	policyPriority         []priorityRule
-	priorityCache          xsync.Map[string, float64]
-	sampleRate             float64
-	pldCollect             bool
-	preferASN              bool
-	hostFailLimit          int
-	tolerance              uint16
+	dataCollector  *lightgbm.PLDDataCollector
+	policyPriority []priorityRule
+	priorityCache  xsync.Map[string, float64]
+	sampleRate     float64
+	pldCollect     bool
+	preferASN      bool
+	hostFailLimit  int
+	tolerance      uint16
 
 	// PLD runtime state
-	utorPriorModel    *lightgbm.PriorModel
-	usePLD            bool // always true for the smart-pld group; kept for readability of the PLD branches
-	priorWeight       float64
-	priorDecayK       float64
-	exploreStrength   float64
-	officialWeight    float64 // cooperative blend with official CalculateWeight (0~1, off by default)
-	firstByteGateMs   int    // post-connect first-byte quality gate (ms, 0=off, default 5000)
-	switchMargin      float64 // hysteresis: challenger must outscore primary by ≥ this factor (default 1.15)
-	switchCooldown    time.Duration // minimum interval between primary switches per target (default 3min)
+	utorPriorModel  *lightgbm.PriorModel
+	usePLD          bool // always true for the smart-pld group; kept for readability of the PLD branches
+	priorWeight     float64
+	priorDecayK     float64
+	exploreStrength float64
+	officialWeight  float64       // cooperative blend with official CalculateWeight (0~1, off by default)
+	firstByteGateMs int           // post-connect first-byte quality gate (ms, 0=off, default 5000)
+	switchMargin    float64       // hysteresis: challenger must outscore primary by ≥ this factor (default 1.15)
+	switchCooldown  time.Duration // minimum interval between primary switches per target (default 3min)
+	zeroProgressMs  int           // second-stage zero-progress gate (ms, 0=off, default 10000)
 
 	// pldRecordCache caches per-(target,node) reward state in memory; persisted
 	// under the independent "pld:" key namespace of the shared smart.db.
@@ -137,33 +148,33 @@ func NewSmartPLD(option GroupCommonOption, smartOption SmartPLDOption, emptyFall
 
 	s := &SmartPLD{
 		GroupBase: NewGroupBase(GroupBaseOption{
-			Name:            option.Name,
-			Type:            C.SmartPLD,
-			Hidden:          option.Hidden,
-			Icon:            option.Icon,
-			Filter:          option.Filter,
-			ExcludeFilter:   option.ExcludeFilter,
-			ExcludeType:     option.ExcludeType,
-			TestTimeout:     option.TestTimeout,
-			MaxFailedTimes:  option.MaxFailedTimes,
-			EmptyFallback:   emptyFallback,
-			Providers:       providers,
+			Name:           option.Name,
+			Type:           C.SmartPLD,
+			Hidden:         option.Hidden,
+			Icon:           option.Icon,
+			Filter:         option.Filter,
+			ExcludeFilter:  option.ExcludeFilter,
+			ExcludeType:    option.ExcludeType,
+			TestTimeout:    option.TestTimeout,
+			MaxFailedTimes: option.MaxFailedTimes,
+			EmptyFallback:  emptyFallback,
+			Providers:      providers,
 		}),
-		testUrl:              option.URL,
-		expectedStatus:       option.ExpectedStatus,
-		configName:           configName,
-		disableUDP:           option.DisableUDP,
-		policyPriority:       make([]priorityRule, 0),
-		sampleRate:           1,
-		pldCollect:           smartOption.PldCollect,
-		preferASN:            smartOption.PreferASN,
-		tolerance:            smartOption.Tolerance,
-		usePLD:               true,
-		priorWeight:          smartOption.PriorWeight,
-		priorDecayK:          smartOption.PriorDecayK,
-		exploreStrength:      smartOption.ExploreStrength,
-		pldRecordCache:       make(map[string]*smart.PLDRecord),
-		lastSwitchAt:         make(map[string]time.Time),
+		testUrl:         option.URL,
+		expectedStatus:  option.ExpectedStatus,
+		configName:      configName,
+		disableUDP:      option.DisableUDP,
+		policyPriority:  make([]priorityRule, 0),
+		sampleRate:      1,
+		pldCollect:      smartOption.PldCollect,
+		preferASN:       smartOption.PreferASN,
+		tolerance:       smartOption.Tolerance,
+		usePLD:          true,
+		priorWeight:     smartOption.PriorWeight,
+		priorDecayK:     smartOption.PriorDecayK,
+		exploreStrength: smartOption.ExploreStrength,
+		pldRecordCache:  make(map[string]*smart.PLDRecord),
+		lastSwitchAt:    make(map[string]time.Time),
 	}
 
 	s.hostFailLimit = s.maxFailedTimes
@@ -212,6 +223,16 @@ func NewSmartPLD(option GroupCommonOption, smartOption SmartPLDOption, emptyFall
 	}
 	if s.switchCooldown > 30*time.Minute {
 		s.switchCooldown = 30 * time.Minute
+	}
+
+	// Second-stage zero-progress gate. Default 10s (sampled at 10s and 16s);
+	// 0 disables. Must not fire before the first-byte gate (5s) does its job.
+	s.zeroProgressMs = smartOption.ZeroProgressMs
+	if s.zeroProgressMs == 0 {
+		s.zeroProgressMs = 10000
+	}
+	if s.zeroProgressMs < 5000 {
+		s.zeroProgressMs = 0 // sanity: too tight to be useful, disable
 	}
 
 	if smartOption.PolicyPriority != "" {
@@ -313,7 +334,7 @@ func (s *SmartPLD) DialContext(ctx context.Context, metadata *C.Metadata) (C.Con
 		} else if i == 0 {
 			batch = proxies[0:1]
 		} else {
-			begin := 1 + (i-1) * parallelDials
+			begin := 1 + (i-1)*parallelDials
 			if begin >= len(proxies) {
 				return nil, 0
 			}
@@ -332,7 +353,7 @@ func (s *SmartPLD) DialContext(ctx context.Context, metadata *C.Metadata) (C.Con
 		}
 
 		if historyConnectTime > 0 {
-			timeout = time.Duration(float64(historyConnectTime) * connectThreshold) * time.Millisecond
+			timeout = time.Duration(float64(historyConnectTime)*connectThreshold) * time.Millisecond
 		}
 
 		if timeout > C.DefaultTCPTimeout || timeout <= 0 {
@@ -604,6 +625,66 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 		})
 	}
 
+	// Second-stage zero-progress gate: the first-byte gate approves any
+	// connection that manages a single byte, but a half-broken node (server
+	// accepts TCP/TLS and answers a header, then its forwarding stalls — the
+	// classic "looks alive, hangs forever" symptom) still slips through and
+	// every request hangs on it. Sample the connection twice; if the client
+	// sent request bytes (upload > 0) yet the server delivered ZERO download
+	// bytes while the client stopped sending too, the node is a black hole
+	// for this target: mark failed, reset the unwrap primary, hard-punish and
+	// close the stalled connection so the next request re-selects and
+	// reconnects through a working candidate.
+	if s.zeroProgressMs > 0 {
+		progressDelay := time.Duration(s.zeroProgressMs) * time.Millisecond
+		firstSample := time.Now()
+		time.AfterFunc(progressDelay, func() {
+			tracker := statistic.DefaultManager.Get(metadata.UUID)
+			if tracker == nil {
+				return // connection already gone — nothing to judge
+			}
+			upload1 := tracker.Info().UploadTotal.Load()
+			time.AfterFunc(6*time.Second, func() {
+				t2 := statistic.DefaultManager.Get(metadata.UUID)
+				if t2 == nil {
+					return
+				}
+				info2 := t2.Info()
+				if !isZeroProgressConnection(upload1, info2.UploadTotal.Load(), info2.DownloadTotal.Load()) {
+					return
+				}
+				target := metadata.SmartTarget
+				if target == "" {
+					target = metadata.WildcardTarget
+				}
+				log.Debugln("[PLD] Group: [%s] Node: [%s] Target: [%s] zero progress (%d bytes up, 0 down after %s), zero-progress gate fired",
+					s.Name(), proxy.Name(), target, upload1, time.Since(firstSample).Round(time.Second))
+				s.markNodeFailure(metadata, proxy.Name(), true, true, 4)
+				s.store.DeleteUnwrapResult(s.Name(), s.configName, target, s.getASNCode(metadata), metadata.WildcardTarget)
+				rec := s.getPLDRecord(target, proxy.Name())
+				rec.FillFailure()
+				s.savePLDRecord(target, proxy.Name(), rec)
+				// Close this node's residual same-target connections so apps
+				// reconnect through the fresh selection instead of half-alive
+				// sockets that will never deliver data.
+				statistic.DefaultManager.RangeSmartTarget(target, func(id string) bool {
+					if id == metadata.UUID {
+						return true
+					}
+					t := statistic.DefaultManager.Get(id)
+					if t == nil {
+						return true
+					}
+					if !lo.Contains(t.Chains(), proxy.Name()) {
+						return true
+					}
+					_ = t.Close()
+					return true
+				})
+			})
+		})
+	}
+
 	return s.registerClosureMetricsCallback(
 		c, proxy, metadata, connectTime,
 		&firstReadLatency, &firstReadErr, &firstWriteErr,
@@ -611,9 +692,19 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 	)
 }
 
+// isZeroProgressConnection reports whether a connection is a black hole for
+// its target: the client sent request bytes (upload1 > 0) but within the
+// sampling window the server delivered zero download bytes while the client
+// also stopped sending (upload unchanged). Pure uploads keep growing and are
+// never flagged; idle keep-alive connections never sent anything (upload1==0)
+// and are never flagged either — both are legitimate long-lived patterns.
+func isZeroProgressConnection(upload1, upload2, download int64) bool {
+	return download <= 0 && upload1 > 0 && upload2 == upload1
+}
+
 func (s *SmartPLD) WrapPacketConnWithMetric(pc C.PacketConn, proxy C.Proxy, metadata *C.Metadata, connectTime int64) C.PacketConn {
 	pc.AppendToChains(s)
-	
+
 	var udpLatency atomic.Int64
 
 	pc = callback.NewFirstReadCallBackPacketConn(pc, func(latency int64) {
@@ -1009,7 +1100,7 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		resultNames, resultWeights = s.computePLDWeights(metadata, resultNames, proxies)
 	}
 
-		// 滞回切换：PLD 重排后的新首位只有满足下列任一条件才允许替换当前
+	// 滞回切换：PLD 重排后的新首位只有满足下列任一条件才允许替换当前
 	// primary —— (a) primary 已被候选排除（blocked/dead/soft-fail）、(b)
 	// primary 对该 target 已负分崩溃、(c) 新首位领先 ≥ switch-margin（默认
 	// 15%）且该 target 的切换冷却已过。否则把 primary 钉回首位：同一 target
@@ -1392,9 +1483,9 @@ func (s *SmartPLD) updateNodeRanking() {
 	if len(rankingWrapper.Result) > 0 {
 		now := time.Now().Unix()
 		lastUpdated := rankingWrapper.LastUpdated
-		cacheAge := time.Duration(now - lastUpdated) * time.Second
+		cacheAge := time.Duration(now-lastUpdated) * time.Second
 
-		if cacheAge < 30 * time.Minute {
+		if cacheAge < 30*time.Minute {
 			rankedNodes := make(map[string]bool, len(rankingWrapper.Result))
 			for _, r := range rankingWrapper.Result {
 				rankedNodes[r.Name] = true
@@ -1408,7 +1499,7 @@ func (s *SmartPLD) updateNodeRanking() {
 			}
 
 			if !hasUnrankedProxy {
-				if cacheAge <= 10 * time.Minute {
+				if cacheAge <= 10*time.Minute {
 					return
 				}
 				proxyMap := make(map[string]C.Proxy, len(proxies))
@@ -1607,34 +1698,34 @@ func (s *SmartPLD) calcMADMetrics(delays []float64) (currentAnomaly bool, unstab
 		return true, true, 0, 0
 	}
 
-	if float64(recentSentinels) / float64(recentCount) > SentinelThreshold {
+	if float64(recentSentinels)/float64(recentCount) > SentinelThreshold {
 		unstable = true
 	}
 
 	if m < minSamples {
-		last := delays[n - 1]
+		last := delays[n-1]
 		currentAnomaly = last >= sentinel
 		return currentAnomaly, unstable, 0, 0
 	}
 
 	sort.Float64s(filtered)
 
-	if m % 2 == 1 {
-		median = filtered[m / 2]
+	if m%2 == 1 {
+		median = filtered[m/2]
 	} else {
-		median = (filtered[m / 2 - 1] + filtered[m / 2]) / 2
+		median = (filtered[m/2-1] + filtered[m/2]) / 2
 	}
 
 	devs := make([]float64, 0, m)
 	for _, v := range filtered {
-		devs = append(devs, math.Abs(v - median))
+		devs = append(devs, math.Abs(v-median))
 	}
 	sort.Float64s(devs)
 
-	if m % 2 == 1 {
-		mad = devs[m / 2]
+	if m%2 == 1 {
+		mad = devs[m/2]
 	} else {
-		mad = (devs[m / 2 - 1] + devs[m / 2]) / 2
+		mad = (devs[m/2-1] + devs[m/2]) / 2
 	}
 
 	if mad == 0 {
@@ -1649,12 +1740,12 @@ func (s *SmartPLD) calcMADMetrics(delays []float64) (currentAnomaly bool, unstab
 			varSum += d * d
 		}
 		std := math.Sqrt(varSum / float64(m))
-		threshold = mean + 2 * std
-		last := delays[n - 1]
+		threshold = mean + 2*std
+		last := delays[n-1]
 		if last >= sentinel {
 			currentAnomaly = true
 		} else {
-			currentAnomaly = last > threshold && delays[n - 2] > threshold
+			currentAnomaly = last > threshold && delays[n-2] > threshold
 		}
 
 		return currentAnomaly, unstable, threshold, calcGrade(threshold)
@@ -1665,7 +1756,7 @@ func (s *SmartPLD) calcMADMetrics(delays []float64) (currentAnomaly bool, unstab
 		k = smallK
 	}
 
-	threshold = median + k * scale * mad
+	threshold = median + k*scale*mad
 
 	if median > 0 {
 		robustCV = scale * mad / median
@@ -1673,11 +1764,11 @@ func (s *SmartPLD) calcMADMetrics(delays []float64) (currentAnomaly bool, unstab
 		robustCV = 0
 	}
 
-	last := delays[n - 1]
+	last := delays[n-1]
 	if last >= sentinel {
 		currentAnomaly = true
 	} else {
-		currentAnomaly = last > threshold && delays[n - 2] > threshold
+		currentAnomaly = last > threshold && delays[n-2] > threshold
 	}
 
 	if !unstable {
@@ -1692,7 +1783,7 @@ func (s *SmartPLD) checkNodesStable() {
 	operations := make([]smart.StoreOperation, 0, len(proxies))
 	nodesToBlock := make(map[string]*smart.NodeState, len(proxies))
 	now := time.Now().Unix()
-	blockedUntil := time.Now().Add(checkInterval + 2 * time.Minute).Unix()
+	blockedUntil := time.Now().Add(checkInterval + 2*time.Minute).Unix()
 
 	nodeStateData, _ := s.store.GetNodeStates(s.Name(), s.configName)
 
@@ -1801,7 +1892,6 @@ func (s *SmartPLD) checkBlockedNodes() {
 
 // 单位转换
 
-
 // 日志记录
 func (s *SmartPLD) logConnectionStats(err error, record *smart.StatsRecord, metadata *C.Metadata, baseWeight, priorityFactor float64,
 	addressDisplay, proxyName string, connectTime int64, latency int64, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate float64,
@@ -1899,8 +1989,6 @@ func (s *SmartPLD) collectConnectionData(input *smart.ModelInput, metadata *C.Me
 
 	s.dataCollector.AddSample(input, metadata, baseWeight, reward, weightSource, nodeDelayMs, nodeType, sampleWeight)
 }
-
-
 
 func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate,
@@ -2016,7 +2104,7 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 
 	input := lightgbm.CreateModelInputFromStatsRecord(
 		atomicRecord, metadata,
-		uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, float64(connectionDuration) / 60000.0, wildcardTarget,
+		uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, float64(connectionDuration)/60000.0, wildcardTarget,
 		lossRate, cumulLossRate,
 	)
 	input.ConnectionFailed = err != nil
@@ -2036,7 +2124,7 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 
 	// 针对具体 域名/IP 屏蔽节点（wildcardTarget + SmartTarget 双级记录）
 	failedBlock := s.markNodeFailure(metadata, proxyName, isDegraded, checked, blockCode)
-	
+
 	if isDegraded || failedBlock {
 		s.closeSameConnection(metadata, proxyName, target, asnNumber, true)
 	}
@@ -2109,7 +2197,7 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		s.collectConnectionData(input, metadata, collectedWeight, labelReward, proxyName, ModelPredicted, nodeDelayMs, nodeType, smart.SampleWeightFromMB(downloadTotalMB))
 	}
 
-	s.logConnectionStats(err, statsSnapshot, metadata, calculatedWeight / priorityFactor, priorityFactor, addressDisplay, proxyName,
+	s.logConnectionStats(err, statsSnapshot, metadata, calculatedWeight/priorityFactor, priorityFactor, addressDisplay, proxyName,
 		connectTime, latency, uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, connectionDuration, asnNumber, ModelPredicted, lossRate, cumulLossRate,
 		pldReward, pldParts, pldEMA, pldVar, pldSamples, pldBWCeilKBps)
 }
@@ -2232,7 +2320,7 @@ func (s *SmartPLD) checkNodeQuality(
 	if downloadTotal < 0.03 && metadata.Host != "" && metadata.DstPort == 443 && !isUDP && metadata.Type != C.INNER {
 		var failure bool
 		var checked bool
-		if now - wtLastCheck > 300 || now - wtLastFailure < 300 {
+		if now-wtLastCheck > 300 || now-wtLastFailure < 300 {
 			checked = true
 			status, ok, err := s.StatusTest(proxy, metadata.Host)
 			if err == nil {
@@ -2366,7 +2454,6 @@ func (s *SmartPLD) applyMaxFailedTimes() {
 		s.hostFailLimit = hostFailLimit
 	}
 }
-
 
 func (s *SmartPLD) getASNCode(metadata *C.Metadata) string {
 	if metadata.DstIPASN == "unknown" {

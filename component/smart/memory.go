@@ -26,9 +26,9 @@ var (
 )
 
 var (
-	targetCacheRefreshFlags    xsync.Map[string, bool]
-	dbResultRefreshFlags       xsync.Map[string, bool]
-	blockedNodesRefreshFlags   xsync.Map[string, bool]
+	targetCacheRefreshFlags  xsync.Map[string, bool]
+	dbResultRefreshFlags     xsync.Map[string, bool]
+	blockedNodesRefreshFlags xsync.Map[string, bool]
 )
 
 type (
@@ -68,37 +68,37 @@ func InitCache() {
 	globalCacheParams.MaxTargets = MinTargetsLimit
 
 	targetCache = lru.New[string, string](
-		lru.WithSize[string, string](globalCacheParams.MaxTargets / 3),
+		lru.WithSize[string, string](globalCacheParams.MaxTargets/3),
 		lru.WithAge[string, string](300),
 		lru.WithStale[string, string](true),
 	)
 
 	unwrapCache = lru.New[string, UnwrapMap](
-		lru.WithSize[string, UnwrapMap](globalCacheParams.MaxTargets / 3),
+		lru.WithSize[string, UnwrapMap](globalCacheParams.MaxTargets/3),
 		lru.WithAge[string, UnwrapMap](600),
 		lru.WithStale[string, UnwrapMap](true),
 	)
 
 	recordCache = lru.New[string, *AtomicStatsRecord](
-		lru.WithSize[string, *AtomicStatsRecord](globalCacheParams.MaxTargets / 3),
+		lru.WithSize[string, *AtomicStatsRecord](globalCacheParams.MaxTargets/3),
 		lru.WithAge[string, *AtomicStatsRecord](300),
 		lru.WithStale[string, *AtomicStatsRecord](true),
 	)
 
 	dbResultCache = lru.New[string, map[string][]byte](
-		lru.WithSize[string, map[string][]byte](globalCacheParams.MaxTargets / 3),
+		lru.WithSize[string, map[string][]byte](globalCacheParams.MaxTargets/3),
 		lru.WithAge[string, map[string][]byte](300),
 		lru.WithStale[string, map[string][]byte](true),
 	)
 
 	blockedNodesCache = lru.New[string, map[string]bool](
-		lru.WithSize[string, map[string]bool](globalCacheParams.MaxTargets / 3),
+		lru.WithSize[string, map[string]bool](globalCacheParams.MaxTargets/3),
 		lru.WithAge[string, map[string]bool](300),
 		lru.WithStale[string, map[string]bool](true),
 	)
 
 	hostStatusCache = lru.New[string, *HostStatus](
-		lru.WithSize[string, *HostStatus](globalCacheParams.MaxTargets / 3),
+		lru.WithSize[string, *HostStatus](globalCacheParams.MaxTargets/3),
 		lru.WithAge[string, *HostStatus](300),
 		lru.WithStale[string, *HostStatus](true),
 	)
@@ -141,7 +141,7 @@ func (s *Store) StorePrefetchResult(group, config string, target string, asnNumb
 			asnPm.RefTCP = targetCacheKey
 		}
 		asnPm.UpdatedTime = time.Now().Unix()
-		
+
 		asnData, asnErr := json.Marshal(asnPm)
 		if asnErr == nil {
 			operations = append(operations, StoreOperation{
@@ -334,7 +334,7 @@ func (s *Store) AdjustCacheParameters() {
 	needAdjust := isFirstRun
 
 	if !isFirstRun {
-		memoryChanged := math.Abs(memoryUsage - globalCacheParams.LastMemoryUsage) > 0.05
+		memoryChanged := math.Abs(memoryUsage-globalCacheParams.LastMemoryUsage) > 0.05
 		needAdjust = memoryChanged
 	}
 
@@ -359,7 +359,14 @@ func (s *Store) AdjustCacheParameters() {
 
 	cacheSize := globalCacheParams.MaxTargets / 4
 	targetCache = lru.ResetLRU(targetCache, cacheSize, lru.WithAge[string, string](300), lru.WithStale[string, string](true))
-	unwrapCache = lru.ResetLRU(unwrapCache, cacheSize, lru.WithAge[string, UnwrapMap](600), lru.WithStale[string, UnwrapMap](true))
+	// unwrapCache pins the most-recent successful node per target so same-target
+	// connections converge on one node (closeSameConnection avoids killing each
+	// other's long-lived conns). TTL used to be 600s; it is 60s now so a node
+	// that is "alive" but actually a black hole (half-broken path: TCP/HTTPS
+	// handshake up, forwarding stalled) gets re-evaluated over the full pool
+	// within a minute instead of being pinned for ten — the recurring "node
+	// unusable but never switches" symptom.
+	unwrapCache = lru.ResetLRU(unwrapCache, cacheSize, lru.WithAge[string, UnwrapMap](60), lru.WithStale[string, UnwrapMap](true))
 	recordCache = lru.ResetLRU(recordCache, cacheSize, lru.WithAge[string, *AtomicStatsRecord](300), lru.WithStale[string, *AtomicStatsRecord](true))
 	dbResultCache = lru.ResetLRU(dbResultCache, cacheSize, lru.WithAge[string, map[string][]byte](300), lru.WithStale[string, map[string][]byte](true))
 	blockedNodesCache = lru.ResetLRU(blockedNodesCache, cacheSize, lru.WithAge[string, map[string]bool](300), lru.WithStale[string, map[string]bool](true))
