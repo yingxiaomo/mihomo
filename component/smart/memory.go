@@ -361,12 +361,13 @@ func (s *Store) AdjustCacheParameters() {
 	targetCache = lru.ResetLRU(targetCache, cacheSize, lru.WithAge[string, string](300), lru.WithStale[string, string](true))
 	// unwrapCache pins the most-recent successful node per target so same-target
 	// connections converge on one node (closeSameConnection avoids killing each
-	// other's long-lived conns). TTL used to be 600s; it is 60s now so a node
-	// that is "alive" but actually a black hole (half-broken path: TCP/HTTPS
-	// handshake up, forwarding stalled) gets re-evaluated over the full pool
-	// within a minute instead of being pinned for ten — the recurring "node
-	// unusable but never switches" symptom.
-	unwrapCache = lru.ResetLRU(unwrapCache, cacheSize, lru.WithAge[string, UnwrapMap](60), lru.WithStale[string, UnwrapMap](true))
+	// other's long-lived conns). TTL 300s: the stale-while-revalidate refresh
+	// re-evaluates the pool every 5 minutes instead of every minute — a 60s TTL
+	// made the async refresh rewrite the primary too often and closeSameConnection
+	// killed Telegram-style keep-alive conns on each swap (endless reconnects).
+	// Broken nodes still switch fast via the post-failure cool-off, which works
+	// regardless of this TTL.
+	unwrapCache = lru.ResetLRU(unwrapCache, cacheSize, lru.WithAge[string, UnwrapMap](300), lru.WithStale[string, UnwrapMap](true))
 	recordCache = lru.ResetLRU(recordCache, cacheSize, lru.WithAge[string, *AtomicStatsRecord](300), lru.WithStale[string, *AtomicStatsRecord](true))
 	dbResultCache = lru.ResetLRU(dbResultCache, cacheSize, lru.WithAge[string, map[string][]byte](300), lru.WithStale[string, map[string][]byte](true))
 	blockedNodesCache = lru.ResetLRU(blockedNodesCache, cacheSize, lru.WithAge[string, map[string]bool](300), lru.WithStale[string, map[string]bool](true))

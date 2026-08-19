@@ -402,8 +402,20 @@ func (s *SmartPLD) DialContext(ctx context.Context, metadata *C.Metadata) (C.Con
 				}
 				finalErr = err
 			} else {
+				// Only converge same-target connections when the unwrap primary
+				// actually changed. If the primary is unchanged (e.g. a TTL
+				// refresh re-dialed the same node, or a parallel fallback retry),
+				// the existing long-lived conns already ride this node — closing
+				// them anyway would kill Telegram-style keep-alive connections
+				// (endless reconnects / spinning) for no gain.
+				oldPrimary := ""
+				if old, _ := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget); len(old) > 0 {
+					oldPrimary = old[0]
+				}
 				s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{p})
-				s.closeSameConnection(metadata, p.Name(), metadata.SmartTarget, asnNumber, false)
+				if oldPrimary != "" && oldPrimary != p.Name() {
+					s.closeSameConnection(metadata, p.Name(), metadata.SmartTarget, asnNumber, false)
+				}
 				return s.WrapConnWithMetric(c, p, metadata, connectTime), nil
 			}
 		}
@@ -1085,7 +1097,7 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 
 	// 异步更新过期缓存（stale-while-revalidate）
 	refreshUnwrapCache := func(isUDP bool) {
-		names, _ := computeFreshNodes(isUDP)
+		names, weights := computeFreshNodes(isUDP)
 		if len(names) == 0 {
 			return
 		}
@@ -1094,12 +1106,43 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		for _, p := range allProxies {
 			proxyByName[p.Name()] = p
 		}
+		// Apply the same hysteresis as selectProxies: keep the current primary
+		// unless the fresh best clearly outranks it (>= switch-margin) or the
+		// current primary dropped out of the candidates. Without this the
+		// stale-while-revalidate refresh rewrote the unwrap primary on every TTL
+		// expiry (60s), closeSameConnection then killed the previous primary's
+		// long-lived conns (Telegram-style keep-alive) and clients spun
+		// reconnecting through a rotating node — "always switching, no stable
+		// connection".
+		freshBest := names[0]
+		if old, _ := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget); len(old) > 0 && old[0] != freshBest {
+			oldIdx := -1
+			for i, n := range names {
+				if n == old[0] {
+					oldIdx = i
+					break
+				}
+			}
+			var wNew, wCur float64
+			if oldIdx >= 0 && weights != nil && len(weights) > oldIdx {
+				wNew = weights[0]
+				wCur = weights[oldIdx]
+			}
+			if oldIdx >= 0 && (weights == nil || len(weights) <= oldIdx || wCur <= 0 || wNew <= wCur*s.switchMargin) {
+				// Current primary still a candidate and not clearly outranked:
+				// keep it pinned. (weights nil => no reliable comparison => keep.)
+				if p, ok := proxyByName[old[0]]; ok {
+					s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{p})
+					return
+				}
+			}
+		}
 		// Only refresh the primary (first ranked) node into the unwrap cache:
 		// unwrap must stay single-node (official smart semantics) so same-target
 		// connections converge on one node. Writing the full fresh list here
 		// would let the PLD F-score re-rank thrash between close-scored nodes
 		// and closeSameConnection would kill each other's long-lived conns.
-		if p, ok := proxyByName[names[0]]; ok {
+		if p, ok := proxyByName[freshBest]; ok {
 			s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{p})
 		}
 	}
