@@ -94,6 +94,42 @@ func TestFinalWeightColdStart(t *testing.T) {
 	}
 }
 
+func TestComputeRewardPartialSuccess(t *testing.T) {
+	// Partial success: downloaded 2MB at ~2MB/s then the client closed the
+	// connection (short-video swipe / prefetch cancel). This is NOT a hard
+	// failure — it proved real throughput and must keep a positive-ish score.
+	r, parts := ComputeRewardDetail(RewardedMetrics{
+		DownloadMB:  2.0, // 2MB
+		DurationSec: 1.0,
+		Failed:      true,
+	})
+	if parts.Failure {
+		t.Fatalf("downloaded-then-closed must not be a hard failure")
+	}
+	if r <= 0.1 || r >= 0.25 {
+		t.Fatalf("partial reward out of band: %v", r) // thrScore 0.4057 → 0.175
+	}
+
+	// True failure: nothing downloaded before closing → hard -2.
+	r2, parts2 := ComputeRewardDetail(RewardedMetrics{Failed: true})
+	if !parts2.Failure || r2 != -2.0 {
+		t.Fatalf("real failure must stay -2: r=%v failure=%v", r2, parts2.Failure)
+	}
+
+	// Partial success updates the throughput channel + archive, not latency.
+	rec := &PLDRecord{}
+	rec.UpdateWithMetrics(RewardedMetrics{DownloadMB: 2.0, DurationSec: 1.0, Failed: true})
+	if rec.RewardLarge <= 0 || rec.SampleCountLarge != 1 {
+		t.Fatalf("partial success must feed the throughput channel: large=%v cnt=%d", rec.RewardLarge, rec.SampleCountLarge)
+	}
+	if rec.ThrCount != 1 || math.Abs(rec.ThrKBpsEMA-2048) > 20 {
+		t.Fatalf("partial success must feed the throughput archive: thr=%v", rec.ThrKBpsEMA)
+	}
+	if rec.Reward != 0 || rec.SampleCount != 0 {
+		t.Fatalf("partial success must NOT touch the latency channel: rew=%v cnt=%d", rec.Reward, rec.SampleCount)
+	}
+}
+
 func TestPLDRecordDualChannelIsolation(t *testing.T) {
 	// Small transfer updates ONLY the latency channel; the throughput channel
 	// and the throughput archive must stay untouched (the core fix: page loads

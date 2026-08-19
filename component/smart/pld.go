@@ -80,6 +80,19 @@ type RewardParts struct {
 // The scalar stays the same as ComputeReward; the parts only feed logging.
 func ComputeRewardDetail(m RewardedMetrics) (float64, RewardParts) {
 	if m.Failed {
+		// Partial success: a connection that downloaded a large amount BEFORE
+		// closing abnormally (short-video swipe, prefetch cancel, closeSame-
+		// Connection killing a long-lived conn) still proves real throughput.
+		// Scoring it as a hard -2.0 would let everyday usage punish every
+		// node's throughput channel to the floor, destroying the ability to
+		// tell fast nodes from slow ones. So: score by sustained throughput
+		// with a fixed small partial-failure penalty.
+		if m.DownloadMB >= SmallTransferKB/1024.0 && m.DurationSec >= 0.5 {
+			thrKbps := m.DownloadMB * 1024.0 / m.DurationSec
+			thrScore := thrKbps / (thrKbps + 3000.0)
+			r := 0.8*thrScore - 0.15 - m.LossRate*1.2
+			return clampReward(r), RewardParts{ThrKBps: thrKbps, LossPenalty: m.LossRate * 1.2}
+		}
 		return -2.0, RewardParts{Failure: true}
 	}
 
@@ -267,7 +280,9 @@ func (r *PLDRecord) FillFailure() {
 // UpdateWithMetrics folds one completed connection into the channel-appropriate
 // reward state:
 //
-//   - failure        → FillFailure (both channels)
+//   - hard failure (nothing downloaded) → FillFailure (both channels)
+//   - partial success (large download then abnormal close) → throughput
+//     channel + throughput archive, scored with a small penalty
 //   - small transfer → latency channel only (throughput channel untouched)
 //   - large transfer → throughput channel + sustained-throughput archive
 //     (latency channel untouched)
@@ -275,12 +290,16 @@ func (r *PLDRecord) FillFailure() {
 // It returns the scalar reward and its physical breakdown for logging/training.
 func (r *PLDRecord) UpdateWithMetrics(m RewardedMetrics) (float64, RewardParts) {
 	scalar, parts := ComputeRewardDetail(m)
-	if m.Failed {
+	if m.Failed && parts.Failure {
+		// True failure (no meaningful download): punish BOTH channels so the
+		// node drops out of ranking for latency- and throughput-sensitive
+		// requests alike.
 		r.FillFailure()
 		return scalar, parts
 	}
 	if !m.SmallFlow() {
 		// Large-flow channel: throughput reward + explicit throughput archive.
+		// Partial successes update it too — they carried real bytes.
 		newR, newVar, newCnt := UpdateRewardEMA(r.RewardLarge, r.RewardLargeVar, r.SampleCountLarge, scalar)
 		r.RewardLarge, r.RewardLargeVar, r.SampleCountLarge = newR, newVar, newCnt
 		if parts.ThrKBps > 0 {
