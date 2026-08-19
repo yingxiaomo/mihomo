@@ -247,9 +247,9 @@ func FinalWeight(prior, rewardEMA float64, nNode, nTotal int64, alpha0, k, c flo
 // Failures are applied to BOTH channels: a node that cannot reach the target
 // must not be selected under either flow priority.
 type PLDRecord struct {
-	Reward        float64 `json:"reward,omitempty"`
-	RewardVar     float64 `json:"reward_var,omitempty"`
-	SampleCount   int64   `json:"sample_count,omitempty"`
+	Reward      float64 `json:"reward,omitempty"`
+	RewardVar   float64 `json:"reward_var,omitempty"`
+	SampleCount int64   `json:"sample_count,omitempty"`
 
 	RewardLarge      float64 `json:"reward_large,omitempty"`
 	RewardLargeVar   float64 `json:"reward_large_var,omitempty"`
@@ -262,7 +262,20 @@ type PLDRecord struct {
 	FirstByteMs   int64   `json:"first_byte_ms,omitempty"`
 	BWCeilingKBps float64 `json:"bw_ceiling_kbps,omitempty"`
 	LastUpdated   int64   `json:"last_updated,omitempty"`
+
+	// FailureUntil marks the end of the post-failure cool-off window (unix
+	// seconds). While now < FailureUntil the node must not be selected for
+	// this target at all. This exists because the -2 hard-failure reward is
+	// nearly invisible to the EWMA of a high-sample node (alpha shrinks as
+	// SampleCount grows), and the failure-count block needs maxFailedTimes
+	// consecutive failures — both are far too slow when a node just went
+	// down and the user expects the next request to pick another candidate.
+	FailureUntil int64 `json:"failure_until,omitempty"`
 }
+
+// FailureCooldownSec is how long a node is unselectable for a target after a
+// hard failure (dial error, first-byte gate timeout, zero-progress gate).
+const FailureCooldownSec = 60
 
 // FillFailure applies a hard failure reward (-2) to BOTH channels: a node that
 // fails the target (dial error, first-byte gate timeout, abnormal response)
@@ -274,7 +287,15 @@ func (r *PLDRecord) FillFailure() {
 	r.Reward, r.RewardVar, r.SampleCount = newR, newVar, newCnt
 	newRL, newVarL, newCntL := UpdateRewardEMA(r.RewardLarge, r.RewardLargeVar, r.SampleCountLarge, rew)
 	r.RewardLarge, r.RewardLargeVar, r.SampleCountLarge = newRL, newVarL, newCntL
+	r.FailureUntil = time.Now().Add(FailureCooldownSec * time.Second).Unix()
 	r.LastUpdated = time.Now().Unix()
+}
+
+// InFailureCooldown reports whether the record is inside its post-failure
+// cool-off window at unix time now — the node must not be selected for this
+// target until the window passes.
+func (r *PLDRecord) InFailureCooldown(now int64) bool {
+	return FailureCooldownSec > 0 && now < r.FailureUntil
 }
 
 // UpdateWithMetrics folds one completed connection into the channel-appropriate

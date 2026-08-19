@@ -87,6 +87,14 @@ type SmartPLDOption struct {
 	// sending too, the node is treated as failed for this target (reset
 	// unwrap + hard-punish). 0 = off; default 10000.
 	ZeroProgressMs int `group:"zero-progress-ms,omitempty"`
+	// FailureCooldownSec is how long a node is unselectable for one target
+	// after a hard failure (dial error, first-byte gate, zero-progress gate).
+	// This fast path exists because the -2 failure reward barely moves the
+	// EWMA of a high-sample node (alpha shrinks with SampleCount) and the
+	// failure-count block needs maxFailedTimes consecutive failures — both
+	// too slow to stop a just-died node being selected again on the next
+	// request. 0 = off; default 60.
+	FailureCooldownSec int `group:"failure-cooldown-sec,omitempty"`
 }
 
 type SmartPLD struct {
@@ -123,6 +131,7 @@ type SmartPLD struct {
 	switchMargin    float64       // hysteresis: challenger must outscore primary by ≥ this factor (default 1.15)
 	switchCooldown  time.Duration // minimum interval between primary switches per target (default 3min)
 	zeroProgressMs  int           // second-stage zero-progress gate (ms, 0=off, default 10000)
+	failureCooldown time.Duration // unselectable window per target after a hard failure (default 60s)
 
 	// pldRecordCache caches per-(target,node) reward state in memory; persisted
 	// under the independent "pld:" key namespace of the shared smart.db.
@@ -233,6 +242,17 @@ func NewSmartPLD(option GroupCommonOption, smartOption SmartPLDOption, emptyFall
 	}
 	if s.zeroProgressMs < 5000 {
 		s.zeroProgressMs = 0 // sanity: too tight to be useful, disable
+	}
+
+	// Post-failure cool-off: a hard failure makes the node unselectable for
+	// this target for failureCooldown (default 60s), regardless of its EWMA
+	// reward or unwrap-primary status.
+	s.failureCooldown = time.Duration(smartOption.FailureCooldownSec) * time.Second
+	if s.failureCooldown == 0 {
+		s.failureCooldown = smart.FailureCooldownSec * time.Second
+	}
+	if s.failureCooldown < 0 {
+		s.failureCooldown = 0 // explicit off
 	}
 
 	if smartOption.PolicyPriority != "" {
@@ -825,13 +845,32 @@ func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, na
 		return rec.Reward < 0
 	}
 
+	// inCooldown reports whether the node is cooling off for this target
+	// after a recent hard failure. Unlike softFailed (EWMA-based), this is a
+	// hard exclusion: a just-failed node must not be selected again even as
+	// the unwrap primary, because its -2 reward barely moves the EWMA of a
+	// high-sample node and the failure-count block needs maxFailedTimes
+	// consecutive failures — both far too slow for the "node just went down,
+	// switch now" expectation.
+	inCooldown := func(name string) bool {
+		if s.failureCooldown <= 0 {
+			return false
+		}
+		target := metadata.SmartTarget
+		if target == "" {
+			target = wildcardTarget
+		}
+		rec := s.getPLDRecord(target, name)
+		return rec.InFailureCooldown(time.Now().Unix())
+	}
+
 	selected := make([]C.Proxy, 0, minCount+1)
 	var failedSelected []C.Proxy
 
 	for i, name := range names {
 		checkNodeUsed[name] = true
 		proxy := proxyByName[name]
-		if proxy == nil || blockedNodes[name] || !proxy.AliveForTestUrl(s.testUrl) || (isUDP && !proxy.SupportUDP()) {
+		if proxy == nil || blockedNodes[name] || !proxy.AliveForTestUrl(s.testUrl) || (isUDP && !proxy.SupportUDP()) || inCooldown(name) {
 			continue
 		}
 		// The ranked names on this path are the unwrap primary / fresh winners:
@@ -944,7 +983,7 @@ func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, na
 		if !p.AliveForTestUrl(s.testUrl) || (isUDP && !p.SupportUDP()) {
 			continue
 		}
-		if softFailed(name) {
+		if softFailed(name) || inCooldown(name) {
 			continue
 		}
 		filteredAll = append(filteredAll, p)

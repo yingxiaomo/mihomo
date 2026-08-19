@@ -3,6 +3,7 @@ package smart
 import (
 	"math"
 	"testing"
+	"time"
 )
 
 func TestUpdateRewardEMA(t *testing.T) {
@@ -62,14 +63,14 @@ func TestComputeRewardSmallTransfer(t *testing.T) {
 func TestComputeRewardLargeTransfer(t *testing.T) {
 	// Large transfer (≥512KB): throughput dominates; loss penalizes.
 	rFast := ComputeReward(RewardedMetrics{
-		DownloadMB: 10.0, // 10MB
-		DurationSec: 2.0, // ~5MB/s
-		LossRate:   0,
+		DownloadMB:  10.0, // 10MB
+		DurationSec: 2.0,  // ~5MB/s
+		LossRate:    0,
 	})
 	rLossy := ComputeReward(RewardedMetrics{
-		DownloadMB: 10.0,
+		DownloadMB:  10.0,
 		DurationSec: 2.0,
-		LossRate:   0.15,
+		LossRate:    0.15,
 	})
 	if rLossy >= rFast {
 		t.Fatalf("loss should penalize: fast=%v lossy=%v", rFast, rLossy)
@@ -229,6 +230,36 @@ func TestPreferLargeFlowChannel(t *testing.T) {
 	}
 }
 
+func TestPLDRecordFailureCooldown(t *testing.T) {
+	// A hard failure must make the node unselectable for the cool-off window:
+	// the -2 reward alone cannot be trusted (EWMA dilution on high-sample
+	// nodes), so FillFailure arms FailureUntil as a hard exclusion.
+	rec := &PLDRecord{}
+	rec.FillFailure()
+	now := time.Now().Unix()
+	if !rec.InFailureCooldown(now) {
+		t.Fatalf("immediately after FillFailure the node must be cooling off")
+	}
+	if rec.InFailureCooldown(now + FailureCooldownSec + 1) {
+		t.Fatalf("after the cool-off window the node must be selectable again")
+	}
+
+	// Success updates must NOT arm the cool-off.
+	rec2 := &PLDRecord{}
+	rec2.UpdateWithMetrics(RewardedMetrics{ConnectTimeMs: 30, DownloadMB: 0.05, DurationSec: 0.4})
+	if rec2.InFailureCooldown(now) {
+		t.Fatalf("successful transfer must not arm the failure cool-off")
+	}
+
+	// Partial success (downloaded then closed abnormally) is NOT a hard
+	// failure and must not arm the cool-off either.
+	rec3 := &PLDRecord{}
+	rec3.UpdateWithMetrics(RewardedMetrics{DownloadMB: 2.0, DurationSec: 1.0, Failed: true})
+	if rec3.InFailureCooldown(now) {
+		t.Fatalf("partial success must not arm the failure cool-off")
+	}
+}
+
 func TestSampleWeightFromMB(t *testing.T) {
 	if w := SampleWeightFromMB(0.05); w < 0.5 || w > 0.6 {
 		t.Fatalf("50KB floor: %v", w)
@@ -251,5 +282,3 @@ func TestSampleWeightFromMB(t *testing.T) {
 		t.Fatalf("weight cap: %v", w)
 	}
 }
-
-
