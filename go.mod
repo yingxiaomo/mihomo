@@ -27,7 +27,7 @@ require (
 	github.com/metacubex/jls-tls v0.0.0-20260723084315-67adc0e2f796
 	github.com/metacubex/kcp-go v0.0.0-20260105040817-550693377604
 	github.com/metacubex/mhurl v0.1.0
-	github.com/metacubex/mipstack v0.0.0-20260816065001-b7038299fe13
+	github.com/metacubex/mipstack v0.0.0-20260822172056-710fa36f450b
 	github.com/metacubex/mlkem v0.1.0
 	github.com/metacubex/quic-go v0.61.1-0.20260727080200-2548683b76f4
 	github.com/metacubex/randv2 v0.2.0
@@ -43,7 +43,7 @@ require (
 	github.com/metacubex/sing-wireguard v0.0.0-20260810013230-110eac03c3f0
 	github.com/metacubex/smux v0.0.0-20260105030934-d0c8756d3141
 	github.com/metacubex/ssh v0.1.0
-	github.com/metacubex/tailscale v0.0.0-20260807072706-a4fb5feabcbb
+	github.com/metacubex/tailscale v0.0.0-20260821153257-ff0ecd818181
 	github.com/metacubex/tfo-go v0.0.0-20260623020846-376a77860b8c
 	github.com/metacubex/tls v0.1.8
 	github.com/metacubex/utls v1.8.7
@@ -57,14 +57,14 @@ require (
 	github.com/sagernet/sing v0.8.9
 	github.com/samber/lo v1.53.0
 	github.com/sirupsen/logrus v1.9.4
-	github.com/stretchr/testify v1.11.1
+	github.com/stretchr/testify v1.12.1
 	github.com/vernesong/leaves v0.0.0-20260629081247-2a1c022f37d0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	github.com/yosida95/uritemplate/v3 v3.0.2
 	gitlab.com/go-extension/aes-ccm v0.0.0-20230221065045-e58665ef23c7
 	go.uber.org/automaxprocs v1.6.0
+	go.yaml.in/yaml/v3 v3.0.5
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
-	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.40.0
 )
 
@@ -92,7 +92,6 @@ require (
 	github.com/bodgit/plumbing v1.3.0 // indirect
 	github.com/bodgit/windows v1.0.1 // indirect
 	github.com/coder/websocket v1.8.12 // indirect
-	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dunglas/httpsfv v1.0.2 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/ebitengine/purego v0.10.0 // indirect
