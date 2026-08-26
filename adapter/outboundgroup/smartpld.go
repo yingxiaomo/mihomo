@@ -1168,6 +1168,46 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 	isUDP := metadata.NetWork == C.UDP
 	resultNames, resultWeights := trySelector(isUDP)
 
+	// Single-candidate deadlock fix: an unwrap hit returns only the pinned
+	// primary, which starves every downstream mechanism — PLD re-rank has no
+	// other nodes to compare against, the UCB exploration bonus has nowhere to
+	// apply, and the hysteresis switch (len(resultNames) > 1) can never fire.
+	// The engine may already know this target performs badly on the primary
+	// (negative F score) yet has no path to act on that knowledge. Supplement
+	// healthy pool nodes (excluding primary/blocked/dead/cooldown/soft-fail)
+	// as comparison candidates so D-UCB ranks a real field; hysteresis margin +
+	// switch cooldown still protect the primary from close-score thrashing.
+	if s.usePLD && len(resultNames) == 1 && len(proxies) > 1 {
+		primaryName := resultNames[0]
+		blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName)
+		supplemented := 0
+		for _, p := range proxies {
+			name := p.Name()
+			if name == primaryName || blockedNodes[name] {
+				continue
+			}
+			if !p.AliveForTestUrl(s.testUrl) {
+				continue
+			}
+			if isUDP && !p.SupportUDP() {
+				continue
+			}
+			rec := s.getPLDRecord(target, name)
+			if rec.InFailureCooldown(time.Now().Unix()) {
+				continue
+			}
+			if rec.SampleCount >= 2 && rec.Reward < 0 {
+				continue // soft-fail: historically negative on this target
+			}
+			resultNames = append(resultNames, name)
+			supplemented++
+		}
+		if supplemented > 0 {
+			log.Debugln("[PLD] Group: [%s] Target: [%s] unwrap single candidate, supplemented %d comparison candidates",
+				s.Name(), target, supplemented)
+		}
+	}
+
 	// Keep the primary node stable: unwrap now stores the single most-recent
 	// winner per target, but the fresh path (prefetch/best-node caches) can
 	// still yield a multi-node list. After the PLD re-rank, restore the head
