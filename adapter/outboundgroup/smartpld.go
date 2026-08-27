@@ -1099,11 +1099,50 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 
 	// 预解析缓存或实时计算
 	computeFreshNodes := func(isUDP bool) ([]string, []float64) {
+		getAndFilter := func(nodes []string, weights []float64) ([]string, []float64) {
+			if len(nodes) == 0 || !s.usePLD {
+				return nodes, weights
+			}
+			// Filter out nodes in PLD failure cooldown or soft-failed
+			// (negative reward EMA): prefetch cache is computed from old
+			// stats and does not know about recent PLD-specific crashes.
+			// Without this filter, a node that crashed for a specific
+			// target (e.g. TG via GFW-interfered CF node) gets re-selected
+			// immediately after cooldown, causing an endless crash→switch→
+			// return cycle that manifests as loading circles.
+			target := metadata.SmartTarget
+			if target == "" {
+				target = wildcardTarget
+			}
+			var filteredN []string
+			var filteredW []float64
+			for i, name := range nodes {
+				rec := s.getPLDRecord(target, name)
+				if rec.InFailureCooldown(time.Now().Unix()) {
+					log.Debugln("[PLD] Group: [%s] Target: [%s] prefetch filtered [%s] in failure cooldown",
+						s.Name(), target, name)
+					continue
+				}
+				if rec.SampleCount >= 2 && rec.Reward < 0 {
+					log.Debugln("[PLD] Group: [%s] Target: [%s] prefetch filtered [%s] soft-failed (reward=%.3f)",
+						s.Name(), target, name, rec.Reward)
+					continue
+				}
+				filteredN = append(filteredN, name)
+				if i < len(weights) {
+					filteredW = append(filteredW, weights[i])
+				}
+			}
+			if len(filteredN) == 0 {
+				return nodes, weights // fallback: don't starve if all filtered
+			}
+			return filteredN, filteredW
+		}
 		if proxiesName, weights := s.store.GetPrefetchResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); len(proxiesName) > 0 {
-			return proxiesName, weights
+			return getAndFilter(proxiesName, weights)
 		}
 		if proxiesName, weights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); err == nil && len(proxiesName) > 0 {
-			return proxiesName, weights
+			return getAndFilter(proxiesName, weights)
 		}
 		return nil, nil
 	}
@@ -1147,6 +1186,18 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		if rec := s.getPLDRecord(target, old[0]); rec.InFailureCooldown(time.Now().Unix()) {
 			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, wildcard)
 			return
+		}
+		// Soft-failed primary (negative PLD reward EMA): also delete unwrap
+		// so the next request does a fresh computation. Without this, the
+		// unwrap stays pinned to a node that selectProxies will reject on
+		// every request, wasting a round-trip and causing brief stalls.
+		if s.usePLD {
+			if rec := s.getPLDRecord(target, old[0]); rec.SampleCount >= 2 && rec.Reward < 0 {
+				s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, wildcard)
+				log.Debugln("[PLD] Group: [%s] Target: [%s] unwrap refresh deleted soft-failed primary [%s] (reward=%.3f)",
+					s.Name(), target, old[0], rec.Reward)
+				return
+			}
 		}
 		// Old primary still healthy for this target: renew the unwrap entry so
 		// the TTL does not expire again on the very next request (avoids a
