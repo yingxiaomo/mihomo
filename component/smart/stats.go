@@ -1214,7 +1214,7 @@ func (s *Store) GetAllNodesForGroup(group, config string) ([]string, error) {
 }
 
 // 域名失败屏蔽
-func (s *Store) GetHostStatus(group, config, wildcardTarget string, extraTargets ...string) (failNodes map[string]int, lastCheck int64, lastFailure int64, blocked bool) {
+func (s *Store) GetHostStatus(group, config, wildcardTarget string, hostFailLimit int, extraTargets ...string) (failNodes map[string]int, lastCheck int64, lastFailure int64, blocked bool) {
 	now := time.Now().Unix()
 
 	lookup := func(pathPrefix string) (nodes map[string]int, lastCheck int64, lastFailure int64, blocked bool) {
@@ -1230,6 +1230,7 @@ func (s *Store) GetHostStatus(group, config, wildcardTarget string, extraTargets
 		})
 		hs.mu.RLock()
 		defer hs.mu.RUnlock()
+		blockingCount := 0
 		for code, codeSet := range hs.Codes {
 			if codeSet == nil {
 				continue
@@ -1243,9 +1244,13 @@ func (s *Store) GetHostStatus(group, config, wildcardTarget string, extraTargets
 						nodes[nodeName] = code
 					}
 				}
+				if code != 1 && nodeEntry > now {
+					blockingCount++
+				}
 			}
 		}
-		return nodes, hs.LastCheck, hs.LastFailure, hs.Blocked
+		blocked = blockingCount > hostFailLimit
+		return nodes, hs.LastCheck, hs.LastFailure, blocked
 	}
 
 	failNodes, lastCheck, lastFailure, blocked = lookup(FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget))
@@ -1501,7 +1506,7 @@ saveAndReturn:
 	return failedBlock
 }
 
-func (s *Store) CheckHostStatus(group, config string) (map[string]map[string]string, error) {
+func (s *Store) CheckHostStatus(group, config string, hostFailLimit int) (map[string]map[string]string, error) {
 	pathPrefix := FormatDBKey(KeyTypeHostFailures, config, group)
 	dataMap, err := s.GetSubBytesByPath(pathPrefix)
 	if err != nil {
@@ -1524,17 +1529,50 @@ func (s *Store) CheckHostStatus(group, config string) (map[string]map[string]str
 		}
 		wildcardTarget := fullPath[lastSlash+1:]
 
-		if hs.Blocked {
-			continue
-		}
+		cachePath := FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget)
+		cacheHS, _ := hostStatusCache.GetOrStore(cachePath, func() *HostStatus { return &HostStatus{} })
+		cacheHS.initOnce.Do(func() {
+			if rawResult, err := s.GetSubBytesByPath(cachePath); err == nil {
+				for _, data := range rawResult {
+					if json.Unmarshal(data, cacheHS) == nil {
+						break
+					}
+				}
+			}
+		})
 
-		codeSet, ok := hs.Codes[2]
+		cacheHS.mu.Lock()
+		hostBlockingCount := 0
+		for code, cs := range cacheHS.Codes {
+			if code != 1 && cs != nil {
+				for _, nodeEntry := range cs.Nodes {
+					if nodeEntry == 0 || nodeEntry > now {
+						hostBlockingCount++
+					}
+				}
+			}
+		}
+		if newBlocked := hostBlockingCount > hostFailLimit; newBlocked != cacheHS.Blocked {
+			cacheHS.Blocked = newBlocked
+			if newData, merr := json.Marshal(cacheHS); merr == nil {
+				s.AppendToGlobalQueue(StoreOperation{
+					Type:   OpSaveHostFailures,
+					Group:  group,
+					Config: config,
+					Target: wildcardTarget,
+					Data:   newData,
+				})
+			}
+		}
+		cacheHS.mu.Unlock()
+
+		codeSet, ok := cacheHS.Codes[2]
 		if !ok || codeSet == nil || codeSet.NodeHosts == nil {
 			continue
 		}
 
 		for nodeName, nodeEntry := range codeSet.Nodes {
-			if nodeEntry != 0 && nodeEntry <= now {
+			if nodeEntry == 0 || nodeEntry-now > int64((HostFailureNodeTTL-hostStatusRetryAfter).Seconds()) {
 				continue
 			}
 			h, ok2 := codeSet.NodeHosts[nodeName]
@@ -1552,7 +1590,7 @@ func (s *Store) CheckHostStatus(group, config string) (map[string]map[string]str
 }
 
 // 移除节点数据
-func (s *Store) RemoveNodesData(group, config string, nodes []string) error {
+func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes []string) error {
 	if len(nodes) == 0 {
 		return nil
 	}
@@ -1762,6 +1800,13 @@ func (s *Store) RemoveNodesData(group, config string, nodes []string) error {
 				if len(hs.Codes) == 0 {
 					failuresToDelete = append(failuresToDelete, path)
 				} else {
+					hostBlockingCount := 0
+					for code, cs := range hs.Codes {
+						if code != 1 && cs != nil {
+							hostBlockingCount += len(cs.Nodes)
+						}
+					}
+					hs.Blocked = hostBlockingCount > hostFailLimit
 					newData, merr := json.Marshal(&hs)
 					if merr != nil {
 						if firstErr == nil {
