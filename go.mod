@@ -131,7 +131,6 @@ require (
 	github.com/oasisprotocol/deoxysii v0.0.0-20220228165953-2091330c22b7 // indirect
 	github.com/pierrec/lz4/v4 v4.1.27 // indirect
 	github.com/pires/go-proxyproto v0.8.0 // indirect
-	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/safchain/ethtool v0.3.0 // indirect
 	github.com/sagernet/cronet-go/lib/android_386 v0.0.0-20260712142643-1e5048bd5587 // indirect

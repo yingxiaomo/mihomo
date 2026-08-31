@@ -835,7 +835,7 @@ func (s *SmartPLD) Proxies() []C.Proxy {
 
 func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, names []string, weights []float64, all []C.Proxy, minCount int, isUDP bool) []C.Proxy {
 	blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName)
-	wtFailNodes, _, _, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, metadata.SmartTarget)
+	wtFailNodes, _, _, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, s.hostFailLimit, metadata.SmartTarget)
 
 	var proxyByName map[string]C.Proxy
 	if len(names) > 0 {
@@ -1784,7 +1784,7 @@ func (s *SmartPLD) cleanupOrphanedNodeCache() {
 			log.Debugln("[PLD] Cleaning up cache data for non-existent node [%s]", node)
 		}
 
-		err := s.store.RemoveNodesData(s.Name(), s.configName, orphanedNodes)
+		err := s.store.RemoveNodesData(s.Name(), s.configName, s.hostFailLimit, orphanedNodes)
 		if err != nil {
 			log.Warnln("[PLD] Failed to clean up non-existent node caches: %v", err)
 		}
@@ -2481,7 +2481,7 @@ func (s *SmartPLD) checkNodeQuality(
 		return oldWeight, false, false, 0
 	}
 
-	_, wtLastCheck, wtLastFailure, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget)
+	_, wtLastCheck, wtLastFailure, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, s.hostFailLimit)
 
 	if wtBlocked {
 		return newWeight, false, false, 0
@@ -2584,7 +2584,7 @@ func (s *SmartPLD) checkHostStatus() {
 		proxyMap[p.Name()] = p
 	}
 
-	toCheck, err := s.store.CheckHostStatus(s.Name(), s.configName)
+	toCheck, err := s.store.CheckHostStatus(s.Name(), s.configName, s.hostFailLimit)
 	if err != nil {
 		return
 	}
