@@ -243,7 +243,9 @@ func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber
 	// 命中保持单节点稳定，而不是 merge 累积（merge 会让 PLD 首选在相近
 	// 分数节点间抖动，并发连接互杀长连接——见连接抖动修复）。
 	targetKey := FormatDBKey(config, group, target)
-	unwrapCache.Set(targetKey, UnwrapMap{Proxies: names})
+	if existing, expireTime, found := unwrapCache.GetWithExpire(targetKey); !found || len(existing.Proxies) == 0 || expireTime.Before(time.Now()) {
+		unwrapCache.Set(targetKey, UnwrapMap{Proxies: names})
+	}
 
 	// ASN sharing (CDN excluded): first-writer-wins（保持原语义，避免
 	// 共享 ASN 的候选列表被每个域名都塞一份）
@@ -264,20 +266,19 @@ func (s *Store) GetUnwrapResult(group, config, target, asnNumber string, wildcar
 		return nil, false
 	}
 
-	targetKey := FormatDBKey(config, group, target)
-	if value, expireTime, found := unwrapCache.GetWithExpire(targetKey); found {
-		if len(value.Proxies) > 0 {
-			return value.Proxies, expireTime.Before(time.Now())
-		}
-	}
-
 	if asnNumber != "" && !CdnASNs[asnNumber] {
 		asnKey := FormatDBKey(config, group, asnNumber)
 		if value, expireTime, found := unwrapCache.GetWithExpire(asnKey); found {
 			if len(value.Proxies) > 0 {
-				unwrapCache.Set(targetKey, UnwrapMap{Proxies: value.Proxies})
 				return value.Proxies, expireTime.Before(time.Now())
 			}
+		}
+	}
+
+	targetKey := FormatDBKey(config, group, target)
+	if value, expireTime, found := unwrapCache.GetWithExpire(targetKey); found {
+		if len(value.Proxies) > 0 {
+			return value.Proxies, expireTime.Before(time.Now())
 		}
 	}
 
