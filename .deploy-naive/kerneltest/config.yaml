@@ -1,0 +1,41 @@
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+external-controller: 127.0.0.1:9090
+ipv6: true
+
+proxies:
+  - name: "fr-reality"
+    type: vless
+    server: fr.momoo.dpdns.org
+    port: 443
+    uuid: 62f3321c-12bc-4b21-866b-2b7cfed10171
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: www.apple.com
+    reality-opts:
+      public-key: 3wzyNL0fWF6_inHtiAsouNs5wzWmIqP0QgiQRe72J0Y
+      short-id: "745ba3a895aec954"
+    client-fingerprint: chrome
+
+  - name: "fr-tuic"
+    type: tuic
+    server: fr.momoo.dpdns.org
+    port: 443
+    uuid: 62f3321c-12bc-4b21-866b-2b7cfed10171
+    password: 62f3321c-12bc-4b21-866b-2b7cfed10171
+    sni: fr.momoo.dpdns.org
+    alpn: [h3]
+    congestion-controller: bbr
+    udp-relay-mode: native
+
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies: [fr-reality, fr-tuic]
+
+rules:
+  - MATCH,PROXY

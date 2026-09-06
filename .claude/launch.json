@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "scratch-http",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8899", "--bind", "127.0.0.1"],
+      "port": 8899
+    },
+    {
+      "name": "mihomo-bare-harness",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["C:/Users/yingx/AppData/Local/Temp/harness/server.py"],
+      "port": 8899
+    },
+    {
+      "name": "mihomo-bare-harness-8898",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["C:/Users/yingx/AppData/Local/Temp/harness/server-8898.py"],
+      "port": 8898
+    }
+  ]
+}
