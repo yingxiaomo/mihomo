@@ -33,10 +33,8 @@ const (
 	KeyTypeRanking      = "ranking"
 	KeyTypeHostFailures = "failures"
 
-	WeightTypeTCP    = "tcp"
-	WeightTypeUDP    = "udp"
-	WeightTypeTCPASN = "tcp_asn"
-	WeightTypeUDPASN = "udp_asn"
+	WeightTypeTCP = "tcp"
+	WeightTypeUDP = "udp"
 )
 
 const (
@@ -54,11 +52,38 @@ const (
 	hostStatusRetryAfter     = 4 * time.Hour
 	hostStatusViewTTLSeconds = 30
 
+	probeMaxBlockTTL = 30 * time.Minute
+
 	AllowedWeight = 0.4
 
 	RankMostUsed   = "MostUsed"
 	RankOccasional = "OccasionalUsed"
 	RankRarelyUsed = "RarelyUsed"
+)
+
+// Thresholds for a rule set whose name follows no convention, which is what a user
+// defined provider name looks like. Calibrated on a real setup: collections at
+// 111030 / 27055 / 4367 entries, the largest service catalog at 1792. The ASN limit
+// stays above what a real service spans once shared networks are excluded (github 1,
+// apple and netflix around 2), a promoted service would be split into several exits.
+const (
+	BroadRuleCount    = 10000
+	BroadASNDiversity = 6
+
+	// asnEvidencePrefix marks the per target network counters kept in StatsRecord.Weights,
+	// they carry no weight and are claim evidence only
+	asnEvidencePrefix = "asn:"
+
+	ASNClaimMinKinds  = 2   // networks a service must span to claim without repeats
+	ASNClaimMinHits   = 4   // successes a single network service needs before it claims
+	ASNClaimAmbiguous = "-" // network two services were seen on, never used as key
+)
+
+const (
+	TargetKindNoRule   TargetKind = iota // no rule identity, the fallback target
+	TargetKindRuleName                   // rule set / geosite / geoip name, which may be provider defined
+	TargetKindService                    // the rule type itself is narrow
+	TargetKindBroad                      // collection of unrelated services, e.g. a region
 )
 
 var (
@@ -75,7 +100,9 @@ var (
 	}
 )
 
-var CdnASNs = map[string]bool{
+// SharedASNs are networks that rent addresses to unrelated parties, so the ASN does
+// not identify a single service and must not be used as a service key.
+var SharedASNs = map[string]bool{
 	"13335":  true, // Cloudflare
 	"12222":  true, // Akamai
 	"16625":  true, // Akamai
@@ -100,13 +127,58 @@ var CdnASNs = map[string]bool{
 	"43317":  true, // CDNvideo
 	"43996":  true, // CDNsun
 	"33438":  true, // Edgio (Highwinds)
-	"396982": true, // Leaseweb CDN
-	"16276":  true, // OVH CDN
+	"396982": true, // Google Cloud Platform
+	"16276":  true, // OVH
 	"30081":  true, // CacheFly
 	"12389":  true, // Zenlayer
 	"37888":  true, // Alibaba CDN
 	"45090":  true, // Tencent CDN
 	"207143": true, // KeyCDN
+	"14061":  true, // DigitalOcean
+	"24940":  true, // Hetzner
+	"31898":  true, // Oracle Cloud
+	"36351":  true, // IBM Cloud (SoftLayer)
+	"14618":  true, // Amazon AES (AWS)
+	"45102":  true, // Alibaba Cloud
+	"132203": true, // Tencent Cloud
+	"55990":  true, // Huawei Cloud
+	"12876":  true, // Scaleway
+	"51167":  true, // Contabo
+	"197540": true, // Netcup
+	"20473":  true, // Vultr (Choopa)
+	"63949":  true, // Linode
+	"9009":   true, // Leaseweb
+	"60781":  true, // Leaseweb NL
+	"36236":  true, // NetActuate (anycast hosting)
+	"39572":  true, // DataWeb Global Group (hosting)
+	"400618": true, // Prime Security (JP IDC)
+	"4134":   true, // China Telecom
+	"4808":   true, // China Unicom
+	"4837":   true, // China Unicom (China169)
+}
+
+// broadSetNames are meta-rules-dat entries that collect unrelated services; an
+// "@<scope>" suffix only marks the scope of the same entry.
+var broadSetNames = map[string]bool{
+	"cn":           true,
+	"private":      true,
+	"gfw":          true,
+	"greatfire":    true,
+	"ads-all":      true,
+	"oc-cn-domain": true, // OpenClash generated CN domain collection
+	"china-domain": true,
+	"china-ip":     true,
+	"tor":          true,
+}
+
+var broadNamePrefixes = []string{"category-", "geolocation-", "tld-"}
+
+// sharedGeoIPPayloads are geoip entries of shared or non routable address space.
+var sharedGeoIPPayloads = map[string]bool{
+	"cloudflare": true,
+	"cloudfront": true,
+	"fastly":     true,
+	"private":    true,
 }
 
 type (
@@ -122,6 +194,10 @@ type (
 		Data    []byte
 	}
 )
+
+// TargetKind classifies a target string: a collection of unrelated services, a
+// single service, or a rule entry name that only the counts can tell apart.
+type TargetKind int
 
 func NewStore(newdb *bbolt.DB) *Store {
 	db = newdb
@@ -188,6 +264,176 @@ func formatOperationKey(op *StoreOperation) string {
 	default:
 		return ""
 	}
+}
+
+// ClassifyTargetName classifies a target by naming conventions. A name that matches
+// no convention is a rule name, NeedsASNKey decides it from counts and diversity.
+func ClassifyTargetName(target string) TargetKind {
+	kind, payload, ok := splitTarget(target)
+	if !ok {
+		return TargetKindNoRule
+	}
+
+	name, _, _ := strings.Cut(strings.ToLower(payload), "@")
+
+	switch kind {
+	case "GeoIP", "SrcGeoIP":
+		if isCountryCode(name) || sharedGeoIPPayloads[name] || broadSetNames[name] {
+			return TargetKindBroad
+		}
+		return TargetKindRuleName
+	case "RuleSet", "GeoSite":
+		if broadSetNames[name] {
+			return TargetKindBroad
+		}
+		for _, prefix := range broadNamePrefixes {
+			if strings.HasPrefix(name, prefix) {
+				return TargetKindBroad
+			}
+		}
+		if asn, ok := asnRuleSetName(name); ok && SharedASNs[asn] {
+			return TargetKindBroad
+		}
+		return TargetKindRuleName
+	default:
+		return TargetKindService
+	}
+}
+
+// NeedsASNKey reports whether the ASN has to replace the target as key: always for a
+// collection or a target without rule identity, and for a provider defined name only
+// once its entry count or its number of unrelated networks proves it is a collection.
+func NeedsASNKey(target string, ruleCount, asnDiversity int) bool {
+	switch ClassifyTargetName(target) {
+	case TargetKindBroad, TargetKindNoRule:
+		return true
+	case TargetKindService:
+		return false
+	}
+	if ruleCount >= BroadRuleCount {
+		return true
+	}
+	return asnDiversity >= BroadASNDiversity
+}
+
+// RuleSetPayload returns the provider payload of a rule set target, the name its
+// entry count is looked up with.
+func RuleSetPayload(target string) (string, bool) {
+	kind, payload, ok := splitTarget(target)
+	if !ok {
+		return "", false
+	}
+	switch kind {
+	case "RuleSet", "GeoSite":
+		return payload, true
+	}
+	return "", false
+}
+
+func splitTarget(target string) (kind, payload string, ok bool) {
+	if target == "" {
+		return "", "", false
+	}
+	open := strings.LastIndex(target, " [")
+	if open <= 0 || !strings.HasSuffix(target, "]") {
+		return "", "", false
+	}
+	payload = target[open+2 : len(target)-1]
+	if payload == "" {
+		return "", "", false
+	}
+	return target[:open], payload, true
+}
+
+func asnRuleSetName(name string) (string, bool) {
+	if len(name) < 3 || name[0] != 'a' || name[1] != 's' {
+		return "", false
+	}
+	digits := name[2:]
+	for i := 0; i < len(digits); i++ {
+		if digits[i] < '0' || digits[i] > '9' {
+			return "", false
+		}
+	}
+	return digits, true
+}
+
+// SmartTargetKey folds a target into a service key when the group runs with prefer-asn.
+// A service rule keeps its rule string, a rule set already covers every ASN the service
+// is served from; otherwise the key becomes the ASN, falling back to the registrable
+// domain when the ASN is missing or shared.
+func SmartTargetKey(preferASN bool, asn, target, wildcardTarget string, needsASNKey bool) string {
+	if target == "" {
+		target = wildcardTarget
+	}
+	if target == "" {
+		return ""
+	}
+	if !preferASN {
+		return target
+	}
+	if !needsASNKey {
+		return target
+	}
+	if asn != "" && !SharedASNs[asn] {
+		return asn
+	}
+	if wildcardTarget != "" {
+		return wildcardTarget
+	}
+	return target
+}
+
+func isCountryCode(s string) bool {
+	if len(s) != 2 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') {
+			return false
+		}
+	}
+	return true
+}
+
+// ClaimedASNRules maps every network to the service rule that owns it, from the
+// evidence collected per target. A network that two services were seen on is
+// reported as ambiguous, so it is never keyed to either of them.
+func ClaimedASNRules(evidence map[string]map[string]int) map[string]string {
+	type claim struct {
+		rule string
+		hits int
+	}
+
+	claims := make(map[string]claim)
+
+	for target, asns := range evidence {
+		if ClassifyTargetName(target) != TargetKindRuleName {
+			continue
+		}
+		singleNetwork := len(asns) < ASNClaimMinKinds
+		for asn, hits := range asns {
+			if singleNetwork && hits < ASNClaimMinHits {
+				continue
+			}
+			switch existing, ok := claims[asn]; {
+			case !ok:
+				claims[asn] = claim{rule: target, hits: hits}
+			case existing.rule == ASNClaimAmbiguous:
+			case existing.rule != target:
+				claims[asn] = claim{rule: ASNClaimAmbiguous, hits: existing.hits}
+			case hits > existing.hits:
+				claims[asn] = claim{rule: target, hits: hits}
+			}
+		}
+	}
+
+	result := make(map[string]string, len(claims))
+	for asn, c := range claims {
+		result[asn] = c.rule
+	}
+	return result
 }
 
 func isHexRandom(s string) bool {
