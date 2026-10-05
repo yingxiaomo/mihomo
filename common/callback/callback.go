@@ -21,7 +21,9 @@ func (c *firstWriteCallBackConn) Write(b []byte) (n int, err error) {
 	defer func() {
 		if !c.written {
 			c.written = true
-			c.callback(err)
+			if c.callback != nil {
+				c.callback(err)
+			}
 		}
 	}()
 	return c.Conn.Write(b)
@@ -31,7 +33,9 @@ func (c *firstWriteCallBackConn) WriteBuffer(buffer *buf.Buffer) (err error) {
 	defer func() {
 		if !c.written {
 			c.written = true
-			c.callback(err)
+			if c.callback != nil {
+				c.callback(err)
+			}
 		}
 	}()
 	return c.Conn.WriteBuffer(buffer)
@@ -53,6 +57,10 @@ func (c *firstWriteCallBackConn) WriterReplaceable() bool {
 
 func (c *firstWriteCallBackConn) ReaderReplaceable() bool {
 	return true
+}
+
+func (c *firstWriteCallBackConn) WriterPossiblyReplaceable() bool {
+	return !c.written
 }
 
 var _ N.ExtendedConn = (*firstWriteCallBackConn)(nil)
