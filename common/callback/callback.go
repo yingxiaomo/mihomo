@@ -1,6 +1,8 @@
 package callback
 
 import (
+	"sync"
+
 	"github.com/metacubex/mihomo/common/buf"
 	N "github.com/metacubex/mihomo/common/net"
 	C "github.com/metacubex/mihomo/constant"
@@ -10,6 +12,9 @@ type firstWriteCallBackConn struct {
 	C.Conn
 	callback func(error)
 	written  bool
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (c *firstWriteCallBackConn) Write(b []byte) (n int, err error) {
@@ -30,6 +35,12 @@ func (c *firstWriteCallBackConn) WriteBuffer(buffer *buf.Buffer) (err error) {
 		}
 	}()
 	return c.Conn.WriteBuffer(buffer)
+}
+
+// Close forwards once: chained layers may close the same conn several times.
+func (c *firstWriteCallBackConn) Close() error {
+	c.closeOnce.Do(func() { c.closeErr = c.Conn.Close() })
+	return c.closeErr
 }
 
 func (c *firstWriteCallBackConn) Upstream() any {
