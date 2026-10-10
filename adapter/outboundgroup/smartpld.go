@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,6 +37,14 @@ import (
 	"github.com/metacubex/mihomo/tunnel"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 	"github.com/samber/lo"
+)
+
+// PLD keeps its own per-ASN weight keys: the official smart group dropped the
+// tcp_asn/udp_asn weight types in favor of ASN evidence claiming, but PLD's
+// weight trail (logConnectionStats) still reads and writes them.
+const (
+	weightTypeTCPASN = "tcp_asn"
+	weightTypeUDPASN = "udp_asn"
 )
 
 // SmartPLDOption is the option set for the smart-pld group type. It is fully
@@ -153,7 +162,8 @@ func NewSmartPLD(option GroupCommonOption, smartOption SmartPLDOption, emptyFall
 		option.URL = C.DefaultTestURL
 	}
 
-	configName := getConfigFilename()
+	configFile := C.Path.Config()
+	configName := strings.TrimSuffix(filepath.Base(configFile), filepath.Ext(configFile))
 
 	s := &SmartPLD{
 		GroupBase: NewGroupBase(GroupBaseOption{
@@ -414,10 +424,10 @@ func (s *SmartPLD) DialContext(ctx context.Context, metadata *C.Metadata) (C.Con
 				// a merely outranked old primary keeps its conns (both
 				// coexist briefly, new conns ride the fresh node).
 				oldPrimary := ""
-				if old, _ := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget); len(old) > 0 {
+				if old, _ := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget); len(old) > 0 {
 					oldPrimary = old[0]
 				}
-				s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{p})
+				s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, []C.Proxy{p})
 				if oldPrimary != "" && oldPrimary != p.Name() {
 					target := metadata.SmartTarget
 					if target == "" {
@@ -426,19 +436,20 @@ func (s *SmartPLD) DialContext(ctx context.Context, metadata *C.Metadata) (C.Con
 					rec := s.getPLDRecord(target, oldPrimary)
 					blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName)
 					if rec.InFailureCooldown(time.Now().Unix()) || blockedNodes[oldPrimary] {
-						s.closeSameConnection(metadata, p.Name(), metadata.SmartTarget, asnNumber, false)
+						s.closeSameConnection(metadata, p.Name(), metadata.SmartTarget, false)
 					}
 				}
 				return s.WrapConnWithMetric(c, p, metadata, connectTime), nil
 			}
 		}
 
-		s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
+		s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
 
 		return nil, finalErr
 	}
 
-	proxies, asnNumber := s.selectProxies(metadata, s.GetProxies(true))
+	asnNumber := s.getASNCode(metadata)
+	proxies, _ := s.selectProxies(metadata, s.GetProxies(true))
 
 	// The unwrap cache pins the previously-selected single node. If that node
 	// just went down (it stays "alive" until the next health check marks it
@@ -515,10 +526,10 @@ func (s *SmartPLD) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 				}
 
 				oldPrimary := ""
-				if old, _ := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget); len(old) > 0 {
+				if old, _ := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget); len(old) > 0 {
 					oldPrimary = old[0]
 				}
-				s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{proxy})
+				s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, []C.Proxy{proxy})
 				// Converge only when the old primary is dead for this target
 				// (cool-off/blocked) — same rationale as DialContext: closing
 				// live keep-alive conns on a mere switch caused reconnect
@@ -531,7 +542,7 @@ func (s *SmartPLD) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 					rec := s.getPLDRecord(target, oldPrimary)
 					blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName)
 					if rec.InFailureCooldown(time.Now().Unix()) || blockedNodes[oldPrimary] {
-						s.closeSameConnection(metadata, proxy.Name(), metadata.SmartTarget, asnNumber, false)
+						s.closeSameConnection(metadata, proxy.Name(), metadata.SmartTarget, false)
 					}
 				}
 				return s.WrapPacketConnWithMetric(pc, proxy, metadata, connectTime), nil
@@ -542,12 +553,13 @@ func (s *SmartPLD) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 			}
 		}
 
-		s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
+		s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
 
 		return nil, finalErr
 	}
 
-	proxies, asnNumber := s.selectProxies(metadata, s.GetProxies(true))
+	asnNumber := s.getASNCode(metadata)
+	proxies, _ := s.selectProxies(metadata, s.GetProxies(true))
 
 	// Same single-node unwrap-cache pitfall as DialContext: fall back to the
 	// full healthy pool when the pinned node cannot establish a packet conn.
@@ -654,7 +666,7 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 			log.Debugln("[PLD] Group: [%s] Node: [%s] Target: [%s] no first byte within %d ms, official quality gate fired",
 				s.Name(), proxy.Name(), target, s.firstByteGateMs)
 			s.markNodeFailure(metadata, proxy.Name(), true, true, 3)
-			s.store.DeleteUnwrapResult(s.Name(), s.configName, target, s.getASNCode(metadata), metadata.WildcardTarget)
+			s.store.DeleteUnwrapResult(s.Name(), s.configName, target)
 
 			// Hard-punish the node for this target: drop its PLD reward exactly
 			// like a dial failure, so the fresh re-rank stops preferring it even
@@ -714,7 +726,7 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 				log.Debugln("[PLD] Group: [%s] Node: [%s] Target: [%s] zero progress (%d bytes up, 0 down after %s), zero-progress gate fired",
 					s.Name(), proxy.Name(), target, upload1, time.Since(firstSample).Round(time.Second))
 				s.markNodeFailure(metadata, proxy.Name(), true, true, 7)
-				s.store.DeleteUnwrapResult(s.Name(), s.configName, target, s.getASNCode(metadata), metadata.WildcardTarget)
+				s.store.DeleteUnwrapResult(s.Name(), s.configName, target)
 				rec := s.getPLDRecord(target, proxy.Name())
 				rec.FillFailure()
 				s.savePLDRecord(target, proxy.Name(), rec)
@@ -835,7 +847,7 @@ func (s *SmartPLD) Proxies() []C.Proxy {
 
 func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, names []string, weights []float64, all []C.Proxy, minCount int, isUDP bool) []C.Proxy {
 	blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName)
-	wtFailNodes, _, _, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, s.hostFailLimit, metadata.SmartTarget)
+	wtFailNodes, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, s.hostFailLimit, metadata.SmartTarget)
 
 	var proxyByName map[string]C.Proxy
 	if len(names) > 0 {
@@ -1076,9 +1088,7 @@ func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, na
 }
 
 // 节点选择
-func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Proxy, string) {
-	// 添加ASN信息
-	asnNumber := s.getASNCode(metadata)
+func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Proxy, bool) {
 	wildcardTarget := smart.GetEffectiveTarget(metadata.Host, metadata.DstIP.String())
 	metadata.WildcardTarget = wildcardTarget
 	if metadata.SmartTarget == "" {
@@ -1092,7 +1102,7 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 	if s.selected != "" {
 		for _, p := range proxies {
 			if p.Name() == s.selected {
-				return []C.Proxy{p}, asnNumber
+				return []C.Proxy{p}, true
 			}
 		}
 	}
@@ -1138,10 +1148,10 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 			}
 			return filteredN, filteredW
 		}
-		if proxiesName, weights := s.store.GetPrefetchResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); len(proxiesName) > 0 {
+		if proxiesName, weights := s.store.GetPrefetchResult(s.Name(), s.configName, metadata.SmartTarget, isUDP); len(proxiesName) > 0 {
 			return getAndFilter(proxiesName, weights)
 		}
-		if proxiesName, weights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); err == nil && len(proxiesName) > 0 {
+		if proxiesName, weights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, metadata.SmartTarget, isUDP); err == nil && len(proxiesName) > 0 {
 			return getAndFilter(proxiesName, weights)
 		}
 		return nil, nil
@@ -1158,7 +1168,7 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 	// PLD 决策脱节；primary 的变更只由 失败信号（冷却/block 排除）或
 	// selectProxies 的滞回切换（领先 ≥switch-margin）驱动。
 	refreshUnwrapCache := func(isUDP bool) {
-		old, _ := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
+		old, _ := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
 		if len(old) == 0 {
 			return
 		}
@@ -1171,12 +1181,12 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 			}
 		}
 		if proxy == nil || !proxy.AliveForTestUrl(s.testUrl) || (isUDP && !proxy.SupportUDP()) {
-			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
+			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
 			return
 		}
 		wildcard := metadata.WildcardTarget
 		if blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName); blockedNodes[old[0]] {
-			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, wildcard)
+			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
 			return
 		}
 		target := metadata.SmartTarget
@@ -1184,7 +1194,7 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 			target = wildcard
 		}
 		if rec := s.getPLDRecord(target, old[0]); rec.InFailureCooldown(time.Now().Unix()) {
-			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, wildcard)
+			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
 			return
 		}
 		// Soft-failed primary (negative PLD reward EMA): also delete unwrap
@@ -1193,7 +1203,7 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		// every request, wasting a round-trip and causing brief stalls.
 		if s.usePLD {
 			if rec := s.getPLDRecord(target, old[0]); rec.SampleCount >= 2 && rec.Reward < 0 {
-				s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, wildcard)
+				s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
 				log.Debugln("[PLD] Group: [%s] Target: [%s] unwrap refresh deleted soft-failed primary [%s] (reward=%.3f)",
 					s.Name(), target, old[0], rec.Reward)
 				return
@@ -1202,22 +1212,23 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		// Old primary still healthy for this target: renew the unwrap entry so
 		// the TTL does not expire again on the very next request (avoids a
 		// refresh goroutine storm when a target is constantly hit).
-		s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{proxy})
+		s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, []C.Proxy{proxy})
 	}
 
-	trySelector := func(isUDP bool) ([]string, []float64) {
+	trySelector := func(isUDP bool) ([]string, []float64, bool) {
 		// 检查匹配缓存
-		if proxiesName, expired := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget); len(proxiesName) > 0 {
+		if proxiesName, expired := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget); len(proxiesName) > 0 {
 			if expired {
 				go refreshUnwrapCache(isUDP)
 			}
-			return proxiesName, nil
+			return proxiesName, nil, true
 		}
-		return computeFreshNodes(isUDP)
+		names, weights := computeFreshNodes(isUDP)
+		return names, weights, false
 	}
 
 	isUDP := metadata.NetWork == C.UDP
-	resultNames, resultWeights := trySelector(isUDP)
+	resultNames, resultWeights, pinned := trySelector(isUDP)
 
 	// Single-candidate deadlock fix: an unwrap hit returns only the pinned
 	// primary, which starves every downstream mechanism — PLD re-rank has no
@@ -1340,7 +1351,7 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 
 	result := s.filterProxies(metadata, wildcardTarget, resultNames, resultWeights, proxies, maxSelected, isUDP)
 
-	return result, asnNumber
+	return result, pinned
 }
 
 // computePLDWeights computes the D-UCB final weight for each candidate node and
@@ -1402,10 +1413,10 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 		cntTotal += cnt
 		cacheKey := smart.FormatDBKey(smart.KeyTypeStats, s.configName, s.Name(), target, name)
 		rec := s.store.GetOrCreateAtomicRecord(cacheKey, s.Name(), s.configName, target, name)
-		if dl, ok := rec.Get("downloadTotal").(float64); ok {
+		if dl := rec.DownloadTotal(); dl > 0 {
 			dlTotal += dl
 		}
-		if mx, ok := rec.Get("maxDownloadRate").(float64); ok && mx > peakRate {
+		if mx := rec.MaxDownloadRate(); mx > peakRate {
 			peakRate = mx
 		}
 
@@ -1797,18 +1808,18 @@ func (s *SmartPLD) getHistoryConnectStats(metadata *C.Metadata, proxy C.Proxy) i
 	proxyName := proxy.Name()
 	cacheKey := smart.FormatDBKey(smart.KeyTypeStats, s.configName, s.Name(), target, proxyName)
 	atomicRecord := s.store.GetOrCreateAtomicRecord(cacheKey, s.Name(), s.configName, target, proxyName)
-	return atomicRecord.Get("connectTime").(int64)
+	return atomicRecord.ConnectTime()
 }
 
 // 连接持续时间更新
 func (s *SmartPLD) updateConnectionDuration(record *smart.AtomicStatsRecord, connectionDuration int64) {
 	durationMinutes := float64(connectionDuration) / 60000.0
-	currentDuration := record.Get("duration").(float64)
+	currentDuration := record.Duration()
 
 	if currentDuration > 0 {
-		record.Set("duration", (currentDuration+durationMinutes)/2.0)
+		record.SetDuration((currentDuration+durationMinutes)/2.0)
 	} else {
-		record.Set("duration", durationMinutes)
+		record.SetDuration(durationMinutes)
 	}
 }
 
@@ -2081,8 +2092,8 @@ func (s *SmartPLD) logConnectionStats(err error, record *smart.StatsRecord, meta
 	var tcpAsnWeight, udpAsnWeight float64
 
 	if asnNumber != "" {
-		tcpAsnWeightKey := smart.WeightTypeTCPASN + ":" + asnNumber
-		udpAsnWeightKey := smart.WeightTypeUDPASN + ":" + asnNumber
+		tcpAsnWeightKey := weightTypeTCPASN + ":" + asnNumber
+		udpAsnWeightKey := weightTypeUDPASN + ":" + asnNumber
 		if record.Weights != nil {
 			if w, ok := record.Weights[tcpAsnWeightKey]; ok {
 				tcpAsnWeight = w
@@ -2207,9 +2218,9 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	weightType := smart.WeightTypeTCP
 	if asnNumber != "" {
 		if isUDP {
-			weightType = smart.WeightTypeUDPASN + ":" + asnNumber
+			weightType = weightTypeUDPASN + ":" + asnNumber
 		} else {
-			weightType = smart.WeightTypeTCPASN + ":" + asnNumber
+			weightType = weightTypeTCPASN + ":" + asnNumber
 		}
 	} else if isUDP {
 		weightType = smart.WeightTypeUDP
@@ -2224,22 +2235,22 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	switch {
 	case err != nil:
 		s.onDialFailed(proxy.Type(), err, s.healthCheck)
-		atomicRecord.Add("failure", int64(1))
+		atomicRecord.AddFailure(1)
 	default:
 		s.onDialSuccess()
-		atomicRecord.Add("success", int64(1))
+		atomicRecord.AddSuccess(1)
 	}
 
 	if connectTime > 0 {
-		oldConnectTime := atomicRecord.Get("connectTime").(int64)
-		newConnectTime := updateEMAInt(oldConnectTime, connectTime)
-		atomicRecord.Set("connectTime", newConnectTime)
+		oldConnectTime := atomicRecord.ConnectTime()
+		newConnectTime := updateEMA(oldConnectTime, connectTime)
+		atomicRecord.SetConnectTime(newConnectTime)
 	}
 
 	if latency > 0 {
-		oldLatency := atomicRecord.Get("latency").(int64)
-		newLatency := updateEMAInt(oldLatency, latency)
-		atomicRecord.Set("latency", newLatency)
+		oldLatency := atomicRecord.Latency()
+		newLatency := updateEMA(oldLatency, latency)
+		atomicRecord.SetLatency(newLatency)
 	}
 
 	if connectionDuration > 0 {
@@ -2247,21 +2258,21 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	}
 
 	if tcpStats != nil {
-		atomicRecord.Add("cumulSent", int64(tcpStats.TotalSent()))
-		atomicRecord.Add("cumulRetrans", int64(tcpStats.TotalRetrans()))
+		atomicRecord.AddCumulSent(int64(tcpStats.TotalSent()))
+		atomicRecord.AddCumulRetrans(int64(tcpStats.TotalRetrans()))
 		lossRate = tcpStats.LossRate()
 	}
 
-	if sent := atomicRecord.Get("cumulSent").(int64); sent > 0 {
-		cumulLossRate = float64(atomicRecord.Get("cumulRetrans").(int64)) / float64(sent)
+	if sent := atomicRecord.CumulSent(); sent > 0 {
+		cumulLossRate = float64(atomicRecord.CumulRetrans()) / float64(sent)
 		if cumulLossRate > 1 {
 			cumulLossRate = 1
 		}
 	}
 
-	emaLossRate := atomicRecord.Get("lossRate").(float64)
-	emaLossRate = updateEMAFloat(emaLossRate, lossRate)
-	atomicRecord.Set("lossRate", emaLossRate)
+	emaLossRate := atomicRecord.LossRate()
+	emaLossRate = updateEMA(emaLossRate, lossRate)
+	atomicRecord.SetLossRate(emaLossRate)
 
 	oldWeight := atomicRecord.GetWeight(weightType)
 	uploadTotalMB := float64(uploadTotal) / (1024.0 * 1024.0)
@@ -2269,17 +2280,17 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	maxUploadRateKB := float64(maxUploadRate) / 1024.0
 	maxDownloadRateKB := float64(maxDownloadRate) / 1024.0
 
-	atomicRecord.Add("uploadTotal", uploadTotalMB)
-	atomicRecord.Add("downloadTotal", downloadTotalMB)
+	atomicRecord.AddUploadTotal(uploadTotalMB)
+	atomicRecord.AddDownloadTotal(downloadTotalMB)
 
-	oldMaxUploadRate := atomicRecord.Get("maxUploadRate").(float64)
+	oldMaxUploadRate := atomicRecord.MaxUploadRate()
 	if maxUploadRateKB > oldMaxUploadRate {
-		atomicRecord.Set("maxUploadRate", maxUploadRateKB)
+		atomicRecord.SetMaxUploadRate(maxUploadRateKB)
 	}
 
-	oldMaxDownloadRate := atomicRecord.Get("maxDownloadRate").(float64)
+	oldMaxDownloadRate := atomicRecord.MaxDownloadRate()
 	if maxDownloadRateKB > oldMaxDownloadRate {
-		atomicRecord.Set("maxDownloadRate", maxDownloadRateKB)
+		atomicRecord.SetMaxDownloadRate(maxDownloadRateKB)
 	}
 
 	input := lightgbm.CreateModelInputFromStatsRecord(
@@ -2316,9 +2327,9 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	// primary switch inside DialContext) is unaffected.
 
 	// 平均权重(适应 target 调整为 rule based 和 asn based 的情况)
-	newWeight := updateEMAFloat(oldWeight, adjWeight)
-	atomicRecord.Set("lastUsed", time.Now().Unix())
-	atomicRecord.SetWeight(weightType, newWeight, isUDP)
+	newWeight := updateEMA(oldWeight, adjWeight)
+	atomicRecord.SetLastUsed(time.Now().Unix())
+	atomicRecord.SetWeight(weightType, newWeight)
 
 	// PLD feedback: derive a scalar reward from the physical metrics of this
 	// connection and fold it into the per-node EWMA reward. This is what the
@@ -2481,7 +2492,8 @@ func (s *SmartPLD) checkNodeQuality(
 		return oldWeight, false, false, 0
 	}
 
-	_, wtLastCheck, wtLastFailure, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, s.hostFailLimit)
+	_, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, s.hostFailLimit)
+	wtLastCheck, wtLastFailure := s.store.GetHostTiming(s.Name(), s.configName, wildcardTarget)
 
 	if wtBlocked {
 		return newWeight, false, false, 0
@@ -2537,18 +2549,18 @@ func (s *SmartPLD) markNodeFailure(metadata *C.Metadata, proxyName string, isDeg
 	wildcardTarget := metadata.WildcardTarget
 	target := metadata.SmartTarget
 
-	failedBlock := s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, metadata, proxyName, s.maxFailedTimes, s.hostFailLimit, isDegraded, checked, blockCode)
+	failedBlock := s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, metadata, proxyName, s.maxFailedTimes, s.hostFailLimit, isDegraded, checked, blockCode, 0)
 
 	if isDegraded || failedBlock {
 		if target != "" && target != wildcardTarget {
-			s.store.UpdateHostStatus(s.Name(), s.configName, target, metadata, proxyName, s.maxFailedTimes, s.hostFailLimit, isDegraded, checked, blockCode)
+			s.store.UpdateHostStatus(s.Name(), s.configName, target, metadata, proxyName, s.maxFailedTimes, s.hostFailLimit, isDegraded, checked, blockCode, 0)
 		}
 	}
 
 	return failedBlock
 }
 
-func (s *SmartPLD) closeSameConnection(metadata *C.Metadata, proxyName, target, asnNumber string, force bool) {
+func (s *SmartPLD) closeSameConnection(metadata *C.Metadata, proxyName, target string, force bool) {
 	statistic.DefaultManager.RangeSmartTarget(target, func(id string) bool {
 		if id == metadata.UUID {
 			return true
@@ -2597,7 +2609,7 @@ func (s *SmartPLD) checkHostStatus() {
 			}
 			status, okRes, err := s.StatusTest(p, host)
 			if err == nil && okRes {
-				s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, &C.Metadata{Host: host}, nodeName, s.maxFailedTimes, s.hostFailLimit, false, true, 0)
+				s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, &C.Metadata{Host: host}, nodeName, s.maxFailedTimes, s.hostFailLimit, false, true, 0, 0)
 				log.Debugln("[PLD] Recover Group: [%s] - Node: [%s] for Host: [%s] with HTTP Status: [%d]", s.Name(), nodeName, host, status)
 			} else if err == nil {
 				log.Debugln("[PLD] Recover Group: [%s] - Node: [%s] for Host: [%s] still abnormal with HTTP Status: [%d]", s.Name(), nodeName, host, status)

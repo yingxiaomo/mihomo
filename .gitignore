@@ -26,3 +26,7 @@ test/config/cache*
 /output
 .vscode/
 .fleet/
+# local build caches
+/.gomodcache/
+/.gocache/
+/.gopath/

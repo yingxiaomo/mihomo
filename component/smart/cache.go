@@ -3,12 +3,25 @@ package smart
 import (
 	"encoding/json"
 	"math"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/common/cmd"
 	"github.com/metacubex/mihomo/common/lru"
 	"github.com/metacubex/mihomo/common/xsync"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
+)
+
+const (
+	MaxTargetsLimit     = 5000
+	MinTargetsLimit     = 500
+	MaxBatchThreshLimit = 300
+	MinBatchThreshLimit = 50
 )
 
 var (
@@ -23,10 +36,16 @@ var (
 	blockedNodesCache *lru.LruCache[string, map[string]bool]
 
 	hostStatusCache *lru.LruCache[string, *HostStatus]
+
+	globalCacheParams struct {
+		BatchSaveThreshold int
+		MaxTargets         int
+		LastMemoryUsage    float64
+		mutex              sync.RWMutex
+	}
 )
 
 var (
-	targetCacheRefreshFlags  xsync.Map[string, bool]
 	dbResultRefreshFlags     xsync.Map[string, bool]
 	blockedNodesRefreshFlags xsync.Map[string, bool]
 )
@@ -50,8 +69,6 @@ type (
 	PrefetchMap struct {
 		TCP         NodesWithWeights `json:"tcp,omitempty"`
 		UDP         NodesWithWeights `json:"udp,omitempty"`
-		RefTCP      string           `json:"ref_tcp,omitempty"`
-		RefUDP      string           `json:"ref_udp,omitempty"`
 		UpdatedTime int64            `json:"updated_time,omitempty"`
 	}
 )
@@ -104,14 +121,12 @@ func InitCache() {
 	)
 }
 
-// 存储预取结果
-func (s *Store) StorePrefetchResult(group, config string, target string, asnNumber string, isUDP bool, proxyNames []string, weights []float64) {
+func (s *Store) StorePrefetchResult(group, config string, target string, isUDP bool, proxyNames []string, weights []float64) {
 	if target == "" || len(proxyNames) == 0 {
 		return
 	}
 
 	var pm PrefetchMap
-	operations := make([]StoreOperation, 0, 2)
 	nodeWeight := NodesWithWeights{Nodes: proxyNames, Weights: weights}
 
 	if isUDP {
@@ -122,45 +137,20 @@ func (s *Store) StorePrefetchResult(group, config string, target string, asnNumb
 	pm.UpdatedTime = time.Now().Unix()
 
 	data, err := json.Marshal(pm)
-	if err == nil {
-		operations = append(operations, StoreOperation{
-			Type:   OpSavePrefetch,
-			Group:  group,
-			Config: config,
-			Target: target,
-			Data:   data,
-		})
+	if err != nil {
+		return
 	}
 
-	if asnNumber != "" && !CdnASNs[asnNumber] {
-		targetCacheKey := FormatDBKey(KeyTypePrefetch, config, group, target)
-		var asnPm PrefetchMap
-		if isUDP {
-			asnPm.RefUDP = targetCacheKey
-		} else {
-			asnPm.RefTCP = targetCacheKey
-		}
-		asnPm.UpdatedTime = time.Now().Unix()
-
-		asnData, asnErr := json.Marshal(asnPm)
-		if asnErr == nil {
-			operations = append(operations, StoreOperation{
-				Type:   OpSavePrefetch,
-				Group:  group,
-				Config: config,
-				Target: asnNumber,
-				Data:   asnData,
-			})
-		}
-	}
-
-	if len(operations) > 0 {
-		s.AppendToGlobalQueue(operations...)
-	}
+	s.AppendToGlobalQueue(StoreOperation{
+		Type:   OpSavePrefetch,
+		Group:  group,
+		Config: config,
+		Target: target,
+		Data:   data,
+	})
 }
 
-// 获取预取结果
-func (s *Store) GetPrefetchResult(group, config string, target string, asnNumber string, isUDP bool) ([]string, []float64) {
+func (s *Store) GetPrefetchResult(group, config string, target string, isUDP bool) ([]string, []float64) {
 	if target == "" {
 		return nil, nil
 	}
@@ -192,29 +182,6 @@ func (s *Store) GetPrefetchResult(group, config string, target string, asnNumber
 		return nil, nil
 	}
 
-	// ASN
-	if asnNumber != "" && !CdnASNs[asnNumber] {
-		if pm, ok := loadPM(FormatDBKey(KeyTypePrefetch, config, group, asnNumber)); ok {
-			if nodes, weights := pick(pm); nodes != nil {
-				return nodes, weights
-			}
-			var refKey string
-			if isUDP {
-				refKey = pm.RefUDP
-			} else {
-				refKey = pm.RefTCP
-			}
-			if refKey != "" {
-				if refPm, ok := loadPM(refKey); ok {
-					if nodes, weights := pick(refPm); nodes != nil {
-						return nodes, weights
-					}
-				}
-			}
-		}
-	}
-
-	// target
 	if pm, ok := loadPM(FormatDBKey(KeyTypePrefetch, config, group, target)); ok {
 		if nodes, weights := pick(pm); nodes != nil {
 			return nodes, weights
@@ -224,7 +191,7 @@ func (s *Store) GetPrefetchResult(group, config string, target string, asnNumber
 	return nil, nil
 }
 
-func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber string, wildcardTarget string, proxies []C.Proxy) {
+func (s *Store) StoreUnwrapResult(group, config string, target string, proxies []C.Proxy) {
 	if target == "" || len(proxies) == 0 {
 		return
 	}
@@ -234,45 +201,15 @@ func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber
 		names[i] = p.Name()
 	}
 
-	// SmartTarget (same ruleset = same node)：覆盖为本次成功节点（单节点）。
-	// 这是原版 smart 平衡"切换 vs 长连接"的核心：同 target 的所有连接首选
-	// 恒为最近成功的节点，closeSameConnection 检查 Contains(chains, 该节点)
-	// 恒成立 → 长连接不被误杀；节点失效时拨号失败被排除，fallback 新节点
-	// 成功后覆盖 unwrap → 平滑切换。PLD 的多候选探索由 computeFreshNodes
-	// （Prefetch/Best 缓存）与 unwrap TTL 过期后的 fresh 路径提供，unwrap
-	// 命中保持单节点稳定，而不是 merge 累积（merge 会让 PLD 首选在相近
-	// 分数节点间抖动，并发连接互杀长连接——见连接抖动修复）。
 	targetKey := FormatDBKey(config, group, target)
 	if existing, expireTime, found := unwrapCache.GetWithExpire(targetKey); !found || len(existing.Proxies) == 0 || expireTime.Before(time.Now()) {
 		unwrapCache.Set(targetKey, UnwrapMap{Proxies: names})
 	}
-
-	// ASN sharing (CDN excluded): first-writer-wins（保持原语义，避免
-	// 共享 ASN 的候选列表被每个域名都塞一份）
-	if asnNumber != "" && !CdnASNs[asnNumber] {
-		asnKey := FormatDBKey(config, group, asnNumber)
-		if existing, _, found := unwrapCache.GetWithExpire(asnKey); !found || len(existing.Proxies) == 0 {
-			unwrapCache.Set(asnKey, UnwrapMap{Proxies: names})
-		}
-	}
 }
 
-// placeholder removed: unwrap cache is single-node overwrite again
-// (see StoreUnwrapResult); mergeProxyNames was the PLD-era multi-node merge
-// helper that caused same-target connection churn.
-
-func (s *Store) GetUnwrapResult(group, config, target, asnNumber string, wildcardTarget string) (proxies []string, expired bool) {
+func (s *Store) GetUnwrapResult(group, config, target string) (proxies []string, expired bool) {
 	if target == "" {
 		return nil, false
-	}
-
-	if asnNumber != "" && !CdnASNs[asnNumber] {
-		asnKey := FormatDBKey(config, group, asnNumber)
-		if value, expireTime, found := unwrapCache.GetWithExpire(asnKey); found {
-			if len(value.Proxies) > 0 {
-				return value.Proxies, expireTime.Before(time.Now())
-			}
-		}
 	}
 
 	targetKey := FormatDBKey(config, group, target)
@@ -285,18 +222,12 @@ func (s *Store) GetUnwrapResult(group, config, target, asnNumber string, wildcar
 	return nil, false
 }
 
-func (s *Store) DeleteUnwrapResult(group, config string, target string, asnNumber string, wildcardTarget string) {
+func (s *Store) DeleteUnwrapResult(group, config string, target string) {
 	if target == "" {
 		return
 	}
 
-	targetKey := FormatDBKey(config, group, target)
-	unwrapCache.Delete(targetKey)
-
-	if asnNumber != "" && !CdnASNs[asnNumber] {
-		asnKey := FormatDBKey(config, group, asnNumber)
-		unwrapCache.Delete(asnKey)
-	}
+	unwrapCache.Delete(FormatDBKey(config, group, target))
 }
 
 func (s *Store) UpdateBlockedNodesCache(group, config string, updates map[string]*NodeState) {
@@ -324,7 +255,44 @@ func (s *Store) UpdateBlockedNodesCache(group, config string, updates map[string
 	blockedNodesCache.Set(cacheKey, newBlocked)
 }
 
-// 调整缓存参数
+func (s *Store) loadBlockedNodes(group, config string) map[string]bool {
+	cacheKey := FormatDBKey(config, group)
+	stateData, err := s.GetNodeStates(group, config)
+	if err != nil {
+		return nil
+	}
+	now := time.Now().Unix()
+	blockedNodes := make(map[string]bool)
+
+	for nodeName, data := range stateData {
+		var state NodeState
+		if json.Unmarshal(data, &state) == nil {
+			if state.BlockedUntil > 0 && state.BlockedUntil > now {
+				blockedNodes[nodeName] = true
+			}
+		}
+	}
+
+	blockedNodesCache.Set(cacheKey, blockedNodes)
+	return blockedNodes
+}
+
+func (s *Store) GetBlockedNodes(group, config string) map[string]bool {
+	cacheKey := FormatDBKey(config, group)
+	if cached, expireTime, ok := blockedNodesCache.GetWithExpire(cacheKey); ok {
+		if expireTime.Before(time.Now()) {
+			if _, loading := blockedNodesRefreshFlags.LoadOrStore(cacheKey, true); !loading {
+				go func() {
+					defer blockedNodesRefreshFlags.Delete(cacheKey)
+					s.loadBlockedNodes(group, config)
+				}()
+			}
+		}
+		return cached
+	}
+	return s.loadBlockedNodes(group, config)
+}
+
 func (s *Store) AdjustCacheParameters() {
 	memoryUsage := GetSystemMemoryUsage()
 
@@ -359,24 +327,15 @@ func (s *Store) AdjustCacheParameters() {
 		globalCacheParams.BatchSaveThreshold)
 
 	cacheSize := globalCacheParams.MaxTargets / 4
-	targetCache = lru.ResetLRU(targetCache, cacheSize, lru.WithAge[string, string](300), lru.WithStale[string, string](true))
-	// unwrapCache pins the most-recent successful node per target so same-target
-	// connections converge on one node (closeSameConnection avoids killing each
-	// other's long-lived conns). TTL 300s: the stale-while-revalidate refresh
-	// re-evaluates the pool every 5 minutes instead of every minute — a 60s TTL
-	// made the async refresh rewrite the primary too often and closeSameConnection
-	// killed Telegram-style keep-alive conns on each swap (endless reconnects).
-	// Broken nodes still switch fast via the post-failure cool-off, which works
-	// regardless of this TTL.
-	unwrapCache = lru.ResetLRU(unwrapCache, cacheSize, lru.WithAge[string, UnwrapMap](300), lru.WithStale[string, UnwrapMap](true))
-	recordCache = lru.ResetLRU(recordCache, cacheSize, lru.WithAge[string, *AtomicStatsRecord](300), lru.WithStale[string, *AtomicStatsRecord](true))
-	dbResultCache = lru.ResetLRU(dbResultCache, cacheSize, lru.WithAge[string, map[string][]byte](300), lru.WithStale[string, map[string][]byte](true))
-	blockedNodesCache = lru.ResetLRU(blockedNodesCache, cacheSize, lru.WithAge[string, map[string]bool](300), lru.WithStale[string, map[string]bool](true))
-	hostStatusCache = lru.ResetLRU(hostStatusCache, cacheSize, lru.WithAge[string, *HostStatus](300), lru.WithStale[string, *HostStatus](true))
+	targetCache.SetMaxSize(cacheSize)
+	unwrapCache.SetMaxSize(cacheSize)
+	recordCache.SetMaxSize(cacheSize)
+	dbResultCache.SetMaxSize(cacheSize)
+	blockedNodesCache.SetMaxSize(cacheSize)
+	hostStatusCache.SetMaxSize(cacheSize)
 	go s.FlushQueue(true)
 }
 
-// 按级别清理内存缓存
 func (s *Store) clearCache(level string, config string, group string) {
 	s.FlushQueue(true)
 
@@ -410,4 +369,79 @@ func (s *Store) clearCache(level string, config string, group string) {
 		blockedNodesCache.Delete(groupKey)
 		hostStatusCache.RemoveByKeyPrefix(FormatDBKey(KeyTypeHostFailures, config, group) + "/")
 	}
+}
+
+func GetBatchSaveThreshold() int {
+	globalCacheParams.mutex.RLock()
+	defer globalCacheParams.mutex.RUnlock()
+
+	if globalCacheParams.BatchSaveThreshold <= 0 {
+		return MinBatchThreshLimit
+	}
+
+	return globalCacheParams.BatchSaveThreshold
+}
+
+func GetSystemMemoryUsage() float64 {
+	total, available := systemMemory()
+	if total > 0 {
+		used := total - available
+		return math.Min(used/total, 1.0)
+	}
+	return 0.5
+}
+
+// systemMemory answers from procfs on Linux and Android, so an adjustment costs no fork.
+func systemMemory() (total, available float64) {
+	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
+		return parseMemInfo(data)
+	}
+	if runtime.GOOS == "windows" {
+		return parseWmic("TotalVisibleMemorySize"), parseWmic("FreePhysicalMemory")
+	}
+	return 0, 0
+}
+
+func parseMemInfo(data []byte) (total, available float64) {
+	for _, line := range strings.Split(string(data), "\n") {
+		name, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		switch name {
+		case "MemTotal":
+			total = memInfoKB(value)
+		case "MemAvailable":
+			available = memInfoKB(value)
+		}
+	}
+	return total, available
+}
+
+func memInfoKB(value string) float64 {
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		return 0
+	}
+	kb, err := strconv.ParseFloat(strings.TrimSuffix(fields[0], "kB"), 64)
+	if err != nil {
+		return 0
+	}
+	return kb / 1024.0
+}
+
+func parseWmic(field string) float64 {
+	output, err := cmd.ExecCmd("wmic OS get " + field)
+	if err != nil {
+		return 0
+	}
+	lines := strings.Split(output, "\n")
+	if len(lines) < 2 {
+		return 0
+	}
+	kb, err := strconv.ParseFloat(strings.TrimSpace(lines[1]), 64)
+	if err != nil {
+		return 0
+	}
+	return kb / 1024.0
 }

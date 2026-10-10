@@ -14,26 +14,27 @@ import (
 	"github.com/metacubex/mihomo/log"
 )
 
-var (
-	collectMutex           sync.Mutex
-	smartCollector         *DataCollector
-)
-
-type DataCollector struct {
-	mutex                  sync.Mutex
-	sampleCount            int
-	dataPath               string
-	file                   *os.File
-	writer                 *csv.Writer
-	configured             bool
-	smartCollectorSize     int64
-	lastFileCheck          time.Time
-}
-
 const (
 	defaultSmartCollectorSize = 100 * 1024 * 1024
 	expectedColumns           = MaxFeatureSize + 10
 )
+
+var (
+	collectMutex   sync.Mutex
+	smartCollector *DataCollector
+)
+
+type DataCollector struct {
+	mutex              sync.Mutex
+	sampleCount        int
+	dataPath           string
+	file               *os.File
+	writer             *csv.Writer
+	configured         bool
+	sizeLimited        bool
+	smartCollectorSize int64
+	lastFileCheck      time.Time
+}
 
 func InitCollector(collectSize float64) {
 	var smartCollectorSize int64
@@ -61,26 +62,33 @@ func (c *DataCollector) AddSample(input *smart.ModelInput, metadata *C.Metadata,
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	if c.configured && time.Since(c.lastFileCheck) > 5 * time.Second {
+	if c.configured && time.Since(c.lastFileCheck) > 5*time.Second {
 		c.lastFileCheck = time.Now()
 		if _, err := os.Stat(c.dataPath); os.IsNotExist(err) {
 			log.Infoln("[Smart] Data file was deleted, reinitializing collector")
 			c.configured = false
+			c.sizeLimited = false
 			if c.file != nil {
 				c.file.Close()
 				c.file = nil
 			}
 			c.writer = nil
+		} else {
+			limitReached := c.sizeLimited
+			if !limitReached && c.file != nil {
+				if stat, err := c.file.Stat(); err == nil {
+					limitReached = stat.Size() > c.smartCollectorSize
+				}
+			}
+			if limitReached {
+				c.sizeLimited = true
+				log.Infoln("[Smart] Maximum file size limit reached (%d MB), stopping data collection", c.smartCollectorSize/(1024*1024))
+			}
 		}
 	}
 
-	// 检查文件大小限制
-	if c.file != nil {
-		stat, err := c.file.Stat()
-		if err == nil && stat.Size() > c.smartCollectorSize {
-			log.Infoln("[Smart] Maximum file size limit reached (%d MB), stopping data collection", c.smartCollectorSize/(1024*1024))
-			return
-		}
+	if c.sizeLimited {
+		return
 	}
 
 	if !c.configured {
@@ -164,7 +172,6 @@ func (c *DataCollector) AddSample(input *smart.ModelInput, metadata *C.Metadata,
 
 	c.sampleCount++
 
-	// 每100条记录刷新一次
 	if c.sampleCount%100 == 0 {
 		c.writer.Flush()
 	}
@@ -209,7 +216,7 @@ func (c *DataCollector) initializeWriter() error {
 		fileExists = false
 	}
 
-	file, err := os.OpenFile(c.dataPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+	file, err := os.OpenFile(c.dataPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return err
 	}
@@ -217,13 +224,13 @@ func (c *DataCollector) initializeWriter() error {
 	if fileExists {
 		if stat, err2 := file.Stat(); err2 == nil && stat.Size() > 0 {
 			last := make([]byte, 1)
-			if _, err2 = file.ReadAt(last, stat.Size() - 1); err2 == nil && last[0] != '\n' {
+			if _, err2 = file.ReadAt(last, stat.Size()-1); err2 == nil && last[0] != '\n' {
 				const scanSize = int64(65536)
 				readStart := stat.Size() - scanSize
 				if readStart < 0 {
 					readStart = 0
 				}
-				buf := make([]byte, stat.Size() - readStart)
+				buf := make([]byte, stat.Size()-readStart)
 				if _, err3 := file.ReadAt(buf, readStart); err3 == nil {
 					newlinePos := int64(-1)
 					for i := int64(len(buf)) - 1; i >= 0; i-- {
