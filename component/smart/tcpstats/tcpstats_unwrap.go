@@ -6,16 +6,24 @@ import (
 	"syscall"
 )
 
-func getTCPStats(conn net.Conn) *Stats {
-	seen := make(map[uintptr]bool, 12)
+// maxUnwrapSteps is a runaway guard only; real wrapper chains stay far below it.
+const maxUnwrapSteps = 256
+
+// GetTCPStats unwraps the connection wrappers until a socket is found; nil means the
+// counters are not available for this connection.
+func GetTCPStats(conn net.Conn) *Stats {
+	var seenBuf [16]uintptr
+	seen := seenBuf[:0]
 outer:
-	for depth := 0; depth < 32; depth++ {
+	for depth := 0; depth < maxUnwrapSteps; depth++ {
 		if rv := reflect.ValueOf(conn); rv.Kind() == reflect.Ptr {
 			ptr := rv.Pointer()
-			if seen[ptr] {
-				return nil
+			for _, prev := range seen {
+				if prev == ptr {
+					return nil
+				}
 			}
-			seen[ptr] = true
+			seen = append(seen, ptr)
 		}
 
 		if sc, ok := conn.(interface {

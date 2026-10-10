@@ -13,14 +13,43 @@ import (
 
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/lru"
+	"github.com/metacubex/mihomo/common/xsync"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 )
 
+const (
+	asnEvidencePrefix = "asn:"
+
+	RankMostUsed   = "MostUsed"
+	RankOccasional = "OccasionalUsed"
+	RankRarelyUsed = "RarelyUsed"
+
+	HostFailureNodeTTL       = 24 * time.Hour
+	hostStatusRetryAfter     = 4 * time.Hour
+	hostStatusViewTTLSeconds = 30
+
+	// zero-traffic and loss need this many strikes within the window
+	hostStrikeWindow = 5 * time.Minute
+	hostStrikeLimit  = 2
+
+	RecordExpiredTime = 7 * 24 * time.Hour
+
+	asnEvidenceRebuildInterval = 30 * time.Minute
+)
+
 var (
+	asnEvidenceCache xsync.Map[string, *asnEvidenceEntry]
+
 	shardedLocks     [1024]*sync.Mutex
 	shardedLocksOnce sync.Once
 )
+
+type asnEvidenceEntry struct {
+	mutex   sync.Mutex
+	updated time.Time
+	data    map[string]map[string]int
+}
 
 type StatsRecord struct {
 	Success            int64              `json:"success"`
@@ -44,6 +73,11 @@ type NodeState struct {
 	LastChecked    int64  `json:"last_checked"`
 	BlockedUntil   int64  `json:"blocked_until"`
 	ThresholdGrade int    `json:"threshold_grade,omitempty"`
+	ExitRegion     string `json:"exit_region,omitempty"`
+	ExitASN        string `json:"exit_asn,omitempty"`
+	ExitKey        string `json:"exit_key,omitempty"`
+	ExitUpdated    int64  `json:"exit_updated,omitempty"`
+	ExitFailed     int64  `json:"exit_failed,omitempty"`
 }
 
 type AtomicStatsRecord struct {
@@ -78,11 +112,21 @@ type HostStatus struct {
 	LastCheck   int64                `json:"last_check,omitempty"`
 	Blocked     bool                 `json:"blocked,omitempty"`
 	Codes       map[int]*CodeNodeSet `json:"codes,omitempty"`
+
+	rev  atomic.Int64                      `json:"-"`
+	view atomic.TypedValue[hostStatusView] `json:"-"`
+}
+
+type hostStatusView struct {
+	rev     int64
+	limit   int
+	expire  int64
+	nodes   map[string]int
+	blocked bool
 }
 
 type ActiveTarget struct {
 	Target   string
-	ASN      string
 	IsUDP    bool
 	LastUsed int64
 }
@@ -100,7 +144,6 @@ type NodeRank struct {
 
 type targetMinHeap []ActiveTarget
 
-// 域名节点锁
 func initShardedLocks() {
 	shardedLocksOnce.Do(func() {
 		for i := range shardedLocks {
@@ -131,44 +174,55 @@ func GetTargetNodeLock(target, group, proxy string) *sync.Mutex {
 	return shardedLocks[h&1023]
 }
 
-// 获取或创建原子记录
 func (s *Store) GetOrCreateAtomicRecord(cacheKey string, group, config, target, proxy string) *AtomicStatsRecord {
-	record, _ := recordCache.GetOrStore(cacheKey, func() *AtomicStatsRecord {
-		r := &AtomicStatsRecord{
-			weights: lru.New[string, float64](lru.WithSize[string, float64](100)),
-		}
+	if record, ok := recordCache.Get(cacheKey); ok {
+		return record
+	}
 
-		if existingData, err := s.GetStatsForTarget(group, config, target, proxy); err == nil {
-			if data, exists := existingData[proxy]; exists {
-				var existingRecord StatsRecord
-				if json.Unmarshal(data, &existingRecord) == nil {
-					r.success.Store(existingRecord.Success)
-					r.failure.Store(existingRecord.Failure)
-					r.connectTime.Store(existingRecord.ConnectTime)
-					r.latency.Store(existingRecord.Latency)
-					r.lastUsed.Store(existingRecord.LastUsed)
-					r.uploadTotal.Store(existingRecord.UploadTotal)
-					r.downloadTotal.Store(existingRecord.DownloadTotal)
-					r.duration.Store(existingRecord.ConnectionDuration)
-					r.maxUploadRate.Store(existingRecord.MaxUploadRate)
-					r.maxDownloadRate.Store(existingRecord.MaxDownloadRate)
-					r.lossRate.Store(existingRecord.LossRate)
-					r.cumulSent.Store(int64(existingRecord.CumulSent))
-					r.cumulRetrans.Store(int64(existingRecord.CumulRetrans))
-					if existingRecord.Weights != nil {
-						for k, v := range existingRecord.Weights {
-							r.weights.Set(k, v)
-						}
-					}
-				}
-			}
-		}
-		return r
-	})
+	record := s.loadAtomicRecord(group, config, target, proxy)
+	record, _ = recordCache.GetOrStore(cacheKey, func() *AtomicStatsRecord { return record })
 	return record
 }
 
-// 创建统计快照
+// loadAtomicRecord restores one node's persisted counters; the cache lock is not held here
+// on purpose, a database read must not hold up every other key of the cache.
+func (s *Store) loadAtomicRecord(group, config, target, proxy string) *AtomicStatsRecord {
+	r := &AtomicStatsRecord{weights: lru.New[string, float64](lru.WithSize[string, float64](100))}
+
+	existingData, err := s.GetStatsForTarget(group, config, target, proxy)
+	if err != nil {
+		return r
+	}
+	data, exists := existingData[proxy]
+	if !exists {
+		return r
+	}
+	var existingRecord StatsRecord
+	if json.Unmarshal(data, &existingRecord) != nil {
+		return r
+	}
+
+	r.success.Store(existingRecord.Success)
+	r.failure.Store(existingRecord.Failure)
+	r.connectTime.Store(existingRecord.ConnectTime)
+	r.latency.Store(existingRecord.Latency)
+	r.lastUsed.Store(existingRecord.LastUsed)
+	r.uploadTotal.Store(existingRecord.UploadTotal)
+	r.downloadTotal.Store(existingRecord.DownloadTotal)
+	r.duration.Store(existingRecord.ConnectionDuration)
+	r.maxUploadRate.Store(existingRecord.MaxUploadRate)
+	r.maxDownloadRate.Store(existingRecord.MaxDownloadRate)
+	r.lossRate.Store(existingRecord.LossRate)
+	r.cumulSent.Store(int64(existingRecord.CumulSent))
+	r.cumulRetrans.Store(int64(existingRecord.CumulRetrans))
+	if existingRecord.Weights != nil {
+		for k, v := range existingRecord.Weights {
+			r.weights.Set(k, v)
+		}
+	}
+	return r
+}
+
 func (record *AtomicStatsRecord) CreateStatsSnapshot(cacheKey string) *StatsRecord {
 	if record == nil {
 		return &StatsRecord{}
@@ -196,158 +250,150 @@ func (record *AtomicStatsRecord) CreateStatsSnapshot(cacheKey string) *StatsReco
 	return snapshot
 }
 
-func (r *AtomicStatsRecord) Get(field string) interface{} {
-	switch field {
-	case "success":
-		return r.success.Load()
-	case "failure":
-		return r.failure.Load()
-	case "connectTime":
-		return r.connectTime.Load()
-	case "latency":
-		return r.latency.Load()
-	case "lastUsed":
-		return r.lastUsed.Load()
-	case "uploadTotal":
-		return r.uploadTotal.Load()
-	case "downloadTotal":
-		return r.downloadTotal.Load()
-	case "maxUploadRate":
-		return r.maxUploadRate.Load()
-	case "maxDownloadRate":
-		return r.maxDownloadRate.Load()
-	case "duration":
-		return r.duration.Load()
-	case "lossRate":
-		return r.lossRate.Load()
-	case "cumulSent":
-		return r.cumulSent.Load()
-	case "cumulRetrans":
-		return r.cumulRetrans.Load()
-	default:
-		return nil
+func (r *AtomicStatsRecord) Success() int64 {
+	return r.success.Load()
+}
+
+func (r *AtomicStatsRecord) AddSuccess(v int64) {
+	current := r.success.Load()
+	if v > 0 && current > math.MaxInt64/2-v {
+		r.success.Store(math.MaxInt64 / 4)
+	} else {
+		r.success.Add(v)
 	}
 }
 
-func (r *AtomicStatsRecord) Set(field string, value interface{}) {
-	switch field {
-	case "success":
-		if v, ok := value.(int64); ok {
-			r.success.Store(v)
-		}
-	case "failure":
-		if v, ok := value.(int64); ok {
-			r.failure.Store(v)
-		}
-	case "connectTime":
-		if v, ok := value.(int64); ok {
-			r.connectTime.Store(v)
-		}
-	case "latency":
-		if v, ok := value.(int64); ok {
-			r.latency.Store(v)
-		}
-	case "lastUsed":
-		if v, ok := value.(int64); ok {
-			r.lastUsed.Store(v)
-		}
-	case "uploadTotal":
-		if v, ok := value.(float64); ok {
-			r.uploadTotal.Store(v)
-		}
-	case "downloadTotal":
-		if v, ok := value.(float64); ok {
-			r.downloadTotal.Store(v)
-		}
-	case "maxUploadRate":
-		if v, ok := value.(float64); ok {
-			r.maxUploadRate.Store(v)
-		}
-	case "maxDownloadRate":
-		if v, ok := value.(float64); ok {
-			r.maxDownloadRate.Store(v)
-		}
-	case "duration":
-		if v, ok := value.(float64); ok {
-			r.duration.Store(v)
-		}
-	case "lossRate":
-		if v, ok := value.(float64); ok {
-			r.lossRate.Store(v)
-		}
-	case "cumulSent":
-		if v, ok := value.(int64); ok {
-			r.cumulSent.Store(v)
-		}
-	case "cumulRetrans":
-		if v, ok := value.(int64); ok {
-			r.cumulRetrans.Store(v)
-		}
+func (r *AtomicStatsRecord) Failure() int64 {
+	return r.failure.Load()
+}
+
+func (r *AtomicStatsRecord) AddFailure(v int64) {
+	current := r.failure.Load()
+	if v > 0 && current > math.MaxInt64/2-v {
+		r.failure.Store(math.MaxInt64 / 4)
+	} else {
+		r.failure.Add(v)
 	}
 }
 
-func (r *AtomicStatsRecord) Add(field string, value interface{}) {
-	switch field {
-	case "success":
-		if v, ok := value.(int64); ok {
-			current := r.success.Load()
-			if v > 0 && current > math.MaxInt64/2-v {
-				r.success.Store(math.MaxInt64 / 4)
-			} else {
-				r.success.Add(v)
-			}
-		}
-	case "failure":
-		if v, ok := value.(int64); ok {
-			current := r.failure.Load()
-			if v > 0 && current > math.MaxInt64/2-v {
-				r.failure.Store(math.MaxInt64 / 4)
-			} else {
-				r.failure.Add(v)
-			}
-		}
-	case "uploadTotal":
-		if v, ok := value.(float64); ok {
-			current := r.uploadTotal.Load()
-			// 1PB (1024^5 bytes)
-			const maxUpload = 1125899906842624.0
-			if current+v > maxUpload {
-				r.uploadTotal.Store(maxUpload / 2)
-			} else {
-				r.uploadTotal.Add(v)
-			}
-		}
-	case "downloadTotal":
-		if v, ok := value.(float64); ok {
-			current := r.downloadTotal.Load()
-			// 1PB (1024^5 bytes)
-			const maxDownload = 1125899906842624.0
-			if current+v > maxDownload {
-				r.downloadTotal.Store(maxDownload / 2)
-			} else {
-				r.downloadTotal.Add(v)
-			}
-		}
-	case "cumulSent":
-		if v, ok := value.(int64); ok && v > 0 {
-			current := r.cumulSent.Load()
-			if current > math.MaxInt64/2-v {
-				r.cumulSent.Store(current / 2)
-				r.cumulRetrans.Store(r.cumulRetrans.Load() / 2)
-			} else {
-				r.cumulSent.Add(v)
-			}
-		}
-	case "cumulRetrans":
-		if v, ok := value.(int64); ok && v > 0 {
-			current := r.cumulRetrans.Load()
-			if current > math.MaxInt64/2-v {
-				r.cumulSent.Store(r.cumulSent.Load() / 2)
-				r.cumulRetrans.Store(current / 2)
-			} else {
-				r.cumulRetrans.Add(v)
-			}
-		}
+func (r *AtomicStatsRecord) ConnectTime() int64 {
+	return r.connectTime.Load()
+}
+
+func (r *AtomicStatsRecord) SetConnectTime(v int64) {
+	r.connectTime.Store(v)
+}
+
+func (r *AtomicStatsRecord) Latency() int64 {
+	return r.latency.Load()
+}
+
+func (r *AtomicStatsRecord) SetLatency(v int64) {
+	r.latency.Store(v)
+}
+
+func (r *AtomicStatsRecord) LastUsed() int64 {
+	return r.lastUsed.Load()
+}
+
+func (r *AtomicStatsRecord) SetLastUsed(v int64) {
+	r.lastUsed.Store(v)
+}
+
+func (r *AtomicStatsRecord) UploadTotal() float64 {
+	return r.uploadTotal.Load()
+}
+
+// AddUploadTotal caps the counter at 1PB (1024^5 bytes), a wrapped value would poison the model input.
+func (r *AtomicStatsRecord) AddUploadTotal(v float64) {
+	current := r.uploadTotal.Load()
+	const maxUpload = 1125899906842624.0
+	if current+v > maxUpload {
+		r.uploadTotal.Store(maxUpload / 2)
+	} else {
+		r.uploadTotal.Add(v)
+	}
+}
+
+func (r *AtomicStatsRecord) DownloadTotal() float64 {
+	return r.downloadTotal.Load()
+}
+
+// AddDownloadTotal caps the counter at 1PB (1024^5 bytes).
+func (r *AtomicStatsRecord) AddDownloadTotal(v float64) {
+	current := r.downloadTotal.Load()
+	const maxDownload = 1125899906842624.0
+	if current+v > maxDownload {
+		r.downloadTotal.Store(maxDownload / 2)
+	} else {
+		r.downloadTotal.Add(v)
+	}
+}
+
+func (r *AtomicStatsRecord) MaxUploadRate() float64 {
+	return r.maxUploadRate.Load()
+}
+
+func (r *AtomicStatsRecord) SetMaxUploadRate(v float64) {
+	r.maxUploadRate.Store(v)
+}
+
+func (r *AtomicStatsRecord) MaxDownloadRate() float64 {
+	return r.maxDownloadRate.Load()
+}
+
+func (r *AtomicStatsRecord) SetMaxDownloadRate(v float64) {
+	r.maxDownloadRate.Store(v)
+}
+
+func (r *AtomicStatsRecord) Duration() float64 {
+	return r.duration.Load()
+}
+
+func (r *AtomicStatsRecord) SetDuration(v float64) {
+	r.duration.Store(v)
+}
+
+func (r *AtomicStatsRecord) LossRate() float64 {
+	return r.lossRate.Load()
+}
+
+func (r *AtomicStatsRecord) SetLossRate(v float64) {
+	r.lossRate.Store(v)
+}
+
+func (r *AtomicStatsRecord) CumulSent() int64 {
+	return r.cumulSent.Load()
+}
+
+// AddCumulSent halves both loss counters at once, so their ratio stays meaningful after an overflow.
+func (r *AtomicStatsRecord) AddCumulSent(v int64) {
+	if v <= 0 {
+		return
+	}
+	current := r.cumulSent.Load()
+	if current > math.MaxInt64/2-v {
+		r.cumulSent.Store(current / 2)
+		r.cumulRetrans.Store(r.cumulRetrans.Load() / 2)
+	} else {
+		r.cumulSent.Add(v)
+	}
+}
+
+func (r *AtomicStatsRecord) CumulRetrans() int64 {
+	return r.cumulRetrans.Load()
+}
+
+func (r *AtomicStatsRecord) AddCumulRetrans(v int64) {
+	if v <= 0 {
+		return
+	}
+	current := r.cumulRetrans.Load()
+	if current > math.MaxInt64/2-v {
+		r.cumulSent.Store(r.cumulSent.Load() / 2)
+		r.cumulRetrans.Store(current / 2)
+	} else {
+		r.cumulRetrans.Add(v)
 	}
 }
 
@@ -358,41 +404,21 @@ func (r *AtomicStatsRecord) GetWeight(weightType string) float64 {
 	return 0
 }
 
-func (r *AtomicStatsRecord) SetWeight(weightType string, value float64, isUDP bool) {
+func (r *AtomicStatsRecord) SetWeight(weightType string, value float64) {
 	r.weights.Set(weightType, value)
-	if weightType != WeightTypeTCP && weightType != WeightTypeUDP {
-		if isUDP {
-			minUDP := r.avgASNWeight(WeightTypeUDP)
-			if minUDP > 0 {
-				r.weights.Set(WeightTypeUDP, minUDP)
-			}
-		} else {
-			minTCP := r.avgASNWeight(WeightTypeTCP)
-			if minTCP > 0 {
-				r.weights.Set(WeightTypeTCP, minTCP)
-			}
-		}
-	}
 }
 
-func (r *AtomicStatsRecord) avgASNWeight(prefix string) float64 {
-	weights := r.weights.FilterByKeyPrefix(prefix)
-	var sum float64
-	var count int
-	for k, v := range weights {
-		if k == prefix {
-			continue
-		}
-		sum += v
-		count++
+// AddASNEvidence counts one more observation of a network on this target, the
+// evidence ClaimedASNRules is built from, see asnEvidencePrefix.
+func (r *AtomicStatsRecord) AddASNEvidence(asn string) {
+	if asn == "" {
+		return
 	}
-	if count == 0 {
-		return 0.0
-	}
-	return sum / float64(count)
+	key := asnEvidencePrefix + asn
+	value, _ := r.weights.Get(key)
+	r.weights.Set(key, value+1)
 }
 
-// 获取节点权重排名缓存
 func (s *Store) GetNodeWeightRankingCache(group, config string) (NodeRank, error) {
 	pathPrefix := FormatDBKey(KeyTypeRanking, config, group)
 	rawResult, err := s.GetSubBytesByPath(pathPrefix)
@@ -410,7 +436,6 @@ func (s *Store) GetNodeWeightRankingCache(group, config string) (NodeRank, error
 	return NodeRank{}, nil
 }
 
-// 获取节点权重排名
 func (s *Store) GetNodeWeightRanking(group, config, testUrl string, proxies []C.Proxy) (NodeRank, error) {
 	if len(proxies) == 0 {
 		return NodeRank{}, fmt.Errorf("no proxies provided")
@@ -439,7 +464,7 @@ func (s *Store) GetNodeWeightRanking(group, config, testUrl string, proxies []C.
 	nodeScores := make(map[string]float64, len(proxies))
 
 	for _, ad := range activeTargets {
-		nodes, weights := s.GetPrefetchResult(group, config, ad.Target, ad.ASN, ad.IsUDP)
+		nodes, weights := s.GetPrefetchResult(group, config, ad.Target, ad.IsUDP)
 		limit := len(nodes)
 		if len(weights) < limit {
 			limit = len(weights)
@@ -532,7 +557,6 @@ func (s *Store) GetNodeWeightRanking(group, config, testUrl string, proxies []C.
 	return NodeRank{}, nil
 }
 
-// 存储节点权重排名
 func (s *Store) StoreNodeWeightRanking(group, config string, ranking NodeRank) {
 	data, err := json.Marshal(ranking)
 	if err != nil {
@@ -547,22 +571,25 @@ func (s *Store) StoreNodeWeightRanking(group, config string, ranking NodeRank) {
 	})
 }
 
-// 获取目标的最佳代理
-func (s *Store) GetBestProxyForTarget(group, config, target, asnNumber string, isUDP bool) ([]string, []float64, error) {
+func (s *Store) GetBestProxyForTarget(group, config, target string, isUDP bool) ([]string, []float64, error) {
 	if target == "" {
 		return nil, nil, errors.New("empty target")
-	}
-
-	now := time.Now().Unix()
-	minDecay := 0.4
-
-	getTimeDecay := func(lastUsedTime int64) float64 {
-		return GetTimeDecayWithCache(lastUsedTime, now, minDecay)
 	}
 
 	allStatsMap, err := s.GetAllStats(group, config)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	return s.bestProxyForTargetFrom(allStatsMap, group, config, target, isUDP)
+}
+
+func (s *Store) bestProxyForTargetFrom(allStatsMap map[string]map[string][]byte, group, config, target string, isUDP bool) ([]string, []float64, error) {
+	now := time.Now().Unix()
+	minDecay := 0.4
+
+	getTimeDecay := func(lastUsedTime int64) float64 {
+		return GetTimeDecayWithCache(lastUsedTime, now, minDecay)
 	}
 
 	weightType := WeightTypeTCP
@@ -572,67 +599,23 @@ func (s *Store) GetBestProxyForTarget(group, config, target, asnNumber string, i
 
 	nodesWithWeight := make(map[string]float64)
 
-	// 优先使用 ASN
-	if asnNumber != "" && !CdnASNs[asnNumber] {
-		asnWeightType := WeightTypeTCPASN + ":" + asnNumber
-		if isUDP {
-			asnWeightType = WeightTypeUDPASN + ":" + asnNumber
+	stats := allStatsMap[target]
+	if len(stats) == 0 {
+		stats, _ = s.GetStatsForTarget(group, config, target, "")
+	}
+
+	for nodeName, data := range stats {
+		var record StatsRecord
+		if json.Unmarshal(data, &record) != nil {
+			continue
 		}
-
-		nodeCounts := make(map[string]int64)
-
-		for _, mapStats := range allStatsMap {
-			for nodeName, data := range mapStats {
-				var record StatsRecord
-				if json.Unmarshal(data, &record) != nil {
-					continue
-				}
-				if record.Weights == nil {
-					continue
-				}
-
-				weight, ok := record.Weights[asnWeightType]
-				if !ok || weight <= 0 {
-					continue
-				}
-
-				timeDecay := getTimeDecay(record.LastUsed)
-				decayedWeight := weight * timeDecay
-				nodesWithWeight[nodeName] += decayedWeight
-				nodeCounts[nodeName]++
-			}
+		var weight float64
+		if record.Weights != nil {
+			weight = record.Weights[weightType]
 		}
-
-		for nodeName, sum := range nodesWithWeight {
-			if count := nodeCounts[nodeName]; count > 0 {
-				nodesWithWeight[nodeName] = sum / float64(count)
-			}
-		}
-	} else {
-		var mapStats map[string][]byte
-		if stats, ok := allStatsMap[target]; ok {
-			mapStats = stats
-		} else {
-			if stats, err := s.GetStatsForTarget(group, config, target, ""); err == nil {
-				mapStats = stats
-			}
-		}
-
-		for nodeName, data := range mapStats {
-			var record StatsRecord
-			if json.Unmarshal(data, &record) != nil {
-				continue
-			}
-			var weight float64
-			if record.Weights != nil {
-				weight = record.Weights[weightType]
-			}
-			if weight > 0 {
-				timeDecay := getTimeDecay(record.LastUsed)
-				// weight maybe is all target ASNs average weight because of avgASNWeight()
-				decayedWeight := weight * timeDecay
-				nodesWithWeight[nodeName] = decayedWeight
-			}
+		if weight > 0 {
+			timeDecay := getTimeDecay(record.LastUsed)
+			nodesWithWeight[nodeName] = weight * timeDecay
 		}
 	}
 
@@ -663,7 +646,6 @@ func (s *Store) GetBestProxyForTarget(group, config, target, asnNumber string, i
 	return bestNodes, bestWeights, nil
 }
 
-// 获取活跃域名
 func (h targetMinHeap) Len() int            { return len(h) }
 func (h targetMinHeap) Less(i, j int) bool  { return h[i].LastUsed < h[j].LastUsed }
 func (h targetMinHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
@@ -685,94 +667,38 @@ func (s *Store) GetActiveTargets(group, config string, limit int) []ActiveTarget
 	h := &targetMinHeap{}
 	heap.Init(h)
 
-	type seenKey struct {
-		target, asn string
-		isUDP       bool
-	}
-	seen := make(map[seenKey]int64)
-
 	for target, nodeStats := range allStats {
-		var maxLastUsed int64
-		// key: "asn:is_udp", value: lastUsed
-		activeCombinations := make(map[string]int64)
+		active := make(map[bool]int64)
 
 		for _, data := range nodeStats {
 			var record StatsRecord
 			if json.Unmarshal(data, &record) != nil {
 				continue
 			}
-			if record.LastUsed > maxLastUsed {
-				maxLastUsed = record.LastUsed
-			}
 			if record.Weights == nil {
 				continue
 			}
 
 			if w, ok := record.Weights[WeightTypeTCP]; ok && w > 0 {
-				key := ":false"
-				if last, exists := activeCombinations[key]; !exists || record.LastUsed > last {
-					activeCombinations[key] = record.LastUsed
+				if last, exists := active[false]; !exists || record.LastUsed > last {
+					active[false] = record.LastUsed
 				}
 			}
 			if w, ok := record.Weights[WeightTypeUDP]; ok && w > 0 {
-				key := ":true"
-				if last, exists := activeCombinations[key]; !exists || record.LastUsed > last {
-					activeCombinations[key] = record.LastUsed
-				}
-			}
-
-			// 处理 ASN 权重
-			for key, weight := range record.Weights {
-				if strings.HasPrefix(key, WeightTypeTCPASN) && weight > 0 {
-					if _, asn, ok := strings.Cut(key, ":"); ok {
-						combKey := asn + ":false"
-						if last, exists := activeCombinations[combKey]; !exists || record.LastUsed > last {
-							activeCombinations[combKey] = record.LastUsed
-						}
-					}
-				} else if strings.HasPrefix(key, WeightTypeUDPASN) && weight > 0 {
-					if _, asn, ok := strings.Cut(key, ":"); ok {
-						combKey := asn + ":true"
-						if last, exists := activeCombinations[combKey]; !exists || record.LastUsed > last {
-							activeCombinations[combKey] = record.LastUsed
-						}
-					}
+				if last, exists := active[true]; !exists || record.LastUsed > last {
+					active[true] = record.LastUsed
 				}
 			}
 		}
 
-		if len(activeCombinations) == 0 {
-			continue
-		}
-
-		hasASN := false
-		for combKey := range activeCombinations {
-			if asn, _, _ := strings.Cut(combKey, ":"); asn != "" {
-				hasASN = true
-				break
-			}
-		}
-
-		for combKey, lastUsed := range activeCombinations {
-			asn, udpStr, _ := strings.Cut(combKey, ":")
-			isUDP := udpStr == "true"
-
-			if asn == "" && hasASN {
-				continue
-			}
-
-			sk := seenKey{target, asn, isUDP}
-			if existingLast, exists := seen[sk]; !exists || lastUsed > existingLast {
-				seen[sk] = lastUsed
-				heap.Push(h, ActiveTarget{
-					Target:   target,
-					ASN:      asn,
-					IsUDP:    isUDP,
-					LastUsed: lastUsed,
-				})
-				if h.Len() > limit {
-					heap.Pop(h)
-				}
+		for isUDP, lastUsed := range active {
+			heap.Push(h, ActiveTarget{
+				Target:   target,
+				IsUDP:    isUDP,
+				LastUsed: lastUsed,
+			})
+			if h.Len() > limit {
+				heap.Pop(h)
 			}
 		}
 	}
@@ -788,9 +714,8 @@ func (s *Store) GetActiveTargets(group, config string, limit int) []ActiveTarget
 	return sorted
 }
 
-// RunPrefetch 最佳节点预计算
 func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int {
-	log.Debugln("[SmartStore] Executing target and ASN pre-calculation for policy group [%s]", group)
+	log.Debugln("[SmartStore] Executing target pre-calculation for policy group [%s]", group)
 
 	if len(proxyMap) == 0 {
 		log.Debugln("[SmartStore] No available nodes for prefetch calculation in group [%s]", group)
@@ -805,47 +730,24 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 
 	type prefetchItem struct {
 		target      string
-		asnNumber   string
 		isUDP       bool
 		bestNodes   []string
 		bestWeights []float64
 	}
 
-	type asnCacheKey struct {
-		asnNumber string
-		isUDP     bool
-	}
-
-	type asnCacheValue struct {
-		nodes   []string
-		weights []float64
-	}
-
-	asnCache := make(map[asnCacheKey]asnCacheValue)
-
 	items := make([]prefetchItem, 0, len(activeTargets))
 
-	for _, active := range activeTargets {
-		var bestNodes []string
-		var bestWeights []float64
-		var err error
+	hoistedStats, hoistedErr := s.GetAllStats(group, config)
 
-		if active.ASN != "" && !CdnASNs[active.ASN] {
-			key := asnCacheKey{active.ASN, active.IsUDP}
-			if v, ok := asnCache[key]; ok {
-				bestNodes = v.nodes
-				bestWeights = v.weights
-			} else {
-				bestNodes, bestWeights, err = s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
-				asnCache[key] = asnCacheValue{
-					nodes:   bestNodes,
-					weights: bestWeights,
-				}
-			}
-		} else {
-			bestNodes, bestWeights, err = s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
+	bestFor := func(active ActiveTarget) ([]string, []float64, error) {
+		if hoistedErr == nil {
+			return s.bestProxyForTargetFrom(hoistedStats, group, config, active.Target, active.IsUDP)
 		}
+		return s.GetBestProxyForTarget(group, config, active.Target, active.IsUDP)
+	}
 
+	for _, active := range activeTargets {
+		bestNodes, bestWeights, err := bestFor(active)
 		if err != nil || len(bestNodes) == 0 {
 			continue
 		}
@@ -863,7 +765,6 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 		if len(nodes) > 0 {
 			item := prefetchItem{
 				target:      active.Target,
-				asnNumber:   active.ASN,
 				isUDP:       active.IsUDP,
 				bestNodes:   nodes,
 				bestWeights: weights,
@@ -872,18 +773,14 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 		}
 	}
 
-	asnCache = make(map[asnCacheKey]asnCacheValue)
 	targetNodeExistsCache := make(map[string]map[string]bool)
 
 	prefetchCount := 0
 
 	for _, item := range items {
-		oldNodes, oldWeights := s.GetPrefetchResult(group, config, item.target, item.asnNumber, item.isUDP)
+		oldNodes, oldWeights := s.GetPrefetchResult(group, config, item.target, item.isUDP)
 
 		target := item.target
-		if item.asnNumber != "" {
-			target += " (ASN: " + item.asnNumber + ")"
-		}
 
 		networkType := "tcp"
 		if item.isUDP {
@@ -893,100 +790,81 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 		var sortedNodes []string
 		var sortedWeights []float64
 		var needUpdate bool
-		cacheHit := false
-		if item.asnNumber != "" && !CdnASNs[item.asnNumber] {
-			key := asnCacheKey{item.asnNumber, item.isUDP}
-			if v, ok := asnCache[key]; ok {
-				sortedNodes = v.nodes
-				sortedWeights = v.weights
-				cacheHit = true
+
+		if len(oldNodes) == 0 {
+			needUpdate = true
+			sortedNodes = item.bestNodes
+			sortedWeights = item.bestWeights
+		} else {
+			finalNodeMap := make(map[string]float64, len(oldNodes)+len(item.bestNodes))
+			for i, node := range oldNodes {
+				finalNodeMap[node] = oldWeights[i]
 			}
-		}
 
-		if !cacheHit {
-			if len(oldNodes) == 0 {
-				needUpdate = true
-				sortedNodes = item.bestNodes
-				sortedWeights = item.bestWeights
-			} else {
-				finalNodeMap := make(map[string]float64, len(oldNodes)+len(item.bestNodes))
-				for i, node := range oldNodes {
-					finalNodeMap[node] = oldWeights[i]
-				}
-
-				for i, newNode := range item.bestNodes {
-					newW := item.bestWeights[i]
-					if oldW, exists := finalNodeMap[newNode]; exists {
-						// prevent degrade recovery too fast
-						if oldW <= 0 || math.Abs(newW-oldW)/oldW > 0.1 {
-							finalNodeMap[newNode] = newW
-							needUpdate = true
-						}
-					} else {
+			for i, newNode := range item.bestNodes {
+				newW := item.bestWeights[i]
+				if oldW, exists := finalNodeMap[newNode]; exists {
+					// prevent degrade recovery too fast
+					if oldW <= 0 || math.Abs(newW-oldW)/oldW > 0.1 {
 						finalNodeMap[newNode] = newW
 						needUpdate = true
 					}
-				}
-
-				// Clean up prefetch results if node stats expired, otherwise they may stay in prefetch results even if they are recovered.
-				nodeExistsMap, ok := targetNodeExistsCache[item.target]
-				if !ok {
-					nodeExistsMap = make(map[string]bool)
-					targetNodeExistsCache[item.target] = nodeExistsMap
-				}
-
-				for node := range finalNodeMap {
-					if !proxyMap[node] && finalNodeMap[node] > AllowedWeight {
-						delete(finalNodeMap, node)
-						continue
-					}
-					exists, checked := nodeExistsMap[node]
-					if !checked {
-						if nodeStats, err := s.GetStatsForTarget(group, config, item.target, node); err == nil && len(nodeStats) > 0 {
-							exists = true
-						}
-						nodeExistsMap[node] = exists
-					}
-					if !exists {
-						delete(finalNodeMap, node)
-					}
-				}
-
-				if needUpdate {
-					var nodeList []NodeWithWeight
-					for node, weight := range finalNodeMap {
-						nodeList = append(nodeList, NodeWithWeight{node, weight})
-					}
-					sort.Slice(nodeList, func(i, j int) bool {
-						if nodeList[i].Weight != nodeList[j].Weight {
-							return nodeList[i].Weight > nodeList[j].Weight
-						}
-						return nodeList[i].Node < nodeList[j].Node
-					})
-
-					sortedNodes = make([]string, len(nodeList))
-					sortedWeights = make([]float64, len(nodeList))
-					for i, nw := range nodeList {
-						sortedNodes[i] = nw.Node
-						sortedWeights[i] = nw.Weight
-					}
 				} else {
-					sortedNodes = item.bestNodes
-					sortedWeights = item.bestWeights
+					finalNodeMap[newNode] = newW
+					needUpdate = true
 				}
 			}
 
-			if item.asnNumber != "" && !CdnASNs[item.asnNumber] {
-				key := asnCacheKey{item.asnNumber, item.isUDP}
-				asnCache[key] = asnCacheValue{
-					nodes:   sortedNodes,
-					weights: sortedWeights,
+			// Clean up prefetch results if node stats expired, otherwise they may stay in prefetch results even if they are recovered.
+			nodeExistsMap, ok := targetNodeExistsCache[item.target]
+			if !ok {
+				nodeExistsMap = make(map[string]bool)
+				targetNodeExistsCache[item.target] = nodeExistsMap
+			}
+
+			for node := range finalNodeMap {
+				if !proxyMap[node] && finalNodeMap[node] > AllowedWeight {
+					delete(finalNodeMap, node)
+					continue
 				}
+				exists, checked := nodeExistsMap[node]
+				if !checked {
+					if nodeStats, err := s.GetStatsForTarget(group, config, item.target, node); err == nil && len(nodeStats) > 0 {
+						exists = true
+					}
+					nodeExistsMap[node] = exists
+				}
+				if !exists {
+					delete(finalNodeMap, node)
+				}
+			}
+
+			if needUpdate {
+				var nodeList []NodeWithWeight
+				for node, weight := range finalNodeMap {
+					nodeList = append(nodeList, NodeWithWeight{node, weight})
+				}
+				sort.Slice(nodeList, func(i, j int) bool {
+					if nodeList[i].Weight != nodeList[j].Weight {
+						return nodeList[i].Weight > nodeList[j].Weight
+					}
+					return nodeList[i].Node < nodeList[j].Node
+				})
+
+				sortedNodes = make([]string, len(nodeList))
+				sortedWeights = make([]float64, len(nodeList))
+				for i, nw := range nodeList {
+					sortedNodes[i] = nw.Node
+					sortedWeights[i] = nw.Weight
+				}
+			} else {
+				sortedNodes = item.bestNodes
+				sortedWeights = item.bestWeights
 			}
 		}
 
 		if needUpdate {
-			s.StorePrefetchResult(group, config, item.target, item.asnNumber, item.isUDP, sortedNodes, sortedWeights)
+			s.StorePrefetchResult(group, config, item.target, item.isUDP, sortedNodes, sortedWeights)
 		}
 
 		prefetchCount++
@@ -998,9 +876,6 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 
 		if len(oldNodes) == 0 {
 			log.Debugln("[SmartStore] Prefetching for group [%s]: network: [%s] => target: [%s] => result: [%s] (no old result)",
-				group, networkType, target, strings.Join(nodeWeightPairs, ", "))
-		} else if cacheHit {
-			log.Debugln("[SmartStore] Prefetching for group [%s]: network: [%s] => target: [%s] => result: [%s] (from cache)",
 				group, networkType, target, strings.Join(nodeWeightPairs, ", "))
 		} else if needUpdate {
 			oldNodeWeightPairs := make([]string, len(oldNodes))
@@ -1017,64 +892,94 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 	return prefetchCount
 }
 
-func (s *Store) loadBlockedNodes(group, config string) map[string]bool {
-	cacheKey := FormatDBKey(config, group)
-	stateData, err := s.GetNodeStates(group, config)
-	if err != nil {
+// RecordASNEvidence counts one more network observation of a target; the counters are
+// seeded only after TargetASNEvidence scanned the store, until then the call is a no-op.
+func (s *Store) RecordASNEvidence(group, config, target, asn string) {
+	if asn == "" || target == "" {
+		return
+	}
+
+	entry, ok := asnEvidenceCache.Load(config + "|" + group)
+	if !ok {
+		return
+	}
+
+	entry.mutex.Lock()
+	defer entry.mutex.Unlock()
+
+	if entry.data == nil {
+		entry.data = make(map[string]map[string]int)
+	}
+	asns := entry.data[target]
+	if asns == nil {
+		asns = make(map[string]int)
+		entry.data[target] = asns
+	}
+	asns[asn]++
+}
+
+// TargetASNEvidence returns for every target the networks its successful connections
+// were served from and how often, which is the evidence ClaimedASNRules works on.
+// The returned maps are a copy, the counters keep changing in the background.
+func (s *Store) TargetASNEvidence(group, config string) map[string]map[string]int {
+	entry, _ := asnEvidenceCache.LoadOrStore(config+"|"+group, &asnEvidenceEntry{})
+
+	entry.mutex.Lock()
+	defer entry.mutex.Unlock()
+
+	if entry.updated.IsZero() || time.Since(entry.updated) > asnEvidenceRebuildInterval {
+		entry.data = s.scanASNEvidence(group, config)
+		entry.updated = time.Now()
+	}
+
+	if len(entry.data) == 0 {
 		return nil
 	}
-	now := time.Now().Unix()
-	blockedNodes := make(map[string]bool)
 
-	for nodeName, data := range stateData {
-		var state NodeState
-		if json.Unmarshal(data, &state) == nil {
-			if state.BlockedUntil > 0 && state.BlockedUntil > now {
-				blockedNodes[nodeName] = true
+	result := make(map[string]map[string]int, len(entry.data))
+	for target, asns := range entry.data {
+		asnsCopy := make(map[string]int, len(asns))
+		for asn, hits := range asns {
+			asnsCopy[asn] = hits
+		}
+		result[target] = asnsCopy
+	}
+	return result
+}
+
+func (s *Store) scanASNEvidence(group, config string) map[string]map[string]int {
+	allStats, err := s.GetAllStats(group, config)
+	if err != nil || len(allStats) == 0 {
+		return nil
+	}
+
+	result := make(map[string]map[string]int)
+
+	for target, nodeStats := range allStats {
+		for _, data := range nodeStats {
+			var record StatsRecord
+			if json.Unmarshal(data, &record) != nil || record.Weights == nil {
+				continue
+			}
+			for key, value := range record.Weights {
+				if !strings.HasPrefix(key, asnEvidencePrefix) {
+					continue
+				}
+				asn := strings.TrimPrefix(key, asnEvidencePrefix)
+				if asn == "" || value <= 0 {
+					continue
+				}
+				if result[target] == nil {
+					result[target] = make(map[string]int)
+				}
+				result[target][asn] += int(value)
 			}
 		}
 	}
 
-	blockedNodesCache.Set(cacheKey, blockedNodes)
-	return blockedNodes
+	return result
 }
 
-// GetBlockedNodes 获取被屏蔽节点
-func (s *Store) GetBlockedNodes(group, config string) map[string]bool {
-	cacheKey := FormatDBKey(config, group)
-	if cached, expireTime, ok := blockedNodesCache.GetWithExpire(cacheKey); ok {
-		if expireTime.Before(time.Now()) {
-			if _, loading := blockedNodesRefreshFlags.LoadOrStore(cacheKey, true); !loading {
-				go func() {
-					defer blockedNodesRefreshFlags.Delete(cacheKey)
-					s.loadBlockedNodes(group, config)
-				}()
-			}
-		}
-		return cached
-	}
-	return s.loadBlockedNodes(group, config)
-}
-
-// GetNodeStates 获取节点状态
-func (s *Store) GetNodeStates(group, config string) (map[string][]byte, error) {
-	pathPrefix := FormatDBKey(KeyTypeNode, config, group)
-	result := make(map[string][]byte)
-
-	rawResult, err := s.GetSubBytesByPath(pathPrefix)
-	if err != nil {
-		return nil, err
-	}
-
-	for fullPath, data := range rawResult {
-		nodeName := fullPath[strings.LastIndexByte(fullPath, '/')+1:]
-		result[nodeName] = data
-	}
-
-	return result, nil
-}
-
-// 获取域名的统计数据
 func (s *Store) GetStatsForTarget(group, config, target, proxy string) (map[string][]byte, error) {
 	result := make(map[string][]byte)
 
@@ -1104,7 +1009,6 @@ func (s *Store) GetStatsForTarget(group, config, target, proxy string) (map[stri
 	return result, nil
 }
 
-// 获取所有统计数据
 func (s *Store) GetAllStats(group, config string) (map[string]map[string][]byte, error) {
 	pathPrefix := FormatDBKey(KeyTypeStats, config, group)
 
@@ -1133,24 +1037,27 @@ func (s *Store) GetAllStats(group, config string) (map[string]map[string][]byte,
 	return result, nil
 }
 
-// 获取缓存中的所有组名
 func (s *Store) GetAllGroupsForConfig(config string) ([]string, error) {
 	groupsMap := make(map[string]bool)
 
 	statsPath := FormatDBKey(KeyTypeStats, config)
+	collect := func(fullPath string) {
+		rest, found := strings.CutPrefix(fullPath, statsPath+"/")
+		if !found {
+			return
+		}
+		if group, _, _ := strings.Cut(rest, "/"); group != "" {
+			groupsMap[group] = true
+		}
+	}
+
 	raw, err := s.GetSubBytesByPath(statsPath)
 	if err != nil {
 		raw = nil
 	}
 
 	for fullPath := range raw {
-		parts := strings.Split(fullPath, "/")
-		if len(parts) >= 4 {
-			group := parts[3]
-			if group != "" {
-				groupsMap[group] = true
-			}
-		}
+		collect(fullPath)
 	}
 
 	if len(groupsMap) == 0 {
@@ -1159,13 +1066,7 @@ func (s *Store) GetAllGroupsForConfig(config string) ([]string, error) {
 			return nil, err2
 		}
 		for path := range scanResults {
-			parts := strings.Split(path, "/")
-			if len(parts) >= 4 {
-				group := parts[3]
-				if group != "" {
-					groupsMap[group] = true
-				}
-			}
+			collect(path)
 		}
 	}
 
@@ -1177,7 +1078,6 @@ func (s *Store) GetAllGroupsForConfig(config string) ([]string, error) {
 	return result, nil
 }
 
-// 通过缓存数据获取组中的节点
 func (s *Store) GetAllNodesForGroup(group, config string) ([]string, error) {
 	nodesMap := make(map[string]bool)
 
@@ -1213,11 +1113,42 @@ func (s *Store) GetAllNodesForGroup(group, config string) ([]string, error) {
 	return result, nil
 }
 
-// 域名失败屏蔽
-func (s *Store) GetHostStatus(group, config, wildcardTarget string, hostFailLimit int, extraTargets ...string) (failNodes map[string]int, lastCheck int64, lastFailure int64, blocked bool) {
+// Manual blocks (code 1) and the short lived answers of a site (code 2) must not block a target,
+// otherwise a site that limits traffic would flip the target in and out of Blocked every few minutes.
+func countsTowardBlock(code int) bool {
+	return code != 1 && code != 2
+}
+
+func buildHostStatusView(codes map[int]*CodeNodeSet, now int64, hostFailLimit int) (map[string]int, bool) {
+	var nodes map[string]int
+	blockingCount := 0
+
+	for code, codeSet := range codes {
+		if codeSet == nil {
+			continue
+		}
+		for nodeName, nodeEntry := range codeSet.Nodes {
+			if nodeEntry == 0 || nodeEntry > now {
+				if nodes == nil {
+					nodes = make(map[string]int)
+				}
+				if oldCode, exists := nodes[nodeName]; !exists || code < oldCode {
+					nodes[nodeName] = code
+				}
+			}
+			if countsTowardBlock(code) && nodeEntry > now {
+				blockingCount++
+			}
+		}
+	}
+
+	return nodes, blockingCount > hostFailLimit
+}
+
+func (s *Store) GetHostStatus(group, config, wildcardTarget string, hostFailLimit int, extraTargets ...string) (failNodes map[string]int, blocked bool) {
 	now := time.Now().Unix()
 
-	lookup := func(pathPrefix string) (nodes map[string]int, lastCheck int64, lastFailure int64, blocked bool) {
+	lookup := func(pathPrefix string) (nodes map[string]int, blocked bool) {
 		hs, _ := hostStatusCache.GetOrStore(pathPrefix, func() *HostStatus { return &HostStatus{} })
 		hs.initOnce.Do(func() {
 			if rawResult, err := s.GetSubBytesByPath(pathPrefix); err == nil {
@@ -1227,55 +1158,83 @@ func (s *Store) GetHostStatus(group, config, wildcardTarget string, hostFailLimi
 					}
 				}
 			}
+			hs.rev.Add(1)
 		})
+
 		hs.mu.RLock()
-		defer hs.mu.RUnlock()
-		blockingCount := 0
-		for code, codeSet := range hs.Codes {
-			if codeSet == nil {
-				continue
-			}
-			for nodeName, nodeEntry := range codeSet.Nodes {
-				if nodeEntry == 0 || nodeEntry > now {
-					if nodes == nil {
-						nodes = make(map[string]int)
-					}
-					if oldCode, exists := nodes[nodeName]; !exists || code < oldCode {
-						nodes[nodeName] = code
-					}
-				}
-				if code != 1 && nodeEntry > now {
-					blockingCount++
-				}
-			}
+		rev := hs.rev.Load()
+		if cached := hs.view.Load(); cached.rev == rev && cached.limit == hostFailLimit && now < cached.expire {
+			nodes, blocked = cached.nodes, cached.blocked
+			hs.mu.RUnlock()
+			return nodes, blocked
 		}
-		blocked = blockingCount > hostFailLimit
-		return nodes, hs.LastCheck, hs.LastFailure, blocked
+		nodes, blocked = buildHostStatusView(hs.Codes, now, hostFailLimit)
+		hs.mu.RUnlock()
+
+		hs.view.Store(hostStatusView{
+			rev:     rev,
+			limit:   hostFailLimit,
+			expire:  now + hostStatusViewTTLSeconds,
+			nodes:   nodes,
+			blocked: blocked,
+		})
+
+		return nodes, blocked
 	}
 
-	failNodes, lastCheck, lastFailure, blocked = lookup(FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget))
+	failNodes, blocked = lookup(FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget))
 
 	for _, extraTarget := range extraTargets {
 		if extraTarget == "" || extraTarget == wildcardTarget {
 			continue
 		}
-		if extraNodes, _, _, _ := lookup(FormatDBKey(KeyTypeHostFailures, config, group, extraTarget)); len(extraNodes) > 0 {
-			if failNodes == nil {
+		if extraNodes, _ := lookup(FormatDBKey(KeyTypeHostFailures, config, group, extraTarget)); len(extraNodes) > 0 {
+			if len(failNodes) == 0 {
+				// the view is shared with the cache and is never written by a caller
 				failNodes = extraNodes
-			} else {
-				for k, v := range extraNodes {
-					if oldCode, exists := failNodes[k]; !exists || v < oldCode {
-						failNodes[k] = v
-					}
+				continue
+			}
+			merged := make(map[string]int, len(failNodes)+len(extraNodes))
+			for k, v := range failNodes {
+				merged[k] = v
+			}
+			for k, v := range extraNodes {
+				if oldCode, exists := merged[k]; !exists || v < oldCode {
+					merged[k] = v
 				}
 			}
+			failNodes = merged
 		}
 	}
 
 	return
 }
 
-func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata *C.Metadata, name string, maxFailedTimes int, hostFailLimit int, failure, checked bool, statusCode int64) bool {
+// GetHostTiming returns the last check / last failure timestamps of a host
+// status entry. GetHostStatus only surfaces the built view (codes + blocked);
+// the PLD quality gate needs the raw timestamps to throttle its synchronous
+// re-probe (re-test at most every hostProbeThrottle, immediately again after a
+// fresh failure).
+func (s *Store) GetHostTiming(group, config, wildcardTarget string) (lastCheck, lastFailure int64) {
+	pathPrefix := FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget)
+	hs, _ := hostStatusCache.GetOrStore(pathPrefix, func() *HostStatus { return &HostStatus{} })
+	hs.initOnce.Do(func() {
+		if rawResult, err := s.GetSubBytesByPath(pathPrefix); err == nil {
+			for _, data := range rawResult {
+				if json.Unmarshal(data, hs) == nil {
+					break
+				}
+			}
+		}
+		hs.rev.Add(1)
+	})
+
+	hs.mu.RLock()
+	defer hs.mu.RUnlock()
+	return hs.LastCheck, hs.LastFailure
+}
+
+func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata *C.Metadata, name string, maxFailedTimes int, hostFailLimit int, failure, checked bool, statusCode int64, ttl time.Duration) bool {
 	if !checked {
 		return false
 	}
@@ -1288,6 +1247,11 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 			return false
 		}
 		host = metadata.Host
+	}
+
+	blockTTL := HostFailureNodeTTL
+	if ttl > 0 {
+		blockTTL = ttl
 	}
 
 	pathPrefix := FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget)
@@ -1310,6 +1274,7 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 
 	hs.mu.Lock()
 	defer hs.mu.Unlock()
+	hs.rev.Add(1)
 
 	if hs.Codes == nil {
 		hs.Codes = make(map[int]*CodeNodeSet)
@@ -1332,7 +1297,11 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 					}
 				}
 			}
-			if len(codeSet.Nodes) == 0 {
+			// FailCounts keep the back off alive, they are dropped once the host is quiet again
+			if now-hs.LastFailure > int64(hostStatusRetryAfter.Seconds()) {
+				codeSet.FailCounts = nil
+			}
+			if len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0 {
 				delete(hs.Codes, code)
 			}
 			continue
@@ -1350,6 +1319,7 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 		}
 	}
 
+	oldLastFailure := hs.LastFailure
 	currentCode := -1
 
 	for code, codeSet := range hs.Codes {
@@ -1363,8 +1333,11 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 		}
 		if codeSet.FailCounts != nil {
 			if _, ok := codeSet.FailCounts[name]; ok {
-				if currentCode == -1 || code < currentCode {
-					currentCode = code
+				// a pending strike must not shadow the other codes
+				if code != 4 && code != 6 {
+					if currentCode == -1 || code < currentCode {
+						currentCode = code
+					}
 				}
 			}
 		}
@@ -1384,6 +1357,28 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 			}
 		}
 		goto saveAndReturn
+	}
+
+	// the first strike only counts, the second excludes the node
+	if failure && (newCode == 4 || newCode == 6) {
+		count := 1
+		if oldLastFailure != 0 && now-oldLastFailure <= int64(hostStrikeWindow.Seconds()) {
+			if codeSet := hs.Codes[newCode]; codeSet != nil && codeSet.FailCounts != nil {
+				count = codeSet.FailCounts[name] + 1
+			}
+		}
+		if count < hostStrikeLimit {
+			if hs.Codes[newCode] == nil {
+				hs.Codes[newCode] = &CodeNodeSet{Nodes: make(map[string]int64)}
+			}
+			codeSet := hs.Codes[newCode]
+			if codeSet.FailCounts == nil {
+				codeSet.FailCounts = make(map[string]int)
+			}
+			codeSet.FailCounts[name] = count
+			hs.LastFailure = now
+			goto saveAndReturn
+		}
 	}
 
 	if currentCode != -1 && currentCode != newCode {
@@ -1421,7 +1416,29 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 		case 1:
 			codeSet.Nodes[name] = 0 // TTL=0 means permanent
 		case 2:
-			codeSet.Nodes[name] = time.Now().Add(HostFailureNodeTTL).Unix()
+			if ttl > 0 {
+				if codeSet.FailCounts == nil {
+					codeSet.FailCounts = make(map[string]int)
+				}
+				count := codeSet.FailCounts[name] + 1
+				if oldLastFailure != 0 && now-oldLastFailure > int64(hostStatusRetryAfter.Seconds()) {
+					count = 1
+				}
+				codeSet.FailCounts[name] = count
+				// a host that keeps rejecting must back off, a short exclusion would break
+				// the per-target node consistency
+				switch {
+				case count == 2:
+					blockTTL = 15 * time.Minute
+				case count == 3:
+					blockTTL = time.Hour
+				case count == 4:
+					blockTTL = 4 * time.Hour
+				case count > 4:
+					blockTTL = HostFailureNodeTTL
+				}
+			}
+			codeSet.Nodes[name] = time.Now().Add(blockTTL).Unix()
 			if codeSet.NodeHosts == nil {
 				codeSet.NodeHosts = make(map[string]string)
 			}
@@ -1429,13 +1446,13 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 		case 3, 5:
 			// code 3 = dial failure, code 5 = weight below AllowedWeight
 			// (official CalculateWeight). Both count consecutive failures only;
-			// a checked success (state-code probe or the recovery check) clears
-			// the counter above. Do not reset on a 5-minute wall-clock gap: with
-			// a dead node pinned by long-lived connections, failures are sparse
-			// (few new requests) and would never accumulate to maxFailedTimes,
-			// so the node could never be blocked.
-			// code 5 no longer blocks instantly for 24h: a low-but-positive
-			// weight is "not great" — it must not disappear for a day.
+			// a checked success clears the counter above. Do not reset on a
+			// 5-minute wall-clock gap: with a dead node pinned by long-lived
+			// connections, failures are sparse (few new requests) and would
+			// never accumulate to maxFailedTimes, so the node could never be
+			// blocked. code 5 no longer blocks instantly for 24h: a
+			// low-but-positive weight is "not great" — it must not disappear
+			// for a day.
 			if codeSet.FailCounts == nil {
 				codeSet.FailCounts = make(map[string]int)
 			}
@@ -1447,13 +1464,19 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 			} else {
 				codeSet.FailCounts[name] = count
 			}
+		case 4, 6:
+			// the repeated strike is confirmed
+			if codeSet.FailCounts != nil {
+				delete(codeSet.FailCounts, name)
+			}
+			codeSet.Nodes[name] = time.Now().Add(blockTTL).Unix()
+			failedBlock = true
 		default:
-			// Strong-signal instant blocks (code 2 abnormal response, code 4
-			// zero-traffic conn, code 6 high loss, code 7 zero-progress gate):
-			// write the 24h block and report it so the caller can immediately
+			// Strong-signal instant blocks (future codes beyond 2/3/4/5/6):
+			// write the block and report it so the caller can immediately
 			// close the node's residual same-target connections (converge on
 			// the fresh selection instead of half-alive sockets).
-			codeSet.Nodes[name] = time.Now().Add(HostFailureNodeTTL).Unix()
+			codeSet.Nodes[name] = time.Now().Add(blockTTL).Unix()
 			failedBlock = true
 		}
 	}
@@ -1463,7 +1486,7 @@ saveAndReturn:
 	hostBlockingCount := 0
 
 	for code, cs := range hs.Codes {
-		if code != 1 && cs != nil {
+		if countsTowardBlock(code) && cs != nil {
 			hostBlockingCount += len(cs.Nodes)
 		}
 	}
@@ -1506,6 +1529,8 @@ saveAndReturn:
 	return failedBlock
 }
 
+// A code 2 entry that still runs longer than probeMaxBlockTTL was written by the version that
+// blocked the answer of a site for a whole day, and is dropped here.
 func (s *Store) CheckHostStatus(group, config string, hostFailLimit int) (map[string]map[string]string, error) {
 	pathPrefix := FormatDBKey(KeyTypeHostFailures, config, group)
 	dataMap, err := s.GetSubBytesByPath(pathPrefix)
@@ -1544,7 +1569,7 @@ func (s *Store) CheckHostStatus(group, config string, hostFailLimit int) (map[st
 		cacheHS.mu.Lock()
 		hostBlockingCount := 0
 		for code, cs := range cacheHS.Codes {
-			if code != 1 && cs != nil {
+			if countsTowardBlock(code) && cs != nil {
 				for _, nodeEntry := range cs.Nodes {
 					if nodeEntry == 0 || nodeEntry > now {
 						hostBlockingCount++
@@ -1552,8 +1577,26 @@ func (s *Store) CheckHostStatus(group, config string, hostFailLimit int) (map[st
 				}
 			}
 		}
+		dirty := false
+		if cs := cacheHS.Codes[2]; cs != nil {
+			maxEntry := now + int64(probeMaxBlockTTL/time.Second)
+			for nodeName, nodeEntry := range cs.Nodes {
+				if nodeEntry > maxEntry {
+					delete(cs.Nodes, nodeName)
+					delete(cs.NodeHosts, nodeName)
+					dirty = true
+				}
+			}
+			if len(cs.Nodes) == 0 {
+				delete(cacheHS.Codes, 2)
+			}
+		}
 		if newBlocked := hostBlockingCount > hostFailLimit; newBlocked != cacheHS.Blocked {
 			cacheHS.Blocked = newBlocked
+			dirty = true
+		}
+		if dirty {
+			cacheHS.rev.Add(1)
 			if newData, merr := json.Marshal(cacheHS); merr == nil {
 				s.AppendToGlobalQueue(StoreOperation{
 					Type:   OpSaveHostFailures,
@@ -1589,7 +1632,6 @@ func (s *Store) CheckHostStatus(group, config string, hostFailLimit int) (map[st
 	return result, nil
 }
 
-// 移除节点数据
 func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes []string) error {
 	if len(nodes) == 0 {
 		return nil
@@ -1604,7 +1646,6 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 
 	var firstErr error
 
-	// 清理 stats
 	statsPrefix := FormatDBKey(KeyTypeStats, config, group)
 	statsResults, err := s.DBViewPrefixScan(statsPrefix, -1, false)
 	if err != nil {
@@ -1626,7 +1667,6 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 		}
 	}
 
-	// 清理 prefetch
 	prefetchPrefix := FormatDBKey(KeyTypePrefetch, config, group)
 	prefetchResults, err := s.DBViewPrefixScan(prefetchPrefix, -1, false)
 	if err != nil {
@@ -1675,7 +1715,7 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 		pm.UDP.Weights = newUDPWeights
 
 		if changed {
-			if len(pm.TCP.Nodes) == 0 && len(pm.UDP.Nodes) == 0 && pm.RefTCP == "" && pm.RefUDP == "" {
+			if len(pm.TCP.Nodes) == 0 && len(pm.UDP.Nodes) == 0 {
 				prefetchToDelete = append(prefetchToDelete, path)
 			} else {
 				newData, merr := json.Marshal(pm)
@@ -1697,7 +1737,6 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 		}
 	}
 
-	// 清理 ranking
 	rankingPrefix := FormatDBKey(KeyTypeRanking, config, group)
 	rankingResults, err := s.DBViewPrefixScan(rankingPrefix, -1, true)
 	if err != nil {
@@ -1802,7 +1841,7 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 				} else {
 					hostBlockingCount := 0
 					for code, cs := range hs.Codes {
-						if code != 1 && cs != nil {
+						if countsTowardBlock(code) && cs != nil {
 							hostBlockingCount += len(cs.Nodes)
 						}
 					}
@@ -1827,7 +1866,6 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 		}
 	}
 
-	// 删除节点状态
 	nodeStateKeys := make([]string, len(nodes))
 	for i, nodeName := range nodes {
 		nodeStateKeys[i] = FormatDBKey(KeyTypeNode, config, group, nodeName)
@@ -1839,7 +1877,6 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 	return firstErr
 }
 
-// 清理旧的记录
 func (s *Store) CleanupOldRecords(group, config string) {
 	keyTypes := []string{KeyTypeStats, KeyTypePrefetch, KeyTypeHostFailures}
 
@@ -1856,26 +1893,33 @@ func (s *Store) CleanupOldRecords(group, config string) {
 		}
 
 		type targetInfo struct {
-			time   time.Time
-			value  float64
-			target string
+			path  string
+			time  time.Time
+			value float64
 		}
-		targetMap := make(map[string]*targetInfo)
+		var records []targetInfo
 		var toDelete []string
 
 		for path, data := range rawData {
-			parts := strings.Split(path, "/")
-			if len(parts) < 5 {
+			rest, found := strings.CutPrefix(path, pathPrefix+"/")
+			if !found {
 				continue
 			}
-			target := parts[4]
+			target := rest
+			hasNode := false
+			if cut := strings.IndexByte(rest, '/'); cut >= 0 {
+				target = rest[:cut]
+				hasNode = true
+			}
+			if target == "" {
+				continue
+			}
 
-			// 优先保留使用频率高和最近使用的记录
 			var lastTime int64
 			var value float64
 			switch keyType {
 			case KeyTypeStats:
-				if len(parts) < 6 {
+				if !hasNode {
 					continue
 				}
 				var record StatsRecord
@@ -1913,24 +1957,20 @@ func (s *Store) CleanupOldRecords(group, config string) {
 				continue
 			}
 
-			targetMap[path] = &targetInfo{
-				time:   time.Unix(lastTime, 0),
-				value:  value,
-				target: target,
-			}
+			records = append(records, targetInfo{path: path, time: time.Unix(lastTime, 0), value: value})
 		}
 
-		var invalidTargets []string
-		var validTargets []string
-		for path, info := range targetMap {
+		var invalidTargets []targetInfo
+		var validTargets []targetInfo
+		for _, info := range records {
 			if info.time.Unix() <= 0 {
-				invalidTargets = append(invalidTargets, path)
+				invalidTargets = append(invalidTargets, info)
 			} else {
-				validTargets = append(validTargets, path)
+				validTargets = append(validTargets, info)
 			}
 		}
 
-		totalRecords := len(targetMap)
+		totalRecords := len(records)
 		toDeleteCount := totalRecords - maxTargets
 		if toDeleteCount < 0 {
 			toDeleteCount = 0
@@ -1938,26 +1978,22 @@ func (s *Store) CleanupOldRecords(group, config string) {
 		deleted := 0
 
 		sort.Slice(validTargets, func(i, j int) bool {
-			infoI := targetMap[validTargets[i]]
-			infoJ := targetMap[validTargets[j]]
-			if infoI.value != infoJ.value {
-				return infoI.value < infoJ.value
+			if validTargets[i].value != validTargets[j].value {
+				return validTargets[i].value < validTargets[j].value
 			}
-			return infoI.time.Before(infoJ.time)
+			return validTargets[i].time.Before(validTargets[j].time)
 		})
 
-		for i := 0; i < len(validTargets); i++ {
-			path := validTargets[i]
-			info := targetMap[path]
+		for _, info := range validTargets {
 			shouldDeleteByCount := deleted < toDeleteCount && totalRecords > maxTargets*2
 			if shouldDeleteByCount || time.Since(info.time) > RecordExpiredTime {
-				toDelete = append(toDelete, path)
+				toDelete = append(toDelete, info.path)
 				deleted++
 			}
 		}
 
-		for _, path := range invalidTargets {
-			toDelete = append(toDelete, path)
+		for _, info := range invalidTargets {
+			toDelete = append(toDelete, info.path)
 			deleted++
 		}
 		if len(toDelete) > 0 {
@@ -1979,6 +2015,4 @@ func (s *Store) CleanupOldRecords(group, config string) {
 				deleted, keyType, group, totalRecords-deleted)
 		}
 	}
-
-	return
 }

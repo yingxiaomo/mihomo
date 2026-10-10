@@ -19,44 +19,51 @@ func TestUpdateHostStatusBlockSemantics(t *testing.T) {
 	md := &C.Metadata{Host: "example.com"}
 	const cfg, grp, wt = "cfg-test", "grp-test", "*.example.com"
 
-	blocked := s.UpdateHostStatus(grp, cfg, wt, md, "node-5", 5, 10, true, true, 5)
+	blocked := s.UpdateHostStatus(grp, cfg, wt, md, "node-5", 5, 10, true, true, 5, 0)
 	if blocked {
 		t.Fatalf("single low-weight failure must not block instantly")
 	}
 	// Consecutive code-5 events accumulate toward maxFailedTimes.
 	for i := 0; i < 3; i++ {
-		blocked = s.UpdateHostStatus(grp, cfg, wt, md, "node-5", 5, 10, true, true, 5)
+		blocked = s.UpdateHostStatus(grp, cfg, wt, md, "node-5", 5, 10, true, true, 5, 0)
 	}
 	if blocked {
 		t.Fatalf("4 low-weight failures must not yet block with maxFailedTimes=5")
 	}
-	blocked = s.UpdateHostStatus(grp, cfg, wt, md, "node-5", 5, 10, true, true, 5)
+	blocked = s.UpdateHostStatus(grp, cfg, wt, md, "node-5", 5, 10, true, true, 5, 0)
 	if !blocked {
 		t.Fatalf("5 low-weight failures must block")
 	}
 
 	// A checked success clears the counter but does not unblock an existing
 	// block (Nodes entry outlives FailCounts).
-	blocked = s.UpdateHostStatus(grp, cfg, wt, md, "node-3", 5, 10, false, true, 0)
+	blocked = s.UpdateHostStatus(grp, cfg, wt, md, "node-3", 5, 10, false, true, 0, 0)
 	if blocked {
 		t.Fatalf("checked success must not set the blocked flag")
 	}
 	for i := 0; i < 4; i++ {
-		s.UpdateHostStatus(grp, cfg, wt, md, "node-3", 5, 10, true, true, 3)
+		s.UpdateHostStatus(grp, cfg, wt, md, "node-3", 5, 10, true, true, 3, 0)
 	}
-	blocked = s.UpdateHostStatus(grp, cfg, wt, md, "node-3", 5, 10, true, true, 3)
+	blocked = s.UpdateHostStatus(grp, cfg, wt, md, "node-3", 5, 10, true, true, 3, 0)
 	if !blocked {
 		t.Fatalf("5 dial failures must block")
 	}
 
 	// code 7 (zero-progress gate) and code 4 (zero-traffic) block instantly.
-	blocked = s.UpdateHostStatus(grp, cfg, wt, md, "node-7", 5, 10, true, true, 7)
+	blocked = s.UpdateHostStatus(grp, cfg, wt, md, "node-7", 5, 10, true, true, 7, 0)
 	if !blocked {
 		t.Fatalf("zero-progress gate (code 7) must block instantly")
 	}
-	blocked = s.UpdateHostStatus(grp, cfg, wt, md, "node-4", 5, 10, true, true, 4)
+	// code 4 (zero-traffic) requires a second strike within the strike
+	// window (upstream two-strike semantics); code 7 (zero-progress gate)
+	// still blocks instantly via the default branch.
+	blocked = s.UpdateHostStatus(grp, cfg, wt, md, "node-4", 5, 10, true, true, 4, 0)
+	if blocked {
+		t.Fatalf("first zero-traffic strike must only count, not block")
+	}
+	blocked = s.UpdateHostStatus(grp, cfg, wt, md, "node-4", 5, 10, true, true, 4, 0)
 	if !blocked {
-		t.Fatalf("zero-traffic (code 4) must block instantly")
+		t.Fatalf("second zero-traffic strike within the window must block")
 	}
 
 	s.ClearHostStatus(grp, cfg, wt)
