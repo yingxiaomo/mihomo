@@ -282,3 +282,50 @@ func TestSampleWeightFromMB(t *testing.T) {
 		t.Fatalf("weight cap: %v", w)
 	}
 }
+
+// TestLargeFlowRewardIndependentOfLatencySampleCount is the regression test for
+// the throughput-channel poisoning bug: the large-transfer branch used to
+// subtract 0.1*(FailureCount-1), and the caller passed the latency channel's
+// total sample count (rec.SampleCount) as FailureCount. Any mature node
+// (thousands of small connections) therefore had EVERY successful large
+// transfer floored at -2, so the throughput ranking carried no signal and the
+// training labels for bulk transfers were all -2 as well.
+func TestLargeFlowRewardIndependentOfLatencySampleCount(t *testing.T) {
+	var rec PLDRecord
+	// Warm the latency channel the way real browsing does: thousands of small
+	// successful transfers.
+	for i := 0; i < 3000; i++ {
+		rec.UpdateWithMetrics(RewardedMetrics{
+			ConnectTimeMs: 60,
+			FirstByteMs:   90,
+			BytesTo64KMs:  20,
+			DownloadMB:    0.05,
+		})
+	}
+	if rec.SampleCount != 3000 {
+		t.Fatalf("latency samples: %d", rec.SampleCount)
+	}
+	latencyBefore := rec.Reward
+
+	// One successful large transfer: 10MB in 2s = 5MB/s.
+	scalar, parts := rec.UpdateWithMetrics(RewardedMetrics{
+		DownloadMB:  10,
+		DurationSec: 2.0,
+	})
+	if scalar <= 0 {
+		t.Fatalf("successful 5MB/s transfer must score positive, got %v", scalar)
+	}
+	if rec.RewardLarge <= 0 {
+		t.Fatalf("throughput channel poisoned by latency sample count: reward_large=%v", rec.RewardLarge)
+	}
+	if rec.SampleCountLarge != 1 {
+		t.Fatalf("large samples: %d", rec.SampleCountLarge)
+	}
+	if parts.ThrKBps < 5000 || parts.ThrKBps > 5200 {
+		t.Fatalf("throughput archive: %v KB/s", parts.ThrKBps)
+	}
+	// The latency channel must be untouched by a large transfer.
+	if rec.SampleCount != 3000 || rec.Reward != latencyBefore {
+		t.Fatalf("large transfer leaked into latency channel: n=%d reward=%v (want %v)", rec.SampleCount, rec.Reward, latencyBefore)
+	}
+}

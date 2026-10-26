@@ -56,7 +56,6 @@ type RewardedMetrics struct {
 	MaxDownloadKB float64 // peak KB/s
 	LossRate      float64
 	Failed        bool
-	FailureCount  int64 // consecutive failures this node has accumulated
 }
 
 // SmallTransferKB is the threshold below which a transfer is treated as
@@ -146,10 +145,11 @@ func ComputeRewardDetail(m RewardedMetrics) (float64, RewardParts) {
 	thrScore := thrKbps / (thrKbps + 3000.0)
 	r := 0.8*thrScore - m.LossRate*1.2
 	parts.LossPenalty = m.LossRate * 1.2
-	// penalize repeated failures softly
-	if m.FailureCount > 1 {
-		r -= 0.1 * float64(m.FailureCount-1)
-	}
+	// NOTE: no extra "repeated failure" penalty here. Real failures are
+	// already scored -2 by FillFailure on both channels; applying a
+	// sample-count-driven penalty on a SUCCESSFUL large transfer used to
+	// poison the throughput channel (any mature node floored at -2), so this
+	// branch must depend only on this transfer's own throughput and loss.
 	return clampReward(r), parts
 }
 

@@ -2358,7 +2358,6 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 			MaxDownloadKB: maxDownloadRateKB,
 			LossRate:      lossRate,
 			Failed:        err != nil,
-			FailureCount:  rec.SampleCount,
 		}
 		r, parts := rec.UpdateWithMetrics(rm)
 		s.savePLDRecord(target, proxyName, rec)
