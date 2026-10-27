@@ -30,3 +30,9 @@ test/config/cache*
 /.gomodcache/
 /.gocache/
 /.gopath/
+
+# local build, deployment, and kernel test artifacts
+/.deploy-naive/
+/artifact.zip
+/naive-mihomo-*.gz
+
