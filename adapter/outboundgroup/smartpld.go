@@ -256,10 +256,11 @@ func NewSmartPLD(option GroupCommonOption, smartOption SmartPLDOption, emptyFall
 
 	// Post-failure cool-off: a hard failure makes the node unselectable for
 	// this target for failureCooldown (default 60s), regardless of its EWMA
-	// reward or unwrap-primary status.
+	// reward or unwrap-primary status. The configured value is baked into the
+	// persisted FailureUntil at FillFailure time; <=0 disables the window.
 	s.failureCooldown = time.Duration(smartOption.FailureCooldownSec) * time.Second
 	if s.failureCooldown == 0 {
-		s.failureCooldown = smart.FailureCooldownSec * time.Second
+		s.failureCooldown = smart.FailureCooldownDefaultSec * time.Second
 	}
 	if s.failureCooldown < 0 {
 		s.failureCooldown = 0 // explicit off
@@ -481,7 +482,9 @@ func (s *SmartPLD) DialContext(ctx context.Context, metadata *C.Metadata) (C.Con
 func (s *SmartPLD) selectProxiesFull(metadata *C.Metadata, proxies []C.Proxy) []C.Proxy {
 	wildcardTarget := smart.GetEffectiveTarget(metadata.Host, metadata.DstIP.String())
 	isUDP := metadata.NetWork == C.UDP
-	return s.filterProxies(metadata, wildcardTarget, nil, nil, proxies, maxSelected, isUDP)
+	features := lightgbm.BuildRequestFeatures(metadata, s.Name(), time.Now())
+	largeMode := smart.PreferLargeFlowChannel(features.DomainTrafficLevel, features.TrafficClass)
+	return s.filterProxies(metadata, wildcardTarget, nil, nil, proxies, maxSelected, isUDP, largeMode)
 }
 
 func (s *SmartPLD) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
@@ -677,7 +680,7 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 			// and the node never got switched (the recurring "won't switch"
 			// symptom: node looks alive, connection hangs, never recovers).
 			rec := s.getPLDRecord(target, proxy.Name())
-			rec.FillFailure()
+			rec.FillFailure(s.failureCooldownSec())
 			s.savePLDRecord(target, proxy.Name(), rec)
 			// NOTE: deliberately NOT force-closing the node's same-target
 			// connections here. The official smart group never closes
@@ -725,11 +728,11 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 				}
 				log.Debugln("[PLD] Group: [%s] Node: [%s] Target: [%s] zero progress (%d bytes up, 0 down after %s), zero-progress gate fired",
 					s.Name(), proxy.Name(), target, upload1, time.Since(firstSample).Round(time.Second))
-				s.markNodeFailure(metadata, proxy.Name(), true, true, 7)
-				s.store.DeleteUnwrapResult(s.Name(), s.configName, target)
-				rec := s.getPLDRecord(target, proxy.Name())
-				rec.FillFailure()
-				s.savePLDRecord(target, proxy.Name(), rec)
+			s.markNodeFailure(metadata, proxy.Name(), true, true, 7)
+			s.store.DeleteUnwrapResult(s.Name(), s.configName, target)
+			rec := s.getPLDRecord(target, proxy.Name())
+			rec.FillFailure(s.failureCooldownSec())
+			s.savePLDRecord(target, proxy.Name(), rec)
 				// NOTE: same as the first-byte gate — no force-closing of the
 				// node's same-target connections. The official smart group never
 				// closes established connections on a quality signal; force-closing
@@ -845,7 +848,14 @@ func (s *SmartPLD) Proxies() []C.Proxy {
 	return s.GetProxies(false)
 }
 
-func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, names []string, weights []float64, all []C.Proxy, minCount int, isUDP bool) []C.Proxy {
+// failureCooldownSec returns the group's configured post-failure cool-off
+// window in seconds (0 = window disabled). It is baked into the persisted
+// FailureUntil at FillFailure time.
+func (s *SmartPLD) failureCooldownSec() int64 {
+	return int64(s.failureCooldown / time.Second)
+}
+
+func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, names []string, weights []float64, all []C.Proxy, minCount int, isUDP bool, largeMode bool) []C.Proxy {
 	blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName)
 	wtFailNodes, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, s.hostFailLimit, metadata.SmartTarget)
 
@@ -859,12 +869,16 @@ func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, na
 
 	checkNodeUsed := make(map[string]bool, len(names)+len(wtFailNodes))
 
-	// softFailed marks nodes whose PLD reward EMA for this target is negative:
-	// they have been failing recently (e.g. Cloudflare-fronted nodes that cannot
-	// reach certain destinations) even though url-test still reports them alive.
-	// Unwrap/pool candidates that keep selecting such nodes cause per-request
-	// timeouts and connection churn, so exclude them from both the ranked names
-	// and the fill-up pool (the full fallbackAll keeps them as a last resort).
+	// softFailed marks nodes whose PLD reward EMA for this target is negative
+	// on the channel this request actually hits: they have been failing
+	// recently (e.g. Cloudflare-fronted nodes that cannot reach certain
+	// destinations) even though url-test still reports them alive. Judging by
+	// the request's channel keeps the dual-channel design coherent end to end —
+	// a "slow web but fast download" node stays a valid large-flow candidate
+	// and vice versa. Unwrap/pool candidates that keep selecting such nodes
+	// cause per-request timeouts and connection churn, so exclude them from
+	// both the ranked names and the fill-up pool (the full fallbackAll keeps
+	// them as a last resort).
 	softFailed := func(name string) bool {
 		if !s.usePLD {
 			return false
@@ -874,10 +888,11 @@ func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, na
 			target = wildcardTarget
 		}
 		rec := s.getPLDRecord(target, name)
-		if rec.SampleCount < 2 {
+		rew, _, cnt := rec.ChannelStats(largeMode)
+		if cnt < 2 {
 			return false // keep cold / exploratory nodes
 		}
-		return rec.Reward < 0
+		return rew < 0
 	}
 
 	// inCooldown reports whether the node is cooling off for this target
@@ -909,16 +924,17 @@ func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, na
 			continue
 		}
 		// The ranked names on this path are the unwrap primary / fresh winners,
-		// but a node whose EWMA reward for this target is negative (softFailed:
-		// ≥2 samples, Reward < 0) must not be served as the primary either —
-		// it kept winning "just because it was pinned", making the fill-up pool
-		// and fallbacks select around it while every request through it hung
-		// (the recurring "won't switch" symptom). Cold nodes (<2 samples) stay
-		// exempt so exploration is never starved. Broken nodes are removed via
-		// blockedNodes (failure-count block), AliveForTestUrl (health check),
-		// inCooldown (post-failure cool-off) and softFailed (historical
-		// negatives); the full fallbackAll keeps even soft-failed nodes as a
-		// last resort so a mildly negative but sole viable node is still used.
+		// but a node whose channel-matched EWMA reward for this target is
+		// negative (softFailed: ≥2 channel samples, EMA < 0) must not be served
+		// as the primary either — it kept winning "just because it was pinned",
+		// making the fill-up pool and fallbacks select around it while every
+		// request through it hung (the recurring "won't switch" symptom). Cold
+		// nodes (<2 channel samples) stay exempt so exploration is never
+		// starved. Broken nodes are removed via blockedNodes (failure-count
+		// block), AliveForTestUrl (health check), inCooldown (post-failure
+		// cool-off) and softFailed (historical negatives); the full fallbackAll
+		// keeps even soft-failed nodes as a last resort so a mildly negative
+		// but sole viable node is still used.
 		w := 0.0
 		if weights != nil && i < len(weights) {
 			w = weights[i]
@@ -1287,8 +1303,9 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 	// unwrap-cache hits. The cache only saves the bbolt ranking lookup;
 	// PLD's in-memory scoring is cheap and its detailed P/F decision trail
 	// should be visible in the dashboard logs for every selection.
+	largeMode := false
 	if s.usePLD && len(resultNames) > 0 {
-		resultNames, resultWeights = s.computePLDWeights(metadata, resultNames, proxies)
+		resultNames, resultWeights, largeMode = s.computePLDWeights(metadata, resultNames, proxies)
 	}
 
 	// 滞回切换：PLD 重排后的新首位只有满足下列任一条件才允许替换当前
@@ -1349,7 +1366,7 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		}
 	}
 
-	result := s.filterProxies(metadata, wildcardTarget, resultNames, resultWeights, proxies, maxSelected, isUDP)
+	result := s.filterProxies(metadata, wildcardTarget, resultNames, resultWeights, proxies, maxSelected, isUDP, largeMode)
 
 	return result, pinned
 }
@@ -1357,9 +1374,9 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 // computePLDWeights computes the D-UCB final weight for each candidate node and
 // re-ranks names/weights by it. It needs the request features (metadata) and the
 // per-node EWMA reward / sample count from the stats store.
-func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxies []C.Proxy) ([]string, []float64) {
+func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxies []C.Proxy) ([]string, []float64, bool) {
 	if len(names) == 0 {
-		return names, nil
+		return names, nil, false
 	}
 
 	features := lightgbm.BuildRequestFeatures(metadata, s.Name(), time.Now())
@@ -1371,7 +1388,7 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 
 	type scoreEntry struct {
 		name     string
-		prior    float64 // 阶段一：PriorModel 先验分（无模型时为 flat 0.5）
+		prior    float64 // 阶段一：PriorModel 先验分（标签域 [-2,1]，无模型时为中性 0）
 		pld      float64 // 阶段二：D-UCB FinalWeight（prior + reward EMA + explore）
 		official float64 // 官方规则权重（CalculateWeight，历史统计）
 		w        float64 // 排序分：cooperative blend of pld & official
@@ -1439,7 +1456,7 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 				rewardVars[name], delays[name], nodeTypes[name])
 			prior = p
 		} else {
-			prior = 0.5 // flat prior when no model
+			prior = lightgbm.FlatPrior // flat prior when no model (reward-scale neutral)
 		}
 		w := smart.FinalWeight(prior, rewards[name], int64(counts[name]), totalSamples,
 			s.priorWeight, s.priorDecayK, s.exploreStrength)
@@ -1503,7 +1520,7 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 		outNames[i] = e.name
 		outWeights[i] = e.w
 	}
-	return outNames, outWeights
+	return outNames, outWeights, largeMode
 }
 
 func (s *SmartPLD) InitSmart() {
@@ -2359,7 +2376,7 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 			LossRate:      lossRate,
 			Failed:        err != nil,
 		}
-		r, parts := rec.UpdateWithMetrics(rm)
+		r, parts := rec.UpdateWithMetrics(rm, s.failureCooldownSec())
 		s.savePLDRecord(target, proxyName, rec)
 		pldReward = r
 		pldParts = &parts

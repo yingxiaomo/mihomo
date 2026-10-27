@@ -89,10 +89,13 @@ var (
 	priorModelOnce sync.Once
 )
 
-// flatPrior is the degenerate prior used when no model is loaded: every node gets
-// the same small base, so D-UCB degenerates to pure online reward + exploration
-// (zero-failure cold start requirement).
-const flatPrior = 0.5
+// FlatPrior is the degenerate prior used when no model is loaded or a
+// prediction fails: the neutral point of the reward label scale. Every node
+// gets the same constant, so the D-UCB ranking degenerates to pure online
+// reward + exploration (zero-failure cold start requirement) without the
+// uniform bias a "good-looking" constant would inject into the hysteresis's
+// negative-score collapse threshold.
+const FlatPrior = 0.0
 
 // Reward label range the prior regression is trained against (ComputeReward /
 // clampReward: hard failure -2 ... best 1). The raw LightGBM output is clamped
@@ -166,22 +169,22 @@ func (m *PriorModel) loadModel(path string) error {
 // 15/16/18. Returns the raw reward-scale prediction clamped to
 // [rewardLabelMin, rewardLabelMax] (negative = this node is expected to perform
 // badly for this target — a real signal FinalWeight needs), or Used=false and
-// flatPrior when no model.
+// FlatPrior when no model.
 func (m *PriorModel) PredictPrior(features RequestFeatures, nodeName string, rewardEMA, sampleCount, rewardVar, delayMs, nodeType float64) (float64, bool) {
 	if m == nil {
-		return flatPrior, false
+		return FlatPrior, false
 	}
 	m.mutex.RLock()
 	model := m.model
 	transforms := m.transforms
 	m.mutex.RUnlock()
 	if model == nil {
-		return flatPrior, false
+		return FlatPrior, false
 	}
 
 	vec := preparePriorFeatures(features, nodeName, rewardEMA, sampleCount, rewardVar, delayMs, nodeType)
 	if len(vec) == 0 {
-		return flatPrior, false
+		return FlatPrior, false
 	}
 
 	// Apply the model's [transforms] section (train_pld.py appends a
@@ -205,7 +208,7 @@ func (m *PriorModel) PredictPrior(features RequestFeatures, nodeName string, rew
 	}()
 
 	if predictErr {
-		return flatPrior, false
+		return FlatPrior, false
 	}
 	return priorFromRaw(raw)
 }
@@ -220,7 +223,7 @@ func (m *PriorModel) PredictPrior(features RequestFeatures, nodeName string, rew
 // never demote one.
 func priorFromRaw(raw float64) (float64, bool) {
 	if math.IsNaN(raw) {
-		return flatPrior, false
+		return FlatPrior, false
 	}
 	if raw < rewardLabelMin {
 		return rewardLabelMin, true

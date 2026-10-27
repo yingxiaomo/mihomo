@@ -6,6 +6,7 @@ package smart
 
 import (
 	"math"
+	"strings"
 	"time"
 )
 
@@ -273,29 +274,35 @@ type PLDRecord struct {
 	FailureUntil int64 `json:"failure_until,omitempty"`
 }
 
-// FailureCooldownSec is how long a node is unselectable for a target after a
-// hard failure (dial error, first-byte gate timeout, zero-progress gate).
-const FailureCooldownSec = 60
+// FailureCooldownDefaultSec is the default cool-off window (seconds) applied
+// when the group does not configure failure-cooldown-sec.
+const FailureCooldownDefaultSec = 60
 
 // FillFailure applies a hard failure reward (-2) to BOTH channels: a node that
 // fails the target (dial error, first-byte gate timeout, abnormal response)
 // must drop out of ranking for latency-sensitive and throughput-sensitive
-// requests alike.
-func (r *PLDRecord) FillFailure() {
+// requests alike. cooldownSec is the group's configured failure-cooldown-sec:
+// it decides how long FailureUntil (persisted) keeps the node unselectable for
+// this target; pass 0 to leave the record without a cool-off window (disabled).
+func (r *PLDRecord) FillFailure(cooldownSec int64) {
 	rew := -2.0
 	newR, newVar, newCnt := UpdateRewardEMA(r.Reward, r.RewardVar, r.SampleCount, rew)
 	r.Reward, r.RewardVar, r.SampleCount = newR, newVar, newCnt
 	newRL, newVarL, newCntL := UpdateRewardEMA(r.RewardLarge, r.RewardLargeVar, r.SampleCountLarge, rew)
 	r.RewardLarge, r.RewardLargeVar, r.SampleCountLarge = newRL, newVarL, newCntL
-	r.FailureUntil = time.Now().Add(FailureCooldownSec * time.Second).Unix()
+	if cooldownSec > 0 {
+		r.FailureUntil = time.Now().Add(time.Duration(cooldownSec) * time.Second).Unix()
+	}
 	r.LastUpdated = time.Now().Unix()
 }
 
 // InFailureCooldown reports whether the record is inside its post-failure
 // cool-off window at unix time now — the node must not be selected for this
-// target until the window passes.
+// target until the window passes. The window length was baked into FailureUntil
+// at FillFailure time from the group's failure-cooldown-sec config (0 disables
+// the window entirely), so only the persisted timestamp is checked here.
 func (r *PLDRecord) InFailureCooldown(now int64) bool {
-	return FailureCooldownSec > 0 && now < r.FailureUntil
+	return r.FailureUntil > 0 && now < r.FailureUntil
 }
 
 // UpdateWithMetrics folds one completed connection into the channel-appropriate
@@ -309,13 +316,13 @@ func (r *PLDRecord) InFailureCooldown(now int64) bool {
 //     (latency channel untouched)
 //
 // It returns the scalar reward and its physical breakdown for logging/training.
-func (r *PLDRecord) UpdateWithMetrics(m RewardedMetrics) (float64, RewardParts) {
+func (r *PLDRecord) UpdateWithMetrics(m RewardedMetrics, cooldownSec int64) (float64, RewardParts) {
 	scalar, parts := ComputeRewardDetail(m)
 	if m.Failed && parts.Failure {
 		// True failure (no meaningful download): punish BOTH channels so the
 		// node drops out of ranking for latency- and throughput-sensitive
 		// requests alike.
-		r.FillFailure()
+		r.FillFailure(cooldownSec)
 		return scalar, parts
 	}
 	if !m.SmallFlow() {
@@ -410,4 +417,28 @@ const PLDKeyPrefix = "pld:"
 // reward record.
 func FormatPLDKey(config, group, target, node string) string {
 	return PLDKeyPrefix + config + ":" + group + ":" + target + ":" + node
+}
+
+// PLDKeyState pairs one persisted PLDRecord with its storage-key parts for the
+// /smart/pld debug endpoint: the record is what selection reads, the parts
+// identify which (config, group, target, node) it belongs to.
+type PLDKeyState struct {
+	Config string     `json:"config"`
+	Group  string     `json:"group"`
+	Target string     `json:"target"`
+	Node   string     `json:"node"`
+	Record *PLDRecord `json:"record"`
+}
+
+// ParsePLDKey splits a PLD storage key back into its parts; ok is false for
+// foreign keys that merely look similar.
+func ParsePLDKey(key string) (config, group, target, node string, ok bool) {
+	if !strings.HasPrefix(key, PLDKeyPrefix) {
+		return "", "", "", "", false
+	}
+	parts := strings.SplitN(key[len(PLDKeyPrefix):], ":", 4)
+	if len(parts) != 4 || parts[0] == "" || parts[1] == "" || parts[2] == "" || parts[3] == "" {
+		return "", "", "", "", false
+	}
+	return parts[0], parts[1], parts[2], parts[3], true
 }

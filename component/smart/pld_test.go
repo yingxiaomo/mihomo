@@ -119,7 +119,7 @@ func TestComputeRewardPartialSuccess(t *testing.T) {
 
 	// Partial success updates the throughput channel + archive, not latency.
 	rec := &PLDRecord{}
-	rec.UpdateWithMetrics(RewardedMetrics{DownloadMB: 2.0, DurationSec: 1.0, Failed: true})
+	rec.UpdateWithMetrics(RewardedMetrics{DownloadMB: 2.0, DurationSec: 1.0, Failed: true}, 60)
 	if rec.RewardLarge <= 0 || rec.SampleCountLarge != 1 {
 		t.Fatalf("partial success must feed the throughput channel: large=%v cnt=%d", rec.RewardLarge, rec.SampleCountLarge)
 	}
@@ -142,7 +142,7 @@ func TestPLDRecordDualChannelIsolation(t *testing.T) {
 		BytesTo64KMs:  60,
 		DownloadMB:    0.05,
 		DurationSec:   0.5,
-	})
+	}, 60)
 	if !parts.SmallFlow {
 		t.Fatalf("0.05MB should be treated as small flow")
 	}
@@ -161,7 +161,7 @@ func TestPLDRecordDualChannelIsolation(t *testing.T) {
 	_, parts2 := rec2.UpdateWithMetrics(RewardedMetrics{
 		DownloadMB:  10.0, // 10MB
 		DurationSec: 2.0,  // 5MB/s
-	})
+	}, 60)
 	if parts2.SmallFlow {
 		t.Fatalf("10MB should be treated as large flow")
 	}
@@ -178,7 +178,7 @@ func TestPLDRecordDualChannelIsolation(t *testing.T) {
 	// Failure must punish BOTH channels (a dead node must not be selected under
 	// either flow priority) and count in both sample counters.
 	rec3 := &PLDRecord{Reward: 0.8, RewardLarge: 0.7}
-	rec3.UpdateWithMetrics(RewardedMetrics{Failed: true})
+	rec3.UpdateWithMetrics(RewardedMetrics{Failed: true}, 60)
 	if !(rec3.Reward < 0.8 && rec3.RewardLarge < 0.7) {
 		t.Fatalf("failure must punish both channels: rew=%v large=%v", rec3.Reward, rec3.RewardLarge)
 	}
@@ -231,22 +231,26 @@ func TestPreferLargeFlowChannel(t *testing.T) {
 }
 
 func TestPLDRecordFailureCooldown(t *testing.T) {
-	// A hard failure must make the node unselectable for the cool-off window:
-	// the -2 reward alone cannot be trusted (EWMA dilution on high-sample
-	// nodes), so FillFailure arms FailureUntil as a hard exclusion.
+	// A hard failure must make the node unselectable for the configured
+	// cool-off window: the -2 reward alone cannot be trusted (EWMA dilution on
+	// high-sample nodes), so FillFailure arms FailureUntil as a hard
+	// exclusion, with the duration taken from failure-cooldown-sec.
 	rec := &PLDRecord{}
-	rec.FillFailure()
+	rec.FillFailure(120)
 	now := time.Now().Unix()
 	if !rec.InFailureCooldown(now) {
 		t.Fatalf("immediately after FillFailure the node must be cooling off")
 	}
-	if rec.InFailureCooldown(now + FailureCooldownSec + 1) {
+	if rec.FailureUntil <= now+118 || rec.FailureUntil > now+121 {
+		t.Fatalf("configured window must be honored: FailureUntil=%d want ~now+120", rec.FailureUntil)
+	}
+	if rec.InFailureCooldown(rec.FailureUntil + 1) {
 		t.Fatalf("after the cool-off window the node must be selectable again")
 	}
 
 	// Success updates must NOT arm the cool-off.
 	rec2 := &PLDRecord{}
-	rec2.UpdateWithMetrics(RewardedMetrics{ConnectTimeMs: 30, DownloadMB: 0.05, DurationSec: 0.4})
+	rec2.UpdateWithMetrics(RewardedMetrics{ConnectTimeMs: 30, DownloadMB: 0.05, DurationSec: 0.4}, 120)
 	if rec2.InFailureCooldown(now) {
 		t.Fatalf("successful transfer must not arm the failure cool-off")
 	}
@@ -254,9 +258,31 @@ func TestPLDRecordFailureCooldown(t *testing.T) {
 	// Partial success (downloaded then closed abnormally) is NOT a hard
 	// failure and must not arm the cool-off either.
 	rec3 := &PLDRecord{}
-	rec3.UpdateWithMetrics(RewardedMetrics{DownloadMB: 2.0, DurationSec: 1.0, Failed: true})
+	rec3.UpdateWithMetrics(RewardedMetrics{DownloadMB: 2.0, DurationSec: 1.0, Failed: true}, 120)
 	if rec3.InFailureCooldown(now) {
 		t.Fatalf("partial success must not arm the failure cool-off")
+	}
+
+	// cooldown 0 disables the window entirely: the -2 still lands on both
+	// channels, but no FailureUntil is set.
+	rec4 := &PLDRecord{}
+	rec4.FillFailure(0)
+	if rec4.FailureUntil != 0 || rec4.InFailureCooldown(now) {
+		t.Fatalf("disabled cooldown must not arm the window: until=%d", rec4.FailureUntil)
+	}
+	if rec4.SampleCount != 1 || rec4.SampleCountLarge != 1 {
+		t.Fatalf("disabled cooldown must still punish both channels: %d/%d", rec4.SampleCount, rec4.SampleCountLarge)
+	}
+}
+
+func TestParsePLDKeyRoundtrip(t *testing.T) {
+	key := FormatPLDKey("run", "香港智能", "GeoSite [telegram]", "自建-hk · 香港-argo")
+	config, group, target, node, ok := ParsePLDKey(key)
+	if !ok || config != "run" || group != "香港智能" || target != "GeoSite [telegram]" || node != "自建-hk · 香港-argo" {
+		t.Fatalf("ParsePLDKey roundtrip failed: %v %q %q %q %q", ok, config, group, target, node)
+	}
+	if _, _, _, _, ok := ParsePLDKey("other:run:g:t:n"); ok {
+		t.Fatal("non-PLD prefix must not parse")
 	}
 }
 
@@ -300,7 +326,7 @@ func TestLargeFlowRewardIndependentOfLatencySampleCount(t *testing.T) {
 			FirstByteMs:   90,
 			BytesTo64KMs:  20,
 			DownloadMB:    0.05,
-		})
+		}, 60)
 	}
 	if rec.SampleCount != 3000 {
 		t.Fatalf("latency samples: %d", rec.SampleCount)
@@ -311,7 +337,7 @@ func TestLargeFlowRewardIndependentOfLatencySampleCount(t *testing.T) {
 	scalar, parts := rec.UpdateWithMetrics(RewardedMetrics{
 		DownloadMB:  10,
 		DurationSec: 2.0,
-	})
+	}, 60)
 	if scalar <= 0 {
 		t.Fatalf("successful 5MB/s transfer must score positive, got %v", scalar)
 	}

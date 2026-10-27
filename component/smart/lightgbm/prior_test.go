@@ -34,7 +34,7 @@ func TestPriorFromRawPassthrough(t *testing.T) {
 
 func TestPriorFromRawNaNFallsBackFlat(t *testing.T) {
 	got, used := priorFromRaw(math.NaN())
-	if used || got != flatPrior {
+	if used || got != FlatPrior {
 		t.Fatalf("NaN should fall back to flat prior (got %v, %v)", got, used)
 	}
 }
@@ -47,8 +47,8 @@ func TestPriorFromRawKeepsNegativeDiscrimination(t *testing.T) {
 	mediocre, _ := priorFromRaw(-0.1)
 	good, _ := priorFromRaw(0.8)
 
-	if bad == mediocre || bad == flatPrior {
-		t.Fatalf("negative predictions collapsed: bad=%v mediocre=%v flat=%v", bad, mediocre, flatPrior)
+	if bad == mediocre || bad == FlatPrior {
+		t.Fatalf("negative predictions collapsed: bad=%v mediocre=%v flat=%v", bad, mediocre, FlatPrior)
 	}
 	if !(bad < mediocre && mediocre < good) {
 		t.Fatalf("ordering broken: bad=%v mediocre=%v good=%v", bad, mediocre, good)
