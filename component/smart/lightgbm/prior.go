@@ -69,7 +69,7 @@ const PriorFeatureSize = 30
 // PriorScore holds one node's predicted base score for a given request.
 type PriorScore struct {
 	Node  string
-	Score float64 // in (0,1], higher = more likely to satisfy this request
+	Score float64 // in [rewardLabelMin, rewardLabelMax], same scale as the online reward EMA
 	Used  bool    // false when model/path unavailable and prior fell back to prior_flat
 }
 
@@ -93,6 +93,15 @@ var (
 // the same small base, so D-UCB degenerates to pure online reward + exploration
 // (zero-failure cold start requirement).
 const flatPrior = 0.5
+
+// Reward label range the prior regression is trained against (ComputeReward /
+// clampReward: hard failure -2 ... best 1). The raw LightGBM output is clamped
+// to this band so the prior stays on the SAME scale as the online RewardEMA
+// that FinalWeight blends it with.
+const (
+	rewardLabelMin = -2.0
+	rewardLabelMax = 1.0
+)
 
 // GetPriorModel loads (once) the prior model from PriorModel.bin — a dedicated
 // file separate from the official weight model's Model.bin. The two models use
@@ -154,7 +163,10 @@ func (m *PriorModel) loadModel(path string) error {
 // auxiliary inputs so the model can blend "what this node historically did" with
 // "what this request needs". rewardVar/delayMs/nodeType are the node's live
 // state (reward variance, last url-test delay, protocol type) feeding features
-// 15/16/18. Returns Used=false and flatPrior when no model.
+// 15/16/18. Returns the raw reward-scale prediction clamped to
+// [rewardLabelMin, rewardLabelMax] (negative = this node is expected to perform
+// badly for this target — a real signal FinalWeight needs), or Used=false and
+// flatPrior when no model.
 func (m *PriorModel) PredictPrior(features RequestFeatures, nodeName string, rewardEMA, sampleCount, rewardVar, delayMs, nodeType float64) (float64, bool) {
 	if m == nil {
 		return flatPrior, false
@@ -178,31 +190,45 @@ func (m *PriorModel) PredictPrior(features RequestFeatures, nodeName string, rew
 		vec = transforms.ApplyTransforms(vec)
 	}
 
-	// Wrap with a 12-feature ontology: pseudo softmax/normalization happens in
-	// the Go layer, the model stays a point regressor.
-	raw := float64(0)
+	// Wrap with a 12-feature ontology: the model stays a point regressor on
+	// the raw reward label; scale mapping happens in priorFromRaw below.
+	var raw float64
+	var predictErr bool
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
 				log.Errorln("[PLD] prior model predict panic: %v", r)
-				raw = 0
+				predictErr = true
 			}
 		}()
 		raw = model.PredictSingle(vec, 0)
 	}()
 
-	if math.IsNaN(raw) || raw <= 0 {
+	if predictErr {
 		return flatPrior, false
 	}
-	// squash to (0,1] for a stable bounded prior
-	score := 1.0 / (1.0 + math.Exp(-raw))
-	if score > 1 {
-		score = 1
+	return priorFromRaw(raw)
+}
+
+// priorFromRaw maps the LightGBM regression output (trained on the raw reward
+// label, range [-2, 1]) onto the prior scale. The output is clamped to the
+// same band the online RewardEMA lives on, so FinalWeight blends two
+// commensurate estimates of "expected reward for this request". The previous
+// mapping (sigmoid of raw>0, flat 0.5 otherwise) destroyed all negative
+// discrimination: every "this node is bad for this target" memory collapsed
+// into the same neutral 0.5, so the prior could only ever boost a candidate,
+// never demote one.
+func priorFromRaw(raw float64) (float64, bool) {
+	if math.IsNaN(raw) {
+		return flatPrior, false
 	}
-	if score < 0.05 {
-		score = 0.05
+	if raw < rewardLabelMin {
+		return rewardLabelMin, true
 	}
-	return score, true
+	if raw > rewardLabelMax {
+		return rewardLabelMax, true
+	}
+	return raw, true
 }
 
 // PriorBatch computes priors for a slice of candidate nodes in one call.
