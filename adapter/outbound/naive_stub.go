@@ -28,6 +28,8 @@ type NaiveOption struct {
 	QUIC                  bool              `proxy:"quic,omitempty"`
 	QUICCongestionControl string            `proxy:"quic-congestion-control,omitempty"`
 	InsecureConcurrency   int               `proxy:"insecure-concurrency,omitempty"`
+	ReceiveWindow            uint64            `proxy:"receive-window,omitempty"`
+	QUICSessionReceiveWindow uint64            `proxy:"quic-session-receive-window,omitempty"`
 	ExtraHeaders          map[string]string `proxy:"extra-headers,omitempty"`
 	Certificate           []string          `proxy:"certificate,omitempty"`
 	CertificatePath       string            `proxy:"certificate-path,omitempty"`

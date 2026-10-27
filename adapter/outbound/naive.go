@@ -40,14 +40,21 @@ type NaiveOption struct {
 	SkipCertVerify bool   `proxy:"skip-cert-verify,omitempty"`
 
 	// QUIC transport (NaïveProxy over QUIC, anti-QoS on UDP-throttled lines).
-	// Requires cronet's built-in UDP support; incompatible with
-	// insecure-concurrency > 1 (cronet rejects that combination).
+	// QUIC + insecure-concurrency > 1 is supported since cronet-go's multi-engine
+	// refactor (one engine per concurrent connection).
 	QUIC                  bool              `proxy:"quic,omitempty"`
 	QUICCongestionControl string            `proxy:"quic-congestion-control,omitempty"` // bbr / bbr2 / cubic / reno
 	InsecureConcurrency   int               `proxy:"insecure-concurrency,omitempty"`
-	ExtraHeaders          map[string]string `proxy:"extra-headers,omitempty"`
-	Certificate           []string          `proxy:"certificate,omitempty"`      // PEM lines: trusted root for the naive server
-	CertificatePath       string            `proxy:"certificate-path,omitempty"` // file containing the trusted root PEM
+	// Flow-control window tuning in bytes; 0 = cronet defaults.
+	// With quic enabled: receive-window is the initial QUIC stream receive
+	// window (default 6 MiB) and quic-session-receive-window the initial QUIC
+	// session receive window (default 15 MiB). Without quic: receive-window is
+	// the HTTP/2 session receive window (default 128 MiB, stream window = half).
+	ReceiveWindow            uint64            `proxy:"receive-window,omitempty"`
+	QUICSessionReceiveWindow uint64            `proxy:"quic-session-receive-window,omitempty"`
+	ExtraHeaders             map[string]string `proxy:"extra-headers,omitempty"`
+	Certificate              []string          `proxy:"certificate,omitempty"`      // PEM lines: trusted root for the naive server
+	CertificatePath          string            `proxy:"certificate-path,omitempty"` // file containing the trusted root PEM
 }
 
 // cronetDialer adapts mihomo's C.Dialer to sing's N.Dialer interface
@@ -94,9 +101,6 @@ type Naive struct {
 }
 
 func NewNaive(option NaiveOption) (*Naive, error) {
-	if option.QUIC && option.InsecureConcurrency > 1 {
-		return nil, fmt.Errorf("naive %s: insecure-concurrency is not supported with quic", option.Name)
-	}
 	quicCC, err := parseQuicCongestionControl(option.QUICCongestionControl)
 	if err != nil {
 		return nil, fmt.Errorf("naive %s: %w", option.Name, err)
@@ -142,6 +146,8 @@ func NewNaive(option NaiveOption) (*Naive, error) {
 	}
 
 	client, err := cronet.NewNaiveClient(cronet.NaiveClientOptions{
+		Context: context.Background(),
+		Logger:  cronetLogger{},
 		ServerAddress: serverAddr,
 		ServerName:    serverName,
 		Username:      option.UserName,
@@ -150,12 +156,14 @@ func NewNaive(option NaiveOption) (*Naive, error) {
 		// cronet runs its own in-process DNS server to resolve the Naive server
 		// name; this field is REQUIRED (NewNaiveClient errors out otherwise).
 		// Answer through mihomo's resolver so hosts/fake-ip/DNS config apply.
-		DNSResolver:             naiveDNSResolver,
-		InsecureConcurrency:     option.InsecureConcurrency,
-		ExtraHeaders:            option.ExtraHeaders,
-		TrustedRootCertificates: trustedRootCertificates,
-		QUIC:                    option.QUIC,
-		QUICCongestionControl:   quicCC,
+		DNSResolver:              naiveDNSResolver,
+		InsecureConcurrency:      option.InsecureConcurrency,
+		ReceiveWindow:            option.ReceiveWindow,
+		QUICSessionReceiveWindow: option.QUICSessionReceiveWindow,
+		ExtraHeaders:             option.ExtraHeaders,
+		TrustedRootCertificates:  trustedRootCertificates,
+		QUIC:                     option.QUIC,
+		QUICCongestionControl:    quicCC,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create naive client: %w", err)
@@ -171,16 +179,40 @@ func NewNaive(option NaiveOption) (*Naive, error) {
 		client: client,
 	}
 
-	log.Infoln("[Naive] %s: cronet ready for %s", option.Name, addr)
+	log.Infoln("[Naive] %s: cronet ready for %s (engine %s)", option.Name, addr, client.Engine().Version())
 	return n, nil
 }
 
+// cronetLogger adapts mihomo's package-level log functions to sing's
+// logger.ContextLogger so cronet's internal logs (socket pair failures,
+// relaying trace, etc.) surface in mihomo's log instead of being dropped.
+type cronetLogger struct{}
+
+func (cronetLogger) Trace(args ...any)                       {}
+func (cronetLogger) Debug(args ...any)                       { log.Debugln(joinLogArgs(args)) }
+func (cronetLogger) Info(args ...any)                        { log.Infoln(joinLogArgs(args)) }
+func (cronetLogger) Warn(args ...any)                        { log.Warnln(joinLogArgs(args)) }
+func (cronetLogger) Error(args ...any)                       { log.Errorln(joinLogArgs(args)) }
+func (cronetLogger) Fatal(args ...any)                       { log.Fatalln(joinLogArgs(args)) }
+func (cronetLogger) Panic(args ...any)                       { log.Fatalln(joinLogArgs(args)) }
+func (cronetLogger) TraceContext(_ context.Context, v ...any) {}
+func (cronetLogger) DebugContext(_ context.Context, v ...any) { log.Debugln(joinLogArgs(v)) }
+func (cronetLogger) InfoContext(_ context.Context, v ...any)  { log.Infoln(joinLogArgs(v)) }
+func (cronetLogger) WarnContext(_ context.Context, v ...any)  { log.Warnln(joinLogArgs(v)) }
+func (cronetLogger) ErrorContext(_ context.Context, v ...any) { log.Errorln(joinLogArgs(v)) }
+func (cronetLogger) FatalContext(_ context.Context, v ...any) { log.Fatalln(joinLogArgs(v)) }
+func (cronetLogger) PanicContext(_ context.Context, v ...any) { log.Fatalln(joinLogArgs(v)) }
+
+func joinLogArgs(v []any) string { return strings.TrimSuffix(fmt.Sprint(v...), "\n") }
+
 // DialContext creates a NaïveProxy CONNECT tunnel to the target via cronet's
 // Chromium network stack. The underlying transport to the Naive server uses
-// mihomo's dialer chain.
+// mihomo's dialer chain. DialEarly is the upstream-standard entry point: it
+// lets cronet start the CONNECT request immediately instead of waiting for
+// the first payload write.
 func (n *Naive) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
 	targetAddr := M.ParseSocksaddr(metadata.RemoteAddress())
-	conn, err := n.client.DialContext(ctx, "tcp", targetAddr)
+	conn, err := n.client.DialEarly(ctx, targetAddr)
 	if err != nil {
 		return nil, fmt.Errorf("naive dial: %w", err)
 	}
