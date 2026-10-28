@@ -137,7 +137,7 @@ type SmartPLD struct {
 	sampleRate     float64
 	pldCollect     bool
 	preferASN      bool
-	hostFailLimit  int
+	hostFailLimit  atomic.Int32
 	tolerance      uint16
 
 	// PLD runtime state
@@ -207,7 +207,7 @@ func NewSmartPLD(option GroupCommonOption, smartOption SmartPLDOption, emptyFall
 		lastSwitchAt:    make(map[string]time.Time),
 	}
 
-	s.hostFailLimit = s.maxFailedTimes
+	s.hostFailLimit.Store(int32(s.maxFailedTimes))
 
 	if smartOption.SampleRate > 0 && smartOption.SampleRate <= 1 {
 		s.sampleRate = smartOption.SampleRate
@@ -917,7 +917,7 @@ func (s *SmartPLD) failureCooldownSec() int64 {
 
 func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, names []string, weights []float64, all []C.Proxy, minCount int, isUDP bool, largeMode bool) []C.Proxy {
 	blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName)
-	wtFailNodes, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, s.hostFailLimit, metadata.SmartTarget)
+	wtFailNodes, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, int(s.hostFailLimit.Load()), metadata.SmartTarget)
 
 	var proxyByName map[string]C.Proxy
 	if len(names) > 0 {
@@ -1142,6 +1142,9 @@ func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, na
 	if len(selected) == 0 {
 		fallbackAll := defaultSort(all)
 		for _, p := range fallbackAll {
+			if isUDP && !p.SupportUDP() {
+				continue // a TCP-only node cannot serve a UDP request at all
+			}
 			if p.AliveForTestUrl(s.testUrl) {
 				selected = append(selected, p)
 			}
@@ -1152,6 +1155,9 @@ func (s *SmartPLD) filterProxies(metadata *C.Metadata, wildcardTarget string, na
 
 		if len(selected) == 0 {
 			for _, p := range fallbackAll {
+				if isUDP && !p.SupportUDP() {
+					continue
+				}
 				selected = append(selected, p)
 				if len(selected) >= minCount {
 					break
@@ -1174,6 +1180,12 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 	if target == "" {
 		target = wildcardTarget
 	}
+
+	// Channel decision up front: the prefetch filter, unwrap renewal and the
+	// supplement path all judge nodes by the channel this request hits, so
+	// compute it once here instead of inside computePLDWeights.
+	features := lightgbm.BuildRequestFeatures(metadata, s.Name(), time.Now())
+	largeMode := smart.PreferLargeFlowChannel(features.DomainTrafficLevel, features.TrafficClass)
 
 	if s.selected != "" {
 		for _, p := range proxies {
@@ -1209,7 +1221,7 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 						s.Name(), target, name)
 					continue
 				}
-				if rew, _, cnt := rec.ChannelStats(false); cnt >= 2 && rew < 0 {
+				if rew, _, cnt := rec.ChannelStats(largeMode); cnt >= 2 && rew < 0 {
 					log.Debugln("[PLD] Group: [%s] Target: [%s] prefetch filtered [%s] soft-failed (reward=%.3f)",
 						s.Name(), target, name, rew)
 					continue
@@ -1243,7 +1255,7 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 	// selectProxies 的实时 D-UCB 排名可能不一致，用它换人会让 primary 与
 	// PLD 决策脱节；primary 的变更只由 失败信号（冷却/block 排除）或
 	// selectProxies 的滞回切换（领先 ≥switch-margin）驱动。
-	refreshUnwrapCache := func(isUDP bool) {
+	refreshUnwrapCache := func(isUDP bool, largeMode bool) {
 		old, _ := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
 		if len(old) == 0 {
 			return
@@ -1279,7 +1291,7 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		// every request, wasting a round-trip and causing brief stalls.
 		if s.usePLD {
 			if rec := s.getPLDRecord(target, old[0]); rec.SoftFailed() {
-				rew, _, _ := rec.ChannelStats(false)
+				rew, _, _ := rec.ChannelStats(largeMode)
 				s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
 				log.Debugln("[PLD] Group: [%s] Target: [%s] unwrap refresh deleted soft-failed primary [%s] (reward=%.3f)",
 					s.Name(), target, old[0], rew)
@@ -1296,7 +1308,7 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		// 检查匹配缓存
 		if proxiesName, expired := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget); len(proxiesName) > 0 {
 			if expired {
-				go refreshUnwrapCache(isUDP)
+				go refreshUnwrapCache(isUDP, largeMode)
 			}
 			return proxiesName, nil, true
 		}
@@ -1335,8 +1347,8 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 			if rec.InFailureCooldown(time.Now().Unix()) {
 				continue
 			}
-			if rec.SoftFailed() {
-				continue // soft-fail: historically negative on this target
+			if rew, _, cnt := rec.ChannelStats(largeMode); cnt >= 2 && rew < 0 {
+				continue // soft-fail: historically negative on this channel
 			}
 			resultNames = append(resultNames, name)
 			supplemented++
@@ -1364,9 +1376,8 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 	// unwrap-cache hits. The cache only saves the bbolt ranking lookup;
 	// PLD's in-memory scoring is cheap and its detailed P/F decision trail
 	// should be visible in the dashboard logs for every selection.
-	largeMode := false
 	if s.usePLD && len(resultNames) > 0 {
-		resultNames, resultWeights, largeMode = s.computePLDWeights(metadata, resultNames, proxies)
+		resultNames, resultWeights = s.computePLDWeights(metadata, resultNames, proxies, features, largeMode)
 	}
 
 	// 滞回切换：PLD 重排后的新首位只有满足下列任一条件才允许替换当前
@@ -1435,17 +1446,12 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 // computePLDWeights computes the D-UCB final weight for each candidate node and
 // re-ranks names/weights by it. It needs the request features (metadata) and the
 // per-node EWMA reward / sample count from the stats store.
-func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxies []C.Proxy) ([]string, []float64, bool) {
+func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxies []C.Proxy, features lightgbm.RequestFeatures, largeMode bool) ([]string, []float64) {
 	if len(names) == 0 {
-		return names, nil, false
+		return names, nil
 	}
 
-	features := lightgbm.BuildRequestFeatures(metadata, s.Name(), time.Now())
 	target := metadata.SmartTarget
-	// 双通道决策：按本次请求的流量类型选通道。大流量档（视频/下载）用吞吐
-	// 通道（RewardLarge + 吞吐档案），网页/交互用延迟通道（Reward），
-	// 独立 EWMA 互不污染 —— 刷网页再多也不会稀释"谁下载快"。
-	largeMode := smart.PreferLargeFlowChannel(features.DomainTrafficLevel, features.TrafficClass)
 
 	type scoreEntry struct {
 		name     string
@@ -1581,7 +1587,7 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 		outNames[i] = e.name
 		outWeights[i] = e.w
 	}
-	return outNames, outWeights, largeMode
+	return outNames, outWeights
 }
 
 func (s *SmartPLD) InitSmart() {
@@ -1614,6 +1620,7 @@ func (s *SmartPLD) InitSmart() {
 	s.startTimedTask(5*time.Minute, recoveryCheckInterval, "Group nodes recovery check", s.checkBlockedNodes, false)
 	s.startTimedTask(15*time.Minute, hostStatusCheckInterval, "Group host status check", s.checkHostStatus, false)
 	s.startTimedTask(1*time.Minute, prefetchInterval, "Group maxFailedTimes refresh", s.applyMaxFailedTimes, false)
+	s.startTimedTask(30*time.Minute, 30*time.Minute, "PLD state eviction", s.evictStalePLDState, false)
 	s.startTimedTask(10*time.Minute, cleanupInterval, "Group old records clean up", func() {
 		s.store.CleanupOldRecords(s.Name(), s.configName)
 	}, false)
@@ -1873,7 +1880,7 @@ func (s *SmartPLD) cleanupOrphanedNodeCache() {
 			log.Debugln("[PLD] Cleaning up cache data for non-existent node [%s]", node)
 		}
 
-		err := s.store.RemoveNodesData(s.Name(), s.configName, s.hostFailLimit, orphanedNodes)
+		err := s.store.RemoveNodesData(s.Name(), s.configName, int(s.hostFailLimit.Load()), orphanedNodes)
 		if err != nil {
 			log.Warnln("[PLD] Failed to clean up non-existent node caches: %v", err)
 		}
@@ -2584,7 +2591,7 @@ func (s *SmartPLD) checkNodeQuality(
 		return oldWeight, false, false, 0
 	}
 
-	_, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, s.hostFailLimit)
+	_, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, int(s.hostFailLimit.Load()))
 	wtLastCheck, wtLastFailure := s.store.GetHostTiming(s.Name(), s.configName, wildcardTarget)
 
 	if wtBlocked {
@@ -2641,11 +2648,11 @@ func (s *SmartPLD) markNodeFailure(metadata *C.Metadata, proxyName string, isDeg
 	wildcardTarget := metadata.WildcardTarget
 	target := metadata.SmartTarget
 
-	failedBlock := s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, metadata, proxyName, s.maxFailedTimes, s.hostFailLimit, isDegraded, checked, blockCode, 0)
+	failedBlock := s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, metadata, proxyName, s.maxFailedTimes, int(s.hostFailLimit.Load()), isDegraded, checked, blockCode, 0)
 
 	if isDegraded || failedBlock {
 		if target != "" && target != wildcardTarget {
-			s.store.UpdateHostStatus(s.Name(), s.configName, target, metadata, proxyName, s.maxFailedTimes, s.hostFailLimit, isDegraded, checked, blockCode, 0)
+			s.store.UpdateHostStatus(s.Name(), s.configName, target, metadata, proxyName, s.maxFailedTimes, int(s.hostFailLimit.Load()), isDegraded, checked, blockCode, 0)
 		}
 	}
 
@@ -2688,7 +2695,7 @@ func (s *SmartPLD) checkHostStatus() {
 		proxyMap[p.Name()] = p
 	}
 
-	toCheck, err := s.store.CheckHostStatus(s.Name(), s.configName, s.hostFailLimit)
+	toCheck, err := s.store.CheckHostStatus(s.Name(), s.configName, int(s.hostFailLimit.Load()))
 	if err != nil {
 		return
 	}
@@ -2701,7 +2708,7 @@ func (s *SmartPLD) checkHostStatus() {
 			}
 			status, okRes, err := s.StatusTest(p, host)
 			if err == nil && okRes {
-				s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, &C.Metadata{Host: host}, nodeName, s.maxFailedTimes, s.hostFailLimit, false, true, 0, 0)
+				s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, &C.Metadata{Host: host}, nodeName, s.maxFailedTimes, int(s.hostFailLimit.Load()), false, true, 0, 0)
 				log.Debugln("[PLD] Recover Group: [%s] - Node: [%s] for Host: [%s] with HTTP Status: [%d]", s.Name(), nodeName, host, status)
 			} else if err == nil {
 				log.Debugln("[PLD] Recover Group: [%s] - Node: [%s] for Host: [%s] still abnormal with HTTP Status: [%d]", s.Name(), nodeName, host, status)
@@ -2740,13 +2747,37 @@ func (s *SmartPLD) getPriorityFactor(proxyName string) float64 {
 	return factor
 }
 
+// evictStalePLDState drops in-memory PLD records whose last update is older
+// than 30 days (they no longer reflect usable reward state) and switch-map
+// entries older than 24 hours. Persisted bbolt records are cleaned with the
+// same age cutoff so the pld: namespace does not grow without bound.
+func (s *SmartPLD) evictStalePLDState() {
+	cutoff := time.Now().AddDate(0, 0, -30).Unix()
+	switchCutoff := time.Now().Add(-24 * time.Hour)
+
+	s.pldRecordMu.Lock()
+	for key, rec := range s.pldRecordCache {
+		if rec.LastUpdated < cutoff {
+			delete(s.pldRecordCache, key)
+		}
+	}
+	for t, at := range s.lastSwitchAt {
+		if at.Before(switchCutoff) {
+			delete(s.lastSwitchAt, t)
+		}
+	}
+	s.pldRecordMu.Unlock()
+
+	s.store.EvictOldPLDRecords(cutoff)
+}
+
 func (s *SmartPLD) applyMaxFailedTimes() {
 	if proxyCount := len(s.GetProxies(true)); proxyCount > 0 {
 		hostFailLimit := proxyCount / 3
 		if hostFailLimit < 2 {
 			hostFailLimit = 2
 		}
-		s.hostFailLimit = hostFailLimit
+		s.hostFailLimit.Store(int32(hostFailLimit))
 	}
 }
 

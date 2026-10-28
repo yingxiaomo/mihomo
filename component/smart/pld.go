@@ -447,10 +447,19 @@ func SampleWeightFromMB(downloadMB float64) float64 {
 const PLDKeyPrefix = "pld:"
 
 // FormatPLDKey builds the storage key for a (group, config, target, node) PLD
-// reward record.
+// reward record. Parts are colon-escaped: bare IPv6 targets or node names that
+// contain colons would otherwise make the key layout ambiguous (two different
+// (target, node) pairs could produce the same key and share one record).
 func FormatPLDKey(config, group, target, node string) string {
-	return PLDKeyPrefix + config + ":" + group + ":" + target + ":" + node
+	return PLDKeyPrefix + escapeKeyPart(config) + ":" + escapeKeyPart(group) + ":" + escapeKeyPart(target) + ":" + escapeKeyPart(node)
 }
+
+func escapeKeyPart(s string) string {
+	// % first so the : escape sequence is unambiguous on the way back
+	s = strings.ReplaceAll(s, "%", "%25")
+	return strings.ReplaceAll(s, ":", "%3A")
+}
+
 
 // PLDKeyState pairs one persisted PLDRecord with its storage-key parts for the
 // /smart/pld debug endpoint: the record is what selection reads, the parts
@@ -482,5 +491,9 @@ func ParsePLDKey(key string) (config, group, target, node string, ok bool) {
 	if len(parts) != 4 || parts[0] == "" || parts[1] == "" || parts[2] == "" || parts[3] == "" {
 		return "", "", "", "", false
 	}
-	return parts[0], parts[1], parts[2], parts[3], true
+	unescape := func(s string) string {
+		s = strings.ReplaceAll(s, "%3A", ":")
+		return strings.ReplaceAll(s, "%25", "%")
+	}
+	return unescape(parts[0]), unescape(parts[1]), unescape(parts[2]), unescape(parts[3]), true
 }

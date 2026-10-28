@@ -320,7 +320,7 @@ func (s *Store) FlushByLevel(level string, config string, group string) error {
 
 	switch level {
 	case "all":
-		s.DBBatchDeletePrefix([]string{"smart"}, false)
+		s.DBBatchDeletePrefix([]string{"smart", PLDKeyPrefix}, false)
 	case "config":
 		s.DBBatchDeletePrefix([]string{
 			FormatDBKey(KeyTypeStats, config),
@@ -328,6 +328,7 @@ func (s *Store) FlushByLevel(level string, config string, group string) error {
 			FormatDBKey(KeyTypeRanking, config),
 			FormatDBKey(KeyTypePrefetch, config),
 			FormatDBKey(KeyTypeHostFailures, config),
+			PLDKeyPrefix + escapeKeyPart(config) + ":",
 		}, false)
 	case "group":
 		s.DBBatchDeletePrefix([]string{
@@ -806,6 +807,27 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 	}
 
 	return result, nil
+}
+
+// EvictOldPLDRecords deletes persisted pld: records whose LastUpdated is
+// older than the cutoff (unix seconds). The records are self-rebuilding
+// reward state; dropping stale ones keeps the namespace bounded.
+func (s *Store) EvictOldPLDRecords(cutoff int64) {
+	items, err := s.DBViewPrefixScan(PLDKeyPrefix, -1, false)
+	if err != nil {
+		return
+	}
+	for key, data := range items {
+		var probe struct {
+			LastUpdated int64 `json:"last_updated,omitempty"`
+		}
+		if json.Unmarshal(data, &probe) != nil || probe.LastUpdated == 0 {
+			continue
+		}
+		if probe.LastUpdated < cutoff {
+			s.DBBatchDeletePrefix([]string{key}, true)
+		}
+	}
 }
 
 func (s *Store) DBViewGetItem(key string) ([]byte, error) {
