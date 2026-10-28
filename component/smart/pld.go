@@ -5,8 +5,10 @@
 package smart
 
 import (
+	"encoding/json"
 	"math"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -248,6 +250,12 @@ func FinalWeight(prior, rewardEMA float64, nNode, nTotal int64, alpha0, k, c flo
 // Failures are applied to BOTH channels: a node that cannot reach the target
 // must not be selected under either flow priority.
 type PLDRecord struct {
+	// mu guards every field below: the record is shared between the selection
+	// hot path (readers), quality-gate timers and the per-connection close
+	// callback (writers) — all run on different goroutines. Unexported, so it
+	// is invisible to json.Marshal and bbolt persistence.
+	mu sync.Mutex
+
 	Reward      float64 `json:"reward,omitempty"`
 	RewardVar   float64 `json:"reward_var,omitempty"`
 	SampleCount int64   `json:"sample_count,omitempty"`
@@ -285,6 +293,14 @@ const FailureCooldownDefaultSec = 60
 // it decides how long FailureUntil (persisted) keeps the node unselectable for
 // this target; pass 0 to leave the record without a cool-off window (disabled).
 func (r *PLDRecord) FillFailure(cooldownSec int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.fillFailureLocked(cooldownSec)
+}
+
+// fillFailureLocked is the unlocked body of FillFailure — callers must hold
+// r.mu (sync.Mutex is not reentrant: UpdateWithMetrics already holds it).
+func (r *PLDRecord) fillFailureLocked(cooldownSec int64) {
 	rew := -2.0
 	newR, newVar, newCnt := UpdateRewardEMA(r.Reward, r.RewardVar, r.SampleCount, rew)
 	r.Reward, r.RewardVar, r.SampleCount = newR, newVar, newCnt
@@ -302,7 +318,18 @@ func (r *PLDRecord) FillFailure(cooldownSec int64) {
 // at FillFailure time from the group's failure-cooldown-sec config (0 disables
 // the window entirely), so only the persisted timestamp is checked here.
 func (r *PLDRecord) InFailureCooldown(now int64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.FailureUntil > 0 && now < r.FailureUntil
+}
+
+// SoftFailed reports the latency-channel soft-fail state (>=2 samples with a
+// negative EMA reward). Callers that judge by the request's channel should
+// use ChannelStats instead.
+func (r *PLDRecord) SoftFailed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.SampleCount >= 2 && r.Reward < 0
 }
 
 // UpdateWithMetrics folds one completed connection into the channel-appropriate
@@ -317,12 +344,14 @@ func (r *PLDRecord) InFailureCooldown(now int64) bool {
 //
 // It returns the scalar reward and its physical breakdown for logging/training.
 func (r *PLDRecord) UpdateWithMetrics(m RewardedMetrics, cooldownSec int64) (float64, RewardParts) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	scalar, parts := ComputeRewardDetail(m)
 	if m.Failed && parts.Failure {
 		// True failure (no meaningful download): punish BOTH channels so the
 		// node drops out of ranking for latency- and throughput-sensitive
 		// requests alike.
-		r.FillFailure(cooldownSec)
+		r.fillFailureLocked(cooldownSec)
 		return scalar, parts
 	}
 	if !m.SmallFlow() {
@@ -357,6 +386,8 @@ func (m RewardedMetrics) SmallFlow() bool {
 // selected flow channel: large==true picks the throughput channel, otherwise
 // the latency channel.
 func (r *PLDRecord) ChannelStats(large bool) (float64, float64, int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if large {
 		return r.RewardLarge, r.RewardLargeVar, r.SampleCountLarge
 	}
@@ -367,6 +398,8 @@ func (r *PLDRecord) ChannelStats(large bool) (float64, float64, int64) {
 // falling back to the packet-pair 64KiB ceiling when no large-flow samples
 // exist yet (cold throughput channel).
 func (r *PLDRecord) ThrKBps() float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.ThrCount > 0 {
 		return r.ThrKBpsEMA
 	}
@@ -428,6 +461,15 @@ type PLDKeyState struct {
 	Target string     `json:"target"`
 	Node   string     `json:"node"`
 	Record *PLDRecord `json:"record"`
+}
+
+// MarshalJSON snapshots the record under its lock so a concurrent mutation
+// cannot tear the persisted state.
+func (r *PLDRecord) MarshalJSON() ([]byte, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	type plain PLDRecord
+	return json.Marshal((*plain)(r))
 }
 
 // ParsePLDKey splits a PLD storage key back into its parts; ok is false for

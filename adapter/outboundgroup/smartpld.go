@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"sync"
 	"time"
 
@@ -345,7 +346,7 @@ func (s *SmartPLD) singleDialContext(ctx context.Context, proxy C.Proxy, metadat
 			return nil, connectTime, err
 		}
 		if !errors.Is(err, context.Canceled) {
-			go s.recordConnectionStats(metadata, proxy, connectTime, 0, 0, 0, 0, 0, 0, nil, 0, err)
+			go s.recordConnectionStats(metadata, proxy, connectTime, 0, 0, 0, 0, 0, 0, nil, 0, err, nil)
 		}
 		return nil, connectTime, err
 	}
@@ -522,7 +523,7 @@ func (s *SmartPLD) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 						return nil, err
 					}
 					finalErr = err
-					go s.recordConnectionStats(metadata, proxy, connectTime, 0, 0, 0, 0, 0, 0, nil, 0, err)
+					go s.recordConnectionStats(metadata, proxy, connectTime, 0, 0, 0, 0, 0, 0, nil, 0, err, nil)
 					continue
 				}
 
@@ -619,6 +620,14 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 	var firstWriteErr atomic.TypedValue[error]
 	var firstReadErr atomic.TypedValue[error]
 	var firstReadLatency atomic.Int64
+	// full-lifecycle error observers: catch mid-transfer failures the one-shot
+	// first-read/write callbacks miss (connection reset after the first byte,
+	// write errors halfway through, all UDP I/O errors)
+	var observedReadErr atomic.TypedValue[error]
+	var observedWriteErr atomic.TypedValue[error]
+	// per-connection failure latch: exactly one hard-failure recording per
+	// connection, whoever fires first (quality gate or close callback)
+	pldFailureLatched := &atomic.Bool{}
 
 	if N.NeedHandshake(c) {
 		c = callback.NewFirstWriteCallBackConn(c, func(err error) {
@@ -634,6 +643,16 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 			firstReadErr.Store(err)
 		}
 	})
+
+	// mirror upstream smart: observe every read/write error for the whole
+	// connection lifetime. A raw relay must keep its splice fast path: the
+	// copy engine peels wrappers down to the socket, so skip those chains.
+	stop := N.UnwrapWriter(c)
+	if _, isRawRelay := stop.(syscall.Conn); !isRawRelay {
+		if u, ok := stop.(interface{ Upstream() any }); !ok || u.Upstream() != nil {
+			c = callback.NewErrorCallBackConn(c, &observedReadErr, &observedWriteErr)
+		}
+	}
 
 	// Passive Packet-Pair readout: stamp first-byte + 64KiB arrival on the real
 	// connection. Only installed under usepld; the tracker is read at close.
@@ -666,6 +685,9 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 			}
 			log.Debugln("[PLD] Group: [%s] Node: [%s] Target: [%s] no first byte within %d ms, official quality gate fired",
 				s.Name(), proxy.Name(), target, s.firstByteGateMs)
+			if !pldFailureLatched.CompareAndSwap(false, true) {
+				return // another failure path already recorded this connection
+			}
 			s.markNodeFailure(metadata, proxy.Name(), true, true, 3)
 			s.store.DeleteUnwrapResult(s.Name(), s.configName, target)
 
@@ -711,26 +733,46 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 				return // connection already gone — nothing to judge
 			}
 			upload1 := tracker.Info().UploadTotal.Load()
+			download1 := tracker.Info().DownloadTotal.Load()
 			time.AfterFunc(6*time.Second, func() {
 				t2 := statistic.DefaultManager.Get(metadata.UUID)
 				if t2 == nil {
 					return
 				}
 				info2 := t2.Info()
-				if !isZeroProgressConnection(upload1, info2.UploadTotal.Load(), info2.DownloadTotal.Load()) {
+				upload2 := info2.UploadTotal.Load()
+				download2 := info2.DownloadTotal.Load()
+				// black-hole detection compares DOWNLOAD PROGRESS between the
+				// two samples instead of the absolute total: a connection that
+				// delivered a response header (download1 > 0) and then stalled
+				// is caught too, not just the pure zero-download case.
+				if !isZeroProgressConnection(upload1, upload2, download1, download2) {
 					return
 				}
 				target := metadata.SmartTarget
 				if target == "" {
 					target = metadata.WildcardTarget
 				}
+				if download1 > 0 {
+					// header-then-stall: the node answered and then went quiet.
+					// Observation-only for now — byte counters cannot tell a
+					// genuinely stalled node from a legitimately idle upgraded
+					// stream, and a false positive would cool down healthy
+					// nodes on quiet targets.
+					log.Infoln("%s", fmt.Sprintf("[PLD] Group: [%s] Node: [%s] Target: [%s] header-then-stall suspected (%d bytes up, %d bytes down, no progress for %s)",
+						s.Name(), proxy.Name(), target, upload1, download1, time.Since(firstSample).Round(time.Second)))
+					return
+				}
 				log.Debugln("[PLD] Group: [%s] Node: [%s] Target: [%s] zero progress (%d bytes up, 0 down after %s), zero-progress gate fired",
 					s.Name(), proxy.Name(), target, upload1, time.Since(firstSample).Round(time.Second))
-			s.markNodeFailure(metadata, proxy.Name(), true, true, 7)
-			s.store.DeleteUnwrapResult(s.Name(), s.configName, target)
-			rec := s.getPLDRecord(target, proxy.Name())
-			rec.FillFailure(s.failureCooldownSec())
-			s.savePLDRecord(target, proxy.Name(), rec)
+				if !pldFailureLatched.CompareAndSwap(false, true) {
+					return // another failure path already recorded this connection
+				}
+				s.markNodeFailure(metadata, proxy.Name(), true, true, 7)
+				s.store.DeleteUnwrapResult(s.Name(), s.configName, target)
+				rec := s.getPLDRecord(target, proxy.Name())
+				rec.FillFailure(s.failureCooldownSec())
+				s.savePLDRecord(target, proxy.Name(), rec)
 				// NOTE: same as the first-byte gate — no force-closing of the
 				// node's same-target connections. The official smart group never
 				// closes established connections on a quality signal; force-closing
@@ -743,19 +785,24 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 
 	return s.registerClosureMetricsCallback(
 		c, proxy, metadata, connectTime,
-		&firstReadLatency, &firstReadErr, &firstWriteErr,
+		&firstReadLatency, &firstReadErr,
+		&observedReadErr, &observedWriteErr, pldFailureLatched,
 		pp,
 	)
 }
 
-// isZeroProgressConnection reports whether a connection is a black hole for
-// its target: the client sent request bytes (upload1 > 0) but within the
-// sampling window the server delivered zero download bytes while the client
-// also stopped sending (upload unchanged). Pure uploads keep growing and are
-// never flagged; idle keep-alive connections never sent anything (upload1==0)
-// and are never flagged either — both are legitimate long-lived patterns.
-func isZeroProgressConnection(upload1, upload2, download int64) bool {
-	return download <= 0 && upload1 > 0 && upload2 == upload1
+// isZeroProgressConnection reports whether a connection stalled for its
+// target between the two samples: the client sent request bytes (upload1 > 0)
+// but the server delivered ZERO download bytes across the whole window
+// (download1 == download2 == 0 — the pure black hole), or delivered some bytes
+// (a response header) that then stopped growing entirely (download1 ==
+// download2 > 0 — header-then-stall). Pure uploads keep growing and are never
+// flagged; idle keep-alive connections never sent anything (upload1==0) and
+// are never flagged either — both are legitimate long-lived patterns.
+// Header-then-stall overlaps with legitimately idle upgraded streams, so the
+// caller only logs that case instead of hard-failing the node.
+func isZeroProgressConnection(upload1, upload2, download1, download2 int64) bool {
+	return upload1 > 0 && upload2 == upload1 && download2 == download1
 }
 
 func (s *SmartPLD) WrapPacketConnWithMetric(pc C.PacketConn, proxy C.Proxy, metadata *C.Metadata, connectTime int64) C.PacketConn {
@@ -1162,9 +1209,9 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 						s.Name(), target, name)
 					continue
 				}
-				if rec.SampleCount >= 2 && rec.Reward < 0 {
+				if rew, _, cnt := rec.ChannelStats(false); cnt >= 2 && rew < 0 {
 					log.Debugln("[PLD] Group: [%s] Target: [%s] prefetch filtered [%s] soft-failed (reward=%.3f)",
-						s.Name(), target, name, rec.Reward)
+						s.Name(), target, name, rew)
 					continue
 				}
 				filteredN = append(filteredN, name)
@@ -1231,10 +1278,11 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		// unwrap stays pinned to a node that selectProxies will reject on
 		// every request, wasting a round-trip and causing brief stalls.
 		if s.usePLD {
-			if rec := s.getPLDRecord(target, old[0]); rec.SampleCount >= 2 && rec.Reward < 0 {
+			if rec := s.getPLDRecord(target, old[0]); rec.SoftFailed() {
+				rew, _, _ := rec.ChannelStats(false)
 				s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
 				log.Debugln("[PLD] Group: [%s] Target: [%s] unwrap refresh deleted soft-failed primary [%s] (reward=%.3f)",
-					s.Name(), target, old[0], rec.Reward)
+					s.Name(), target, old[0], rew)
 				return
 			}
 		}
@@ -1287,7 +1335,7 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 			if rec.InFailureCooldown(time.Now().Unix()) {
 				continue
 			}
-			if rec.SampleCount >= 2 && rec.Reward < 0 {
+			if rec.SoftFailed() {
 				continue // soft-fail: historically negative on this target
 			}
 			resultNames = append(resultNames, name)
@@ -2213,7 +2261,7 @@ func (s *SmartPLD) collectConnectionData(input *smart.ModelInput, metadata *C.Me
 
 func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate,
-	connectionDuration int64, tcpStats *tcpstats.Stats, bytesTo64KMs int64, err error) {
+	connectionDuration int64, tcpStats *tcpstats.Stats, bytesTo64KMs int64, err error, pldFailureLatched *atomic.Bool) {
 
 	if proxy.Type() == C.Compatible || proxy.Type() == C.Reject || proxy.Type() == C.Pass || proxy.Type() == C.RejectDrop {
 		return
@@ -2378,6 +2426,8 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		// to BOTH channels, small transfers update only the latency channel,
 		// large transfers only the throughput channel + throughput archive.
 		rec := s.getPLDRecord(target, proxyName)
+		var r float64
+		var parts smart.RewardParts
 		rm := smart.RewardedMetrics{
 			IsUDP:         isUDP,
 			ConnectTimeMs: connectTime,
@@ -2389,7 +2439,16 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 			LossRate:      lossRate,
 			Failed:        err != nil,
 		}
-		r, parts := rec.UpdateWithMetrics(rm, s.failureCooldownSec())
+		if pldFailureLatched != nil && pldFailureLatched.Load() {
+			// a quality gate already recorded this connection's hard failure in
+			// the PLD state (FillFailure). Keep the training sample and the
+			// scalar reward, but skip the second record mutation so one
+			// connection produces exactly one outcome in the online state.
+			rm.Failed = true
+			r, parts = smart.ComputeRewardDetail(rm)
+		} else {
+			r, parts = rec.UpdateWithMetrics(rm, s.failureCooldownSec())
+		}
 		s.savePLDRecord(target, proxyName, rec)
 		pldReward = r
 		pldParts = &parts
@@ -2428,7 +2487,7 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		pldReward, pldParts, pldEMA, pldVar, pldSamples, pldBWCeilKBps)
 }
 
-func (s *SmartPLD) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, firstReadLatency *atomic.Int64, firstReadErr *atomic.TypedValue[error], firstWriteErr *atomic.TypedValue[error], pp *callback.PacketPairCallBackConn) C.Conn {
+func (s *SmartPLD) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, firstReadLatency *atomic.Int64, firstReadErr *atomic.TypedValue[error], observedReadErr *atomic.TypedValue[error], observedWriteErr *atomic.TypedValue[error], pldFailureLatched *atomic.Bool, pp *callback.PacketPairCallBackConn) C.Conn {
 	return callback.NewCloseCallbackConn(c, func() {
 		tracker := statistic.DefaultManager.Get(metadata.UUID)
 		if tracker != nil {
@@ -2441,7 +2500,11 @@ func (s *SmartPLD) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metad
 
 			latency := firstReadLatency.Load()
 			readErr := firstReadErr.Load()
-			writeErr := firstWriteErr.Load()
+			// the observer covers mid-transfer errors the one-shot callbacks miss
+			if err := observedReadErr.Load(); err != nil {
+				readErr = err
+			}
+			writeErr := observedWriteErr.Load()
 
 			// Packet-Pair readout (passive). BytesTo64KMs drives the small-flow
 			// bandwidth-ceiling branch; 0 when the flow never crossed 64KiB.
@@ -2472,7 +2535,7 @@ func (s *SmartPLD) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metad
 				s.markNodeFailure(metadata, proxy.Name(), true, true, 3)
 			}
 
-			go s.recordConnectionStats(metadata, proxy, connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, tcpStats, bytesTo64KMs, closeErr)
+			go s.recordConnectionStats(metadata, proxy, connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, tcpStats, bytesTo64KMs, closeErr, pldFailureLatched)
 			return
 		}
 	})
@@ -2490,7 +2553,7 @@ func (s *SmartPLD) registerPacketClosureMetricsCallback(pc C.PacketConn, proxy C
 			maxDownloadRate := info.MaxDownloadRate.Load()
 
 			go s.recordConnectionStats(metadata, proxy, connectTime, udpLatency.Load(),
-				uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, nil, 0, nil)
+				uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, nil, 0, nil, nil)
 			return
 		}
 	})
@@ -2743,7 +2806,10 @@ func (s *SmartPLD) Close() error {
 		s.store.FlushQueue(true)
 	}
 
-	lightgbm.CloseAllPLDCollectors()
+	// NOTE: the PLD collector is a process-level singleton shared by every
+	// smart-pld group — it deliberately outlives individual group Close()
+	// calls (SQLite autocommits per insert; CSV flushes per write), so no
+	// data is lost by leaving it running across config reloads.
 
 	smartInitOnce = sync.Once{}
 

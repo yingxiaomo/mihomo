@@ -89,6 +89,19 @@ INSERT INTO samples (
 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
 func InitPLDCollector(collectSize float64) {
+	pldCollectMutex.Lock()
+	defer pldCollectMutex.Unlock()
+
+	// process-level singleton: every smart-pld group shares ONE collector.
+	// Re-creating on every group init (config reload, multi-group setups)
+	// orphaned the previous instance — its handle leaked while another group's
+	// Close call could shut the shared state down mid-collection. Reuse the
+	// running collector; SQLite autocommits per insert so nothing is lost by
+	// not re-opening.
+	if pldSmartCollector != nil {
+		return
+	}
+
 	var pldSmartCollectorSize int64
 	if collectSize > 0 {
 		pldSmartCollectorSize = int64(collectSize * 1024 * 1024)
@@ -297,6 +310,10 @@ func (c *PLDDataCollector) Close() error {
 	return nil
 }
 
+// CloseAllPLDCollectors shuts the shared process-level collector down.
+// SmartPLD groups must NOT call this from Close(): one group closing used to
+// shut the shared collector down mid-collection for every other group. It
+// only makes sense on explicit process shutdown paths.
 func CloseAllPLDCollectors() {
 	pldCollectMutex.Lock()
 	defer pldCollectMutex.Unlock()
