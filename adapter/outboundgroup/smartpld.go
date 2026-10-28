@@ -1420,6 +1420,14 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		}
 		if allowSwitch {
 			s.markPrimarySwitch(target)
+			// Persist the switch: drop the old primary's unwrap entry so the
+			// next request re-ranks the full pool and stores the new primary.
+			// Without this, StoreUnwrapResult in DialContext silently drops the
+			// new primary's write (first-writer-wins: the old entry is still
+			// unexpired), the async refresh re-stores the old primary, and the
+			// switch never actually takes effect — the margin-based switch was
+			// structurally unable to displace a healthy primary.
+			s.store.DeleteUnwrapResult(s.Name(), s.configName, target)
 		} else {
 			// 保持当前 primary：把 primary 移回首位（若它仍在候选里）
 			for i, n := range resultNames {
