@@ -189,19 +189,19 @@ func NewNaive(option NaiveOption) (*Naive, error) {
 type cronetLogger struct{}
 
 func (cronetLogger) Trace(args ...any)                       {}
-func (cronetLogger) Debug(args ...any)                       { log.Debugln(joinLogArgs(args)) }
-func (cronetLogger) Info(args ...any)                        { log.Infoln(joinLogArgs(args)) }
-func (cronetLogger) Warn(args ...any)                        { log.Warnln(joinLogArgs(args)) }
-func (cronetLogger) Error(args ...any)                       { log.Errorln(joinLogArgs(args)) }
-func (cronetLogger) Fatal(args ...any)                       { log.Fatalln(joinLogArgs(args)) }
-func (cronetLogger) Panic(args ...any)                       { log.Fatalln(joinLogArgs(args)) }
+func (cronetLogger) Debug(args ...any)                       { log.Debugln("%s", joinLogArgs(args)) }
+func (cronetLogger) Info(args ...any)                        { log.Infoln("%s", joinLogArgs(args)) }
+func (cronetLogger) Warn(args ...any)                        { log.Warnln("%s", joinLogArgs(args)) }
+func (cronetLogger) Error(args ...any)                       { log.Errorln("%s", joinLogArgs(args)) }
+func (cronetLogger) Fatal(args ...any)                       { log.Fatalln("%s", joinLogArgs(args)) }
+func (cronetLogger) Panic(args ...any)                       { log.Fatalln("%s", joinLogArgs(args)) }
 func (cronetLogger) TraceContext(_ context.Context, v ...any) {}
-func (cronetLogger) DebugContext(_ context.Context, v ...any) { log.Debugln(joinLogArgs(v)) }
-func (cronetLogger) InfoContext(_ context.Context, v ...any)  { log.Infoln(joinLogArgs(v)) }
-func (cronetLogger) WarnContext(_ context.Context, v ...any)  { log.Warnln(joinLogArgs(v)) }
-func (cronetLogger) ErrorContext(_ context.Context, v ...any) { log.Errorln(joinLogArgs(v)) }
-func (cronetLogger) FatalContext(_ context.Context, v ...any) { log.Fatalln(joinLogArgs(v)) }
-func (cronetLogger) PanicContext(_ context.Context, v ...any) { log.Fatalln(joinLogArgs(v)) }
+func (cronetLogger) DebugContext(_ context.Context, v ...any) { log.Debugln("%s", joinLogArgs(v)) }
+func (cronetLogger) InfoContext(_ context.Context, v ...any)  { log.Infoln("%s", joinLogArgs(v)) }
+func (cronetLogger) WarnContext(_ context.Context, v ...any)  { log.Warnln("%s", joinLogArgs(v)) }
+func (cronetLogger) ErrorContext(_ context.Context, v ...any) { log.Errorln("%s", joinLogArgs(v)) }
+func (cronetLogger) FatalContext(_ context.Context, v ...any) { log.Fatalln("%s", joinLogArgs(v)) }
+func (cronetLogger) PanicContext(_ context.Context, v ...any) { log.Fatalln("%s", joinLogArgs(v)) }
 
 func joinLogArgs(v []any) string { return strings.TrimSuffix(fmt.Sprint(v...), "\n") }
 
