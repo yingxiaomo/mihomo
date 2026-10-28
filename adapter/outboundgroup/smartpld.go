@@ -73,8 +73,13 @@ type SmartPLDOption struct {
 	// official system" quality gate: if the first response byte does not
 	// arrive within this many ms, the node is marked failed for the target
 	// (official verdict) and the unwrap primary is reset so the next attempt
-	// picks another candidate. 0 = off; default 5000.
-	FirstByteGateMs int `group:"first-byte-gate-ms,omitempty"`
+	// picks another candidate. Pointer semantics: nil = unset (default 5000),
+	// explicit 0 or negative = off, positive = configured value. The pointer
+	// is required because a plain int cannot distinguish "absent" from
+	// "explicit 0" — the two used to collapse onto the default, so a
+	// documented "0 = off" could never actually turn the gate off
+	// (fixed 2026-10-28, see a0e5761b for the original design intent).
+	FirstByteGateMs *int `group:"first-byte-gate-ms,omitempty"`
 	// SwitchMargin is the hysteresis gate for replacing the current unwrap
 	// primary: a challenger must outscore the current node by at least this
 	// factor before the primary switches (default 1.15 = 15% lead). Below the
@@ -94,16 +99,21 @@ type SmartPLDOption struct {
 	// samples the connection: if the client sent request bytes (upload>0),
 	// the server still delivered ZERO download bytes and the client stopped
 	// sending too, the node is treated as failed for this target (reset
-	// unwrap + hard-punish). 0 = off; default 10000.
-	ZeroProgressMs int `group:"zero-progress-ms,omitempty"`
+	// unwrap + hard-punish). Pointer semantics: nil = unset (default 10000),
+	// explicit 0/negative = off, positive = configured value (values below
+	// 5000 are still rejected by a sanity clamp — too tight to be useful).
+	// Pointer for the same absent-vs-zero reason as FirstByteGateMs.
+	ZeroProgressMs *int `group:"zero-progress-ms,omitempty"`
 	// FailureCooldownSec is how long a node is unselectable for one target
 	// after a hard failure (dial error, first-byte gate, zero-progress gate).
 	// This fast path exists because the -2 failure reward barely moves the
 	// EWMA of a high-sample node (alpha shrinks with SampleCount) and the
 	// failure-count block needs maxFailedTimes consecutive failures — both
 	// too slow to stop a just-died node being selected again on the next
-	// request. 0 = off; default 60.
-	FailureCooldownSec int `group:"failure-cooldown-sec,omitempty"`
+	// request. Pointer semantics: nil = unset (default 60), explicit 0 or
+	// negative = off, positive = configured seconds. Pointer for the same
+	// absent-vs-zero reason as FirstByteGateMs.
+	FailureCooldownSec *int `group:"failure-cooldown-sec,omitempty"`
 }
 
 type SmartPLD struct {
@@ -216,14 +226,8 @@ func NewSmartPLD(option GroupCommonOption, smartOption SmartPLDOption, emptyFall
 	}
 
 	// Post-connect first-byte quality gate: "select with PLD, verify with the
-	// official system". Default 5s; 0 disables.
-	s.firstByteGateMs = smartOption.FirstByteGateMs
-	if s.firstByteGateMs == 0 {
-		s.firstByteGateMs = 5000
-	}
-	if s.firstByteGateMs < 0 {
-		s.firstByteGateMs = 0
-	}
+	// official system". Default 5s; explicit 0/negative disables.
+	s.firstByteGateMs = resolveGateOption(smartOption.FirstByteGateMs, 5000)
 
 	// Switch hysteresis: a challenger must outscore the current primary by ≥
 	// switch-margin (default 15%), and primary switches are rate-limited per
@@ -246,25 +250,19 @@ func NewSmartPLD(option GroupCommonOption, smartOption SmartPLDOption, emptyFall
 
 	// Second-stage zero-progress gate. Default 10s (sampled at 10s and 16s);
 	// 0 disables. Must not fire before the first-byte gate (5s) does its job.
-	s.zeroProgressMs = smartOption.ZeroProgressMs
-	if s.zeroProgressMs == 0 {
-		s.zeroProgressMs = 10000
-	}
-	if s.zeroProgressMs < 5000 {
-		s.zeroProgressMs = 0 // sanity: too tight to be useful, disable
+	s.zeroProgressMs = resolveGateOption(smartOption.ZeroProgressMs, 10000)
+	if s.zeroProgressMs > 0 && s.zeroProgressMs < 5000 {
+		// sanity: a positive window this tight can never be useful; honor the
+		// explicit-off states but warn on silently-disabled tight values.
+		log.Warnln("[PLD] zero-progress-ms %d is below the 5000ms minimum, disabling the gate", s.zeroProgressMs)
+		s.zeroProgressMs = 0
 	}
 
 	// Post-failure cool-off: a hard failure makes the node unselectable for
 	// this target for failureCooldown (default 60s), regardless of its EWMA
 	// reward or unwrap-primary status. The configured value is baked into the
 	// persisted FailureUntil at FillFailure time; <=0 disables the window.
-	s.failureCooldown = time.Duration(smartOption.FailureCooldownSec) * time.Second
-	if s.failureCooldown == 0 {
-		s.failureCooldown = smart.FailureCooldownDefaultSec * time.Second
-	}
-	if s.failureCooldown < 0 {
-		s.failureCooldown = 0 // explicit off
-	}
+	s.failureCooldown = time.Duration(resolveGateOption(smartOption.FailureCooldownSec, smart.FailureCooldownDefaultSec)) * time.Second
 
 	if smartOption.PolicyPriority != "" {
 		applyPolicyPriorityPLD(s, smartOption.PolicyPriority)
@@ -846,6 +844,21 @@ func (s *SmartPLD) Providers() []provider.ProxyProvider {
 
 func (s *SmartPLD) Proxies() []C.Proxy {
 	return s.GetProxies(false)
+}
+
+// resolveGateOption maps an optional group config value onto the runtime
+// setting for the on/off-style knobs (first-byte gate, zero-progress gate,
+// failure cooldown): nil = unset -> default; explicit 0/negative = off (0);
+// positive = configured value. Pointer input is what preserves the
+// distinction between "absent" and "explicit 0".
+func resolveGateOption(v *int, def int) int {
+	if v == nil {
+		return def
+	}
+	if *v > 0 {
+		return *v
+	}
+	return 0
 }
 
 // failureCooldownSec returns the group's configured post-failure cool-off
