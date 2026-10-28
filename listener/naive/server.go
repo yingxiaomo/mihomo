@@ -2,6 +2,7 @@ package naive
 
 import (
 	"context"
+	"sync/atomic"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -32,7 +33,7 @@ import (
 )
 
 type Listener struct {
-	closed       bool
+	closed       atomic.Bool
 	addr         string
 	tcpListener  net.Listener
 	httpServer   *http.Server
@@ -53,8 +54,16 @@ func (l *Listener) Address() string {
 
 // Close implements C.Listener
 func (l *Listener) Close() error {
-	l.closed = true
+	l.closed.Store(true)
 	var errs []error
+	// Close the HTTP/2 server too: closing the TCP listener only stops new
+	// connections; without this, already-accepted HTTP/2 tunnels keep working
+	// after the listener is removed (config reload / delete).
+	if l.httpServer != nil {
+		if err := l.httpServer.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	// Close the UDP sockets before the HTTP/3 servers: the sockets were passed
 	// to http3.Server.Serve (so the server does not own them), and
 	// http3.Server.Close blocks until every active QUIC connection has ended —
@@ -177,7 +186,7 @@ func New(config LC.AuthServer, masquerade string, enableH3 bool, lc C.InboundLis
 	handler.localAddr = tcpListener.Addr()
 	sl.httpServer = &http.Server{Handler: handler}
 	go func() {
-		if err := sl.httpServer.Serve(tcpListener); err != nil && !sl.closed {
+		if err := sl.httpServer.Serve(tcpListener); err != nil && !sl.closed.Load() {
 			log.Warnln("[Naive] http server on %s exited: %v", config.Listen, err)
 		}
 	}()
@@ -205,7 +214,7 @@ func New(config LC.AuthServer, masquerade string, enableH3 bool, lc C.InboundLis
 			sl.udpListeners = append(sl.udpListeners, udpListener)
 			sl.h3Servers = append(sl.h3Servers, h3Server)
 			go func(server *http3.Server, conn net.PacketConn) {
-				if err := server.Serve(conn); err != nil && !sl.closed {
+				if err := server.Serve(conn); err != nil && !sl.closed.Load() {
 					log.Warnln("[Naive] h3 server on %s exited: %v", conn.LocalAddr(), err)
 				}
 			}(h3Server, udpListener)

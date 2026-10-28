@@ -127,6 +127,13 @@ func NewNaive(option NaiveOption) (*Naive, error) {
 		Prefer:       option.IPVersion,
 	})
 
+	if option.SkipCertVerify {
+		return nil, fmt.Errorf("naive %s: skip-cert-verify is not supported by the cronet backend (it always verifies certificates); use certificate/certificate-path to pin the server's root instead", option.Name)
+	}
+	if option.DialerProxy != "" {
+		return nil, fmt.Errorf("naive %s: dialer-proxy is not supported (the cronet engine dials the Naive server directly); remove it or use another outbound type", option.Name)
+	}
+
 	// Build a system dialer that respects mihomo's base options (interface,
 	// routing mark, TFO, IP version preference) but does NOT apply dialer-proxy
 	// — the cronet engine's transport must connect directly to the Naive server.

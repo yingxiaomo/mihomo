@@ -82,6 +82,12 @@ func (n *Naive) Listen(tunnel C.Tunnel) error {
 			n.Additions()...,
 		)
 		if err != nil {
+			// roll back the addresses that did bind: without this, the earlier
+			// listeners leak (no one owns them yet) and their ports stay busy
+			for _, prev := range n.l {
+				_ = prev.Close()
+			}
+			n.l = nil
 			return err
 		}
 		n.l = append(n.l, l)
