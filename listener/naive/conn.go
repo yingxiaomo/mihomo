@@ -1,6 +1,7 @@
 package naive
 
 import (
+	"sync"
 	"encoding/binary"
 	"io"
 	"math/rand"
@@ -144,6 +145,13 @@ type naiveH2Conn struct {
 	localAddr  net.Addr
 	remoteAddr net.Addr
 	paddingConn
+	// deadline support: a timer goroutine closes the reader when the
+	// deadline passes, causing the blocked Read to return an error. Without
+	// this, tunnel Peek(1) (which sets a read deadline then blocks) would
+	// hang forever on server-first protocols like SSH.
+	readTimer *time.Timer
+	closeRead chan struct{}
+	mu        sync.Mutex
 }
 
 func (c *naiveH2Conn) Read(b []byte) (int, error) {
@@ -168,10 +176,46 @@ func (c *naiveH2Conn) Close() error {
 func (c *naiveH2Conn) LocalAddr() net.Addr  { return c.localAddr }
 func (c *naiveH2Conn) RemoteAddr() net.Addr { return c.remoteAddr }
 
-// Deadlines are not supported over an HTTP/2 stream; report success without
-// enforcing them so mihomo's relay loop (which probes deadlines) keeps working.
-func (c *naiveH2Conn) SetDeadline(t time.Time) error      { return nil }
-func (c *naiveH2Conn) SetReadDeadline(t time.Time) error  { return nil }
+// SetReadDeadline implements a real deadline: a timer closes the underlying
+// reader when the deadline passes, causing the blocked Read to return
+// io.EOF. A zero time cancels the timer. This is required for tunnel
+// Peek(1), which sets a read deadline then blocks waiting for the banner —
+// server-first protocols (SSH, SMTP, FTP) hang forever without it.
+func (c *naiveH2Conn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.readTimer != nil {
+		c.readTimer.Stop()
+		c.readTimer = nil
+	}
+	if t.IsZero() {
+		return nil
+	}
+	d := time.Until(t)
+	if d <= 0 {
+		return nil // already passed — don't close, the caller will handle it
+	}
+	closer, canClose := c.reader.(io.Closer)
+	if !canClose {
+		return nil
+	}
+	c.closeRead = make(chan struct{})
+	ch := c.closeRead
+	c.readTimer = time.AfterFunc(d, func() {
+		select {
+		case <-ch:
+			return // deadline was cancelled
+		default:
+			closer.Close()
+		}
+	})
+	return nil
+}
+
 func (c *naiveH2Conn) SetWriteDeadline(t time.Time) error { return nil }
+
+func (c *naiveH2Conn) SetDeadline(t time.Time) error {
+	return c.SetReadDeadline(t)
+}
 
 var _ net.Conn = (*naiveH2Conn)(nil)

@@ -1,6 +1,8 @@
 package callback
 
 import (
+	"io"
+	"context"
 	"errors"
 	"net"
 	"os"
@@ -20,9 +22,14 @@ type errorCallBackConn struct {
 	writeErr *atomic.TypedValue[error]
 }
 
-// our own close and a transient deadline must not be charged to the node
+// our own close, a transient deadline, and locally-initiated cancels
+// (io.ErrClosedPipe from Hysteria2/QUIC session cancel) must not be charged
+// to the node
 func isConnectionLifecycle(err error) bool {
-	return errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded)
+	return errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, os.ErrDeadlineExceeded) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, context.Canceled)
 }
 
 func (c *errorCallBackConn) record(slot *atomic.TypedValue[error], err error) {

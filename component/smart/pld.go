@@ -323,6 +323,13 @@ func (r *PLDRecord) InFailureCooldown(now int64) bool {
 	return r.FailureUntil > 0 && now < r.FailureUntil
 }
 
+// GetLastUpdated returns the record's last update timestamp (locked).
+func (r *PLDRecord) GetLastUpdated() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.LastUpdated
+}
+
 // SoftFailed reports the latency-channel soft-fail state (>=2 samples with a
 // negative EMA reward). Callers that judge by the request's channel should
 // use ChannelStats instead.

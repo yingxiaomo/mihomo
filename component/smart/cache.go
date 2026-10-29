@@ -222,6 +222,20 @@ func (s *Store) GetUnwrapResult(group, config, target string) (proxies []string,
 	return nil, false
 }
 
+// ForceStoreUnwrapResult unconditionally stores the unwrap result, bypassing
+// the first-writer-wins guard. Used by the hysteresis switch path: the stale
+// entry must be replaced by the new primary, not silently dropped.
+func (s *Store) ForceStoreUnwrapResult(group, config string, target string, proxies []C.Proxy) {
+	if target == "" || len(proxies) == 0 {
+		return
+	}
+	names := make([]string, len(proxies))
+	for i, p := range proxies {
+		names[i] = p.Name()
+	}
+	unwrapCache.Set(FormatDBKey(config, group, target), UnwrapMap{Proxies: names})
+}
+
 func (s *Store) DeleteUnwrapResult(group, config string, target string) {
 	if target == "" {
 		return

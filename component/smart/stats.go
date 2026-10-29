@@ -1874,6 +1874,29 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 		s.DBBatchDeletePrefix(nodeStateKeys, true)
 	}
 
+	// Also remove pld: records for the removed nodes, so a node that
+	// re-joins with the same name does not inherit stale reward state
+	// (old failure cooldown, negative EMA) from its previous incarnation.
+	pldPrefix := PLDKeyPrefix + escapeKeyPart(config) + ":" + escapeKeyPart(group) + ":"
+	pldResults, err := s.DBViewPrefixScan(pldPrefix, -1, false)
+	if err == nil {
+		var pldToDelete []string
+		for path := range pldResults {
+			_, _, _, node, ok := ParsePLDKey(path)
+			if !ok {
+				continue
+			}
+			if _, orphaned := nodeSet[node]; orphaned {
+				pldToDelete = append(pldToDelete, path)
+			}
+		}
+		if len(pldToDelete) > 0 {
+			if delErr := s.DBBatchDeletePrefix(pldToDelete, true); delErr != nil && firstErr == nil {
+				firstErr = delErr
+			}
+		}
+	}
+
 	return firstErr
 }
 

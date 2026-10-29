@@ -1304,6 +1304,15 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		// Old primary still healthy for this target: renew the unwrap entry so
 		// the TTL does not expire again on the very next request (avoids a
 		// refresh goroutine storm when a target is constantly hit).
+		//
+		// Re-read the current unwrap entry before acting: between our initial
+		// read and now (all the health checks above take time), a hysteresis
+		// switch may have stored a different primary. Acting on stale data
+		// would overwrite the new primary with the old one.
+		current, _ := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
+		if len(current) == 0 || current[0] != old[0] {
+			return // primary changed while we were checking — don't overwrite
+		}
 		s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, []C.Proxy{proxy})
 	}
 
@@ -1423,15 +1432,13 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		}
 		if allowSwitch {
 			s.markPrimarySwitch(target)
-			// Persist the switch immediately: store the new primary in the
-			// unwrap cache so the next request's unwrap hit returns it.
-			// The previous approach (DeleteUnwrapResult only) left a window:
-			// the stale prefetch cache still had the old primary first, and
-			// the switch cooldown blocked re-switching, so the old primary
-			// was re-pinned on the very next request.
+			// Atomically replace the primary: StoreUnwrapResult has a
+			// first-writer-wins guard that silently drops writes when the
+			// old entry is unexpired — ForceStoreUnwrapResult bypasses that
+			// guard to guarantee the new primary is persisted.
 			for _, p := range proxies {
 				if p.Name() == resultNames[0] {
-					s.store.StoreUnwrapResult(s.Name(), s.configName, target, []C.Proxy{p})
+					s.store.ForceStoreUnwrapResult(s.Name(), s.configName, target, []C.Proxy{p})
 					break
 				}
 			}
@@ -2788,7 +2795,7 @@ func (s *SmartPLD) evictStalePLDState() {
 
 	s.pldRecordMu.Lock()
 	for key, rec := range s.pldRecordCache {
-		if rec.LastUpdated < cutoff {
+		if rec.GetLastUpdated() < cutoff {
 			delete(s.pldRecordCache, key)
 		}
 	}
