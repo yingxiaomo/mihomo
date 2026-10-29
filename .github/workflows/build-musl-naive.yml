@@ -42,7 +42,7 @@ jobs:
       # ISAs have no allTargets entry at all, so chromium cannot cross-compile
       # libcronet for those CPUs.
       matrix:
-        arch: [amd64, amd64-v2, amd64-v3, arm64, arm5, arm6, arm7, 386, mipsle, loong64, riscv64]
+        arch: [amd64, amd64-v2, amd64-v3, arm5, arm6, arm7, 386, mipsle, loong64, riscv64]  # arm64 excluded: cronet-go aarch64-musl toolchain passes -mno-thumb (ARM32-only clang flag)
     steps:
       - name: Checkout
         uses: actions/checkout@v6
