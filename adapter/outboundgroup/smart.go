@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+
 	"math"
 	"math/rand"
 	"net"
@@ -16,7 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -525,34 +524,37 @@ func (s *Smart) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metadata
 
 	var firstReadErr atomic.TypedValue[error]
 	var firstReadLatency atomic.Int64
+	var localReadClose atomic.Bool
 	var observedReadErr atomic.TypedValue[error]
 	var observedWriteErr atomic.TypedValue[error]
 
 	needHandshake := N.NeedHandshake(c)
-	// a raw relay must keep its splice fast path: the copy engine peels wrappers
-	// down to the socket, so the observer would disable it; skip those chains
-	stop := N.UnwrapWriter(c)
-	if _, isRawRelay := stop.(syscall.Conn); !isRawRelay {
-		if u, ok := stop.(interface{ Upstream() any }); !ok || u.Upstream() != nil {
-			c = callback.NewErrorCallBackConn(c, &observedReadErr, &observedWriteErr)
-		}
-	}
+	// Ordinary copies keep this observer; the production relay retains its
+	// error sinks while unwrapping raw sockets for accelerated copy.
+	c = callback.NewErrorCallBackConn(c, &observedReadErr, &observedWriteErr)
 
 	if needHandshake {
-		c = callback.NewFirstWriteCallBackConn(c, nil)
+		c = callback.NewFirstWriteCallBackConn(c, func(err error) {
+			if transferErr := callback.TransferError(err); transferErr != nil {
+				observedWriteErr.CompareAndSwap(nil, transferErr)
+			}
+		})
 	}
 
 	c = callback.NewFirstReadCallBackConn(c, func(err error) {
 		firstReadLatency.Store(time.Since(start).Milliseconds())
-		if err != nil {
-			firstReadErr.Store(err)
+		if callback.IsConnectionLifecycle(err) {
+			localReadClose.Store(true)
+		}
+		if transferErr := callback.TransferError(err); transferErr != nil {
+			firstReadErr.Store(transferErr)
 		}
 	})
 
 	return s.registerClosureMetricsCallback(
 		c, proxy, metadata, connectTime,
 		&firstReadLatency, &firstReadErr,
-		&observedReadErr, &observedWriteErr,
+		&observedReadErr, &observedWriteErr, &localReadClose,
 	)
 }
 
@@ -1248,12 +1250,13 @@ func (s *Smart) updateConnectionDuration(record *smart.AtomicStatsRecord, connec
 func (s *Smart) saveStatsRecord(target string, proxy C.Proxy, record *smart.StatsRecord) {
 	if data, err := json.Marshal(record); err == nil {
 		s.store.AppendToGlobalQueue(smart.StoreOperation{
-			Type:   smart.OpSaveStats,
-			Group:  s.Name(),
-			Config: s.configName,
-			Target: target,
-			Node:   proxy.Name(),
-			Data:   data,
+			Type:          smart.OpSaveStats,
+			Group:         s.Name(),
+			Config:        s.configName,
+			Target:        target,
+			Node:          proxy.Name(),
+			Data:          data,
+			StatsSnapshot: record,
 		})
 	}
 }
@@ -1559,8 +1562,10 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		connectTime, latency, uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, connectionDuration, ModelPredicted, lossRate, cumulLossRate)
 }
 
-func (s *Smart) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, firstReadLatency *atomic.Int64, firstReadErr *atomic.TypedValue[error], observedReadErr *atomic.TypedValue[error], observedWriteErr *atomic.TypedValue[error]) C.Conn {
+func (s *Smart) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, firstReadLatency *atomic.Int64, firstReadErr *atomic.TypedValue[error], observedReadErr *atomic.TypedValue[error], observedWriteErr *atomic.TypedValue[error], localReadClose *atomic.Bool) C.Conn {
 	return callback.NewCloseCallbackConn(c, func() {
+		// Explicit close needs no preceding Read error to be recognized as local.
+		localReadClose.Store(true)
 		tracker := statistic.DefaultManager.Get(metadata.UUID)
 		if tracker != nil {
 			info := tracker.Info()
@@ -1583,15 +1588,9 @@ func (s *Smart) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata
 				tcpStats = tcpstats.GetTCPStats(trackerConn)
 			}
 
-			var closeErr error
-			if readErr != nil {
-				if readErr == io.EOF {
-					if writeErr != nil && writeErr != io.EOF {
-						closeErr = writeErr
-					}
-				} else {
-					closeErr = readErr
-				}
+			closeErr := callback.TransferError(readErr, writeErr)
+			if localReadClose.Load() && closeErr == nil && downloadTotal == 0 {
+				return // locally canceled before any response: no quality penalty
 			}
 
 			// a connection the group closed on purpose is not a transfer failure

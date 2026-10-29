@@ -26,6 +26,16 @@ func (c *CachedConn) Read(b []byte) (n int, err error) {
 	return c.ExtendedConn.Read(b)
 }
 
+// ReadBuffer must consume the cache too: a non-replaceable outer first-read
+// callback can select extended I/O before Copy is allowed to call ReadCached.
+func (c *CachedConn) ReadBuffer(buffer *buf.Buffer) error {
+	if len(c.data) > 0 {
+		_, err := buffer.ReadOnceFrom(c)
+		return err
+	}
+	return c.ExtendedConn.ReadBuffer(buffer)
+}
+
 func (c *CachedConn) ReadCached() *buf.Buffer { // call in sing/common/bufio.Copy
 	if len(c.data) > 0 {
 		data := c.data

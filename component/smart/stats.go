@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	stdatomic "sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -52,6 +53,9 @@ type asnEvidenceEntry struct {
 }
 
 type StatsRecord struct {
+	// Runtime provenance is deliberately not part of the persisted JSON schema.
+	origin             *statsOrigin
+	source             *AtomicStatsRecord
 	Success            int64              `json:"success"`
 	Failure            int64              `json:"failure"`
 	ConnectTime        int64              `json:"connect_time"`
@@ -81,6 +85,7 @@ type NodeState struct {
 }
 
 type AtomicStatsRecord struct {
+	origin      stdatomic.Pointer[statsOrigin]
 	success     atomic.Int64
 	failure     atomic.Int64
 	connectTime atomic.Int64
@@ -97,6 +102,11 @@ type AtomicStatsRecord struct {
 	cumulRetrans    atomic.Int64
 
 	weights *lru.LruCache[string, float64]
+}
+
+type statsOrigin struct {
+	key        string
+	generation *writeGeneration
 }
 
 type CodeNodeSet struct {
@@ -175,13 +185,28 @@ func GetTargetNodeLock(target, group, proxy string) *sync.Mutex {
 }
 
 func (s *Store) GetOrCreateAtomicRecord(cacheKey string, group, config, target, proxy string) *AtomicStatsRecord {
-	if record, ok := recordCache.Get(cacheKey); ok {
+	for {
+		storeBarrier.RLock()
+		if record, ok := recordCache.Get(cacheKey); ok {
+			storeBarrier.RUnlock()
+			return record
+		}
+		origin := statsOriginForScope(cacheKey, writeScope{config, group, proxy})
+		storeBarrier.RUnlock()
+
+		// Loading may be slow. Validate its original generation at insertion,
+		// rather than blocking every Flush while a DB view is in progress.
+		record := s.loadAtomicRecord(group, config, target, proxy)
+		storeBarrier.RLock()
+		if origin != nil && origin.generation.invalid.Load() {
+			storeBarrier.RUnlock()
+			continue
+		}
+		record.origin.Store(origin)
+		record, _ = recordCache.GetOrStore(cacheKey, func() *AtomicStatsRecord { return record })
+		storeBarrier.RUnlock()
 		return record
 	}
-
-	record := s.loadAtomicRecord(group, config, target, proxy)
-	record, _ = recordCache.GetOrStore(cacheKey, func() *AtomicStatsRecord { return record })
-	return record
 }
 
 // loadAtomicRecord restores one node's persisted counters; the cache lock is not held here
@@ -227,8 +252,22 @@ func (record *AtomicStatsRecord) CreateStatsSnapshot(cacheKey string) *StatsReco
 	if record == nil {
 		return &StatsRecord{}
 	}
+	storeBarrier.RLock()
+	defer storeBarrier.RUnlock()
+	origin := record.origin.Load()
+	if origin == nil {
+		// Manually constructed, uncached records are legitimate first writers.
+		record.origin.CompareAndSwap(nil, statsOriginForKey(cacheKey))
+		origin = record.origin.Load()
+	}
+	weights := make(map[string]float64)
+	if record.weights != nil {
+		weights = record.weights.FilterByKeyPrefix("")
+	}
 
 	snapshot := &StatsRecord{
+		origin:             origin,
+		source:             record,
 		Success:            record.success.Load(),
 		Failure:            record.failure.Load(),
 		ConnectTime:        record.connectTime.Load(),
@@ -242,10 +281,14 @@ func (record *AtomicStatsRecord) CreateStatsSnapshot(cacheKey string) *StatsReco
 		LossRate:           record.lossRate.Load(),
 		CumulSent:          uint64(record.cumulSent.Load()),
 		CumulRetrans:       uint64(record.cumulRetrans.Load()),
-		Weights:            record.weights.FilterByKeyPrefix(""),
+		Weights:            weights,
 	}
 
-	recordCache.Set(cacheKey, record)
+	if origin == nil || origin.key == cacheKey && !origin.generation.invalid.Load() {
+		recordCache.SetIf(cacheKey, record, func(current *AtomicStatsRecord, _ time.Time, found bool) bool {
+			return !found || current == record
+		})
+	}
 
 	return snapshot
 }
@@ -1636,6 +1679,8 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 	if len(nodes) == 0 {
 		return nil
 	}
+	storeBarrier.Lock()
+	defer storeBarrier.Unlock()
 
 	removeNodesFromQueue(group, config, nodes)
 
@@ -1643,11 +1688,14 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 	for _, n := range nodes {
 		nodeSet[n] = struct{}{}
 	}
+	invalidateLive("group", config, group, nodeSet)
+	opQueue.remove(func(op StoreOperation) bool { return op.generation != nil && op.generation.invalid.Load() })
+	invalidateNodeCaches(group, config, nodeSet)
 
 	var firstErr error
 
 	statsPrefix := FormatDBKey(KeyTypeStats, config, group)
-	statsResults, err := s.DBViewPrefixScan(statsPrefix, -1, false)
+	statsResults, err := s.DBViewPrefixScan(statsPrefix, -1, true)
 	if err != nil {
 		return err
 	}
@@ -1668,7 +1716,7 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 	}
 
 	prefetchPrefix := FormatDBKey(KeyTypePrefetch, config, group)
-	prefetchResults, err := s.DBViewPrefixScan(prefetchPrefix, -1, false)
+	prefetchResults, err := s.DBViewPrefixScan(prefetchPrefix, -1, true)
 	if err != nil {
 		if firstErr == nil {
 			firstErr = err
@@ -1789,7 +1837,7 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 
 	var failuresToDelete []string
 	failuresPrefix := FormatDBKey(KeyTypeHostFailures, config, group)
-	failuresResults, err := s.DBViewPrefixScan(failuresPrefix, -1, false)
+	failuresResults, err := s.DBViewPrefixScan(failuresPrefix, -1, true)
 	if err != nil {
 		if firstErr == nil {
 			firstErr = err

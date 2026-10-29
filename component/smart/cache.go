@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/common/cmd"
@@ -27,7 +28,8 @@ const (
 var (
 	targetCache *lru.LruCache[string, string]
 
-	unwrapCache *lru.LruCache[string, UnwrapMap]
+	unwrapCache   *lru.LruCache[string, UnwrapMap]
+	unwrapVersion atomic.Uint64
 
 	recordCache *lru.LruCache[string, *AtomicStatsRecord]
 
@@ -54,6 +56,7 @@ type (
 	UnwrapMap struct {
 		Proxies []string `json:"proxies,omitempty"`
 		Ref     string   `json:"ref,omitempty"`
+		Version uint64   `json:"-"` // each replacement/renewal has a distinct identity, even A -> A
 	}
 
 	NodesWithWeights struct {
@@ -202,9 +205,9 @@ func (s *Store) StoreUnwrapResult(group, config string, target string, proxies [
 	}
 
 	targetKey := FormatDBKey(config, group, target)
-	if existing, expireTime, found := unwrapCache.GetWithExpire(targetKey); !found || len(existing.Proxies) == 0 || expireTime.Before(time.Now()) {
-		unwrapCache.Set(targetKey, UnwrapMap{Proxies: names})
-	}
+	unwrapCache.SetIf(targetKey, UnwrapMap{Proxies: names, Version: unwrapVersion.Add(1)}, func(existing UnwrapMap, expires time.Time, found bool) bool {
+		return !found || len(existing.Proxies) == 0 || expires.Before(time.Now())
+	})
 }
 
 func (s *Store) GetUnwrapResult(group, config, target string) (proxies []string, expired bool) {
@@ -215,7 +218,7 @@ func (s *Store) GetUnwrapResult(group, config, target string) (proxies []string,
 	targetKey := FormatDBKey(config, group, target)
 	if value, expireTime, found := unwrapCache.GetWithExpire(targetKey); found {
 		if len(value.Proxies) > 0 {
-			return value.Proxies, expireTime.Before(time.Now())
+			return append([]string(nil), value.Proxies...), expireTime.Before(time.Now())
 		}
 	}
 
@@ -233,7 +236,43 @@ func (s *Store) ForceStoreUnwrapResult(group, config string, target string, prox
 	for i, p := range proxies {
 		names[i] = p.Name()
 	}
-	unwrapCache.Set(FormatDBKey(config, group, target), UnwrapMap{Proxies: names})
+	unwrapCache.Set(FormatDBKey(config, group, target), UnwrapMap{Proxies: names, Version: unwrapVersion.Add(1)})
+}
+
+// GetUnwrapSnapshot captures the identity checked by asynchronous refresh. The
+// proxy names alone are not an identity: a new write of A must survive old A work.
+func (s *Store) GetUnwrapSnapshot(group, config, target string) (UnwrapMap, bool) {
+	value, _, found := s.GetUnwrapSnapshotWithExpiry(group, config, target)
+	return value, found
+}
+
+func (s *Store) GetUnwrapSnapshotWithExpiry(group, config, target string) (UnwrapMap, bool, bool) {
+	if target == "" {
+		return UnwrapMap{}, false, false
+	}
+	value, expires, found := unwrapCache.GetWithExpire(FormatDBKey(config, group, target))
+	value.Proxies = append([]string(nil), value.Proxies...)
+	return value, found && expires.Before(time.Now()), found
+}
+
+func (s *Store) DeleteUnwrapSnapshot(group, config, target string, expected UnwrapMap) bool {
+	if target == "" {
+		return false
+	}
+	return unwrapCache.DeleteIf(FormatDBKey(config, group, target), func(current UnwrapMap) bool {
+		return current.Version == expected.Version
+	})
+}
+
+func (s *Store) RenewUnwrapSnapshot(group, config, target string, expected UnwrapMap) bool {
+	if target == "" || len(expected.Proxies) == 0 {
+		return false
+	}
+	renewed := expected
+	renewed.Version = unwrapVersion.Add(1)
+	return unwrapCache.SetIf(FormatDBKey(config, group, target), renewed, func(current UnwrapMap, _ time.Time, found bool) bool {
+		return found && current.Version == expected.Version
+	})
 }
 
 func (s *Store) DeleteUnwrapResult(group, config string, target string) {
@@ -242,6 +281,38 @@ func (s *Store) DeleteUnwrapResult(group, config string, target string) {
 	}
 
 	unwrapCache.Delete(FormatDBKey(config, group, target))
+}
+
+// DeleteUnwrapResultIfPrimary is for an explicit failure of one node, not a
+// refresh snapshot: failure on A must not unpin a current healthy B.
+func (s *Store) DeleteUnwrapResultIfPrimary(group, config, target, primary string) bool {
+	if target == "" || primary == "" {
+		return false
+	}
+	return unwrapCache.DeleteIf(FormatDBKey(config, group, target), func(current UnwrapMap) bool {
+		return len(current.Proxies) > 0 && current.Proxies[0] == primary
+	})
+}
+
+func invalidateNodeCaches(group, config string, nodes map[string]struct{}) {
+	for key := range recordCache.FilterByKeyPrefix(FormatDBKey(KeyTypeStats, config, group) + "/") {
+		node := key[strings.LastIndexByte(key, '/')+1:]
+		if _, removed := nodes[node]; removed {
+			recordCache.Delete(key)
+		}
+	}
+	for key, value := range unwrapCache.FilterByKeyPrefix(FormatDBKey(config, group) + "/") {
+		for _, node := range value.Proxies {
+			if _, removed := nodes[node]; removed {
+				unwrapCache.DeleteIf(key, func(current UnwrapMap) bool { return current.Version == value.Version })
+				break
+			}
+		}
+	}
+	for _, kt := range []string{KeyTypeStats, KeyTypeNode, KeyTypePrefetch, KeyTypeRanking, KeyTypeHostFailures} {
+		dbResultCache.Delete(FormatDBKey(kt, config, group))
+	}
+	blockedNodesCache.Delete(FormatDBKey(config, group))
 }
 
 func (s *Store) UpdateBlockedNodesCache(group, config string, updates map[string]*NodeState) {
@@ -351,8 +422,6 @@ func (s *Store) AdjustCacheParameters() {
 }
 
 func (s *Store) clearCache(level string, config string, group string) {
-	s.FlushQueue(true)
-
 	if level == "all" {
 		targetCache.Clear()
 		unwrapCache.Clear()
@@ -369,7 +438,9 @@ func (s *Store) clearCache(level string, config string, group string) {
 		unwrapCache.RemoveByKeyPrefix(FormatDBKey(config) + "/")
 		recordCache.RemoveByKeyPrefix(FormatDBKey(KeyTypeStats, config) + "/")
 		for _, kt := range []string{KeyTypeStats, KeyTypeNode, KeyTypePrefetch, KeyTypeRanking, KeyTypeHostFailures} {
-			dbResultCache.RemoveByKeyPrefix(FormatDBKey(kt, config) + "/")
+			prefix := FormatDBKey(kt, config)
+			dbResultCache.Delete(prefix)
+			dbResultCache.RemoveByKeyPrefix(prefix + "/")
 		}
 		blockedNodesCache.RemoveByKeyPrefix(FormatDBKey(config) + "/")
 		hostStatusCache.RemoveByKeyPrefix(FormatDBKey(KeyTypeHostFailures, config) + "/")

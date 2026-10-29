@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+
 	"math"
 	"math/rand"
 	"net"
@@ -15,7 +15,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"sync"
 	"time"
 
@@ -155,13 +154,8 @@ type SmartPLD struct {
 
 	// pldRecordCache caches per-(target,node) reward state in memory; persisted
 	// under the independent "pld:" key namespace of the shared smart.db.
-	pldRecordMu    sync.Mutex
-	pldRecordCache map[string]*smart.PLDRecord
-
-	// lastSwitchAt tracks the last primary-switch time per target, enforcing
-	// the switch cooldown (broken-primary collapses bypass it).
-	switchMu     sync.Mutex
-	lastSwitchAt map[string]time.Time
+	pldCacheOnce sync.Once
+	pldCache     *smart.PLDCache
 
 	// healthChecking guards the proactive group-wide URLTest so concurrent
 	// first connections don't fire duplicate full-group probes.
@@ -203,8 +197,6 @@ func NewSmartPLD(option GroupCommonOption, smartOption SmartPLDOption, emptyFall
 		priorWeight:     smartOption.PriorWeight,
 		priorDecayK:     smartOption.PriorDecayK,
 		exploreStrength: smartOption.ExploreStrength,
-		pldRecordCache:  make(map[string]*smart.PLDRecord),
-		lastSwitchAt:    make(map[string]time.Time),
 	}
 
 	s.hostFailLimit.Store(int32(s.maxFailedTimes))
@@ -617,7 +609,6 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 
 	start := time.Now()
 
-	var firstWriteErr atomic.TypedValue[error]
 	var firstReadErr atomic.TypedValue[error]
 	var firstReadLatency atomic.Int64
 	// full-lifecycle error observers: catch mid-transfer failures the one-shot
@@ -625,34 +616,28 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 	// write errors halfway through, all UDP I/O errors)
 	var observedReadErr atomic.TypedValue[error]
 	var observedWriteErr atomic.TypedValue[error]
-	// per-connection failure latch: exactly one hard-failure recording per
-	// connection, whoever fires first (quality gate or close callback)
-	pldFailureLatched := &atomic.Bool{}
+	// Gates and final statistics share one serialized connection outcome.
+	pldFailureLatched := &pldConnectionOutcome{}
 
 	if N.NeedHandshake(c) {
 		c = callback.NewFirstWriteCallBackConn(c, func(err error) {
-			if err != nil {
-				firstWriteErr.Store(err)
+			if transferErr := pldFailureLatched.readError(err); transferErr != nil {
+				observedWriteErr.CompareAndSwap(nil, transferErr)
 			}
 		})
 	}
 
 	c = callback.NewFirstReadCallBackConn(c, func(err error) {
-		firstReadLatency.Store(time.Since(start).Milliseconds())
-		if err != nil {
-			firstReadErr.Store(err)
+		// Zero is the not-read sentinel, so quantize completed reads to >=1ms.
+		firstReadLatency.Store(max(1, time.Since(start).Milliseconds()))
+		if transferErr := pldFailureLatched.readError(err); transferErr != nil {
+			firstReadErr.Store(transferErr)
 		}
 	})
 
-	// mirror upstream smart: observe every read/write error for the whole
-	// connection lifetime. A raw relay must keep its splice fast path: the
-	// copy engine peels wrappers down to the socket, so skip those chains.
-	stop := N.UnwrapWriter(c)
-	if _, isRawRelay := stop.(syscall.Conn); !isRawRelay {
-		if u, ok := stop.(interface{ Upstream() any }); !ok || u.Upstream() != nil {
-			c = callback.NewErrorCallBackConn(c, &observedReadErr, &observedWriteErr)
-		}
-	}
+	// Observe ordinary reads/writes even for raw sockets. The production relay
+	// retains these error sinks while peeling the socket for accelerated copy.
+	c = callback.NewErrorCallBackConn(c, &observedReadErr, &observedWriteErr)
 
 	// Passive Packet-Pair readout: stamp first-byte + 64KiB arrival on the real
 	// connection. Only installed under usepld; the tracker is read at close.
@@ -675,7 +660,7 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 			if firstReadLatency.Load() > 0 {
 				return // first byte arrived in time — connection is fine
 			}
-			tracker := statistic.DefaultManager.Get(metadata.UUID)
+			tracker := findPLDTracker(metadata)
 			if tracker == nil {
 				return // connection already gone
 			}
@@ -685,11 +670,9 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 			}
 			log.Debugln("[PLD] Group: [%s] Node: [%s] Target: [%s] no first byte within %d ms, official quality gate fired",
 				s.Name(), proxy.Name(), target, s.firstByteGateMs)
-			if !pldFailureLatched.CompareAndSwap(false, true) {
-				return // another failure path already recorded this connection
+			if !s.failPLDConnection(pldFailureLatched, metadata, proxy.Name(), 3) {
+				return
 			}
-			s.markNodeFailure(metadata, proxy.Name(), true, true, 3)
-			s.store.DeleteUnwrapResult(s.Name(), s.configName, target)
 
 			// Hard-punish the node for this target: drop its PLD reward exactly
 			// like a dial failure, so the fresh re-rank stops preferring it even
@@ -699,9 +682,6 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 			// back as the target's primary — every next request selected it again
 			// and the node never got switched (the recurring "won't switch"
 			// symptom: node looks alive, connection hangs, never recovers).
-			rec := s.getPLDRecord(target, proxy.Name())
-			rec.FillFailure(s.failureCooldownSec())
-			s.savePLDRecord(target, proxy.Name(), rec)
 			// NOTE: deliberately NOT force-closing the node's same-target
 			// connections here. The official smart group never closes
 			// established connections on a quality signal — it only re-selects
@@ -728,14 +708,14 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 		progressDelay := time.Duration(s.zeroProgressMs) * time.Millisecond
 		firstSample := time.Now()
 		time.AfterFunc(progressDelay, func() {
-			tracker := statistic.DefaultManager.Get(metadata.UUID)
+			tracker := findPLDTracker(metadata)
 			if tracker == nil {
 				return // connection already gone — nothing to judge
 			}
 			upload1 := tracker.Info().UploadTotal.Load()
 			download1 := tracker.Info().DownloadTotal.Load()
 			time.AfterFunc(6*time.Second, func() {
-				t2 := statistic.DefaultManager.Get(metadata.UUID)
+				t2 := statistic.DefaultManager.Get(tracker.ID())
 				if t2 == nil {
 					return
 				}
@@ -765,14 +745,9 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 				}
 				log.Debugln("[PLD] Group: [%s] Node: [%s] Target: [%s] zero progress (%d bytes up, 0 down after %s), zero-progress gate fired",
 					s.Name(), proxy.Name(), target, upload1, time.Since(firstSample).Round(time.Second))
-				if !pldFailureLatched.CompareAndSwap(false, true) {
-					return // another failure path already recorded this connection
+				if !s.failPLDConnection(pldFailureLatched, metadata, proxy.Name(), 7) {
+					return
 				}
-				s.markNodeFailure(metadata, proxy.Name(), true, true, 7)
-				s.store.DeleteUnwrapResult(s.Name(), s.configName, target)
-				rec := s.getPLDRecord(target, proxy.Name())
-				rec.FillFailure(s.failureCooldownSec())
-				s.savePLDRecord(target, proxy.Name(), rec)
 				// NOTE: same as the first-byte gate — no force-closing of the
 				// node's same-target connections. The official smart group never
 				// closes established connections on a quality signal; force-closing
@@ -1258,71 +1233,15 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 	// selectProxies 的实时 D-UCB 排名可能不一致，用它换人会让 primary 与
 	// PLD 决策脱节；primary 的变更只由 失败信号（冷却/block 排除）或
 	// selectProxies 的滞回切换（领先 ≥switch-margin）驱动。
-	refreshUnwrapCache := func(isUDP bool, largeMode bool) {
-		old, _ := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
-		if len(old) == 0 {
-			return
-		}
-		allProxies := s.GetProxies(true)
-		var proxy C.Proxy
-		for _, p := range allProxies {
-			if p.Name() == old[0] {
-				proxy = p
-				break
-			}
-		}
-		if proxy == nil || !proxy.AliveForTestUrl(s.testUrl) || (isUDP && !proxy.SupportUDP()) {
-			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
-			return
-		}
-		wildcard := metadata.WildcardTarget
-		if blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName); blockedNodes[old[0]] {
-			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
-			return
-		}
-		target := metadata.SmartTarget
-		if target == "" {
-			target = wildcard
-		}
-		if rec := s.getPLDRecord(target, old[0]); rec.InFailureCooldown(time.Now().Unix()) {
-			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
-			return
-		}
-		// Soft-failed primary (negative PLD reward EMA): also delete unwrap
-		// so the next request does a fresh computation. Without this, the
-		// unwrap stays pinned to a node that selectProxies will reject on
-		// every request, wasting a round-trip and causing brief stalls.
-		if s.usePLD {
-			rec := s.getPLDRecord(target, old[0])
-			if rew, _, cnt := rec.ChannelStats(largeMode); cnt >= 2 && rew < 0 {
-				s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
-				log.Debugln("[PLD] Group: [%s] Target: [%s] unwrap refresh deleted soft-failed primary [%s] (reward=%.3f)",
-					s.Name(), target, old[0], rew)
-				return
-			}
-		}
-		// Old primary still healthy for this target: renew the unwrap entry so
-		// the TTL does not expire again on the very next request (avoids a
-		// refresh goroutine storm when a target is constantly hit).
-		//
-		// Re-read the current unwrap entry before acting: between our initial
-		// read and now (all the health checks above take time), a hysteresis
-		// switch may have stored a different primary. Acting on stale data
-		// would overwrite the new primary with the old one.
-		current, _ := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
-		if len(current) == 0 || current[0] != old[0] {
-			return // primary changed while we were checking — don't overwrite
-		}
-		s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, []C.Proxy{proxy})
-	}
-
 	trySelector := func(isUDP bool) ([]string, []float64, bool) {
 		// 检查匹配缓存
-		if proxiesName, expired := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget); len(proxiesName) > 0 {
+		if snapshot, expired, ok := s.store.GetUnwrapSnapshotWithExpiry(s.Name(), s.configName, target); ok && len(snapshot.Proxies) > 0 {
 			if expired {
-				go refreshUnwrapCache(isUDP, largeMode)
+				// Capture immutable request data and the actual observed generation
+				// before scheduling; refresh never reads a later primary as old work.
+				go s.refreshUnwrapCache(isUDP, largeMode, target, snapshot)
 			}
-			return proxiesName, nil, true
+			return append([]string(nil), snapshot.Proxies...), nil, true
 		}
 		names, weights := computeFreshNodes(isUDP)
 		return names, weights, false
@@ -1889,11 +1808,17 @@ func (s *SmartPLD) cleanupOrphanedNodeCache() {
 	if err != nil {
 		return
 	}
+	// Rewards can exist without any official stats (including not-yet-saved
+	// live rewards in any matching instance). Nodes enumerates weak owners;
+	// do not let another instance's unsaved rewards evade provider cleanup.
+	cachedNodes = append(cachedNodes, s.rewardCache().Nodes()...)
 
 	var orphanedNodes []string
+	seen := make(map[string]bool)
 	for _, nodeName := range cachedNodes {
-		if !proxyMap[nodeName] {
+		if !proxyMap[nodeName] && !seen[nodeName] {
 			orphanedNodes = append(orphanedNodes, nodeName)
+			seen[nodeName] = true
 		}
 	}
 
@@ -1924,7 +1849,7 @@ func (s *SmartPLD) updateConnectionDuration(record *smart.AtomicStatsRecord, con
 	currentDuration := record.Duration()
 
 	if currentDuration > 0 {
-		record.SetDuration((currentDuration+durationMinutes)/2.0)
+		record.SetDuration((currentDuration + durationMinutes) / 2.0)
 	} else {
 		record.SetDuration(durationMinutes)
 	}
@@ -1934,12 +1859,13 @@ func (s *SmartPLD) updateConnectionDuration(record *smart.AtomicStatsRecord, con
 func (s *SmartPLD) saveStatsRecord(target string, proxy C.Proxy, record *smart.StatsRecord) {
 	if data, err := json.Marshal(record); err == nil {
 		s.store.AppendToGlobalQueue(smart.StoreOperation{
-			Type:   smart.OpSaveStats,
-			Group:  s.Name(),
-			Config: s.configName,
-			Target: target,
-			Node:   proxy.Name(),
-			Data:   data,
+			Type:          smart.OpSaveStats,
+			Group:         s.Name(),
+			Config:        s.configName,
+			Target:        target,
+			Node:          proxy.Name(),
+			Data:          data,
+			StatsSnapshot: record,
 		})
 	}
 }
@@ -2290,7 +2216,25 @@ func (s *SmartPLD) collectConnectionData(input *smart.ModelInput, metadata *C.Me
 
 func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate,
-	connectionDuration int64, tcpStats *tcpstats.Stats, bytesTo64KMs int64, err error, pldFailureLatched *atomic.Bool) {
+	connectionDuration int64, tcpStats *tcpstats.Stats, bytesTo64KMs int64, err error, pldFailureLatched *pldConnectionOutcome) {
+	if pldFailureLatched == nil {
+		pldFailureLatched = &pldConnectionOutcome{}
+	}
+	pldFailureLatched.mu.Lock()
+	defer pldFailureLatched.mu.Unlock()
+	if pldFailureLatched.recorded {
+		return
+	}
+	pldFailureLatched.closed = true
+	pldFailureLatched.recorded = true
+	if callback.IsConnectionLifecycle(err) {
+		pldFailureLatched.localClose = true
+	}
+	err = callback.TransferError(err)
+	// A local cancellation before any response is a neutral lifecycle event.
+	if pldFailureLatched.localClose && !pldFailureLatched.failed && err == nil && downloadTotal == 0 {
+		return
+	}
 
 	if proxy.Type() == C.Compatible || proxy.Type() == C.Reject || proxy.Type() == C.Pass || proxy.Type() == C.RejectDrop {
 		return
@@ -2339,11 +2283,15 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 
 	atomicRecord := s.store.GetOrCreateAtomicRecord(cacheKey, s.Name(), s.configName, target, proxyName)
 
-	switch {
-	case err != nil:
-		s.onDialFailed(proxy.Type(), err, s.healthCheck)
+	// A gate is a connection outcome, not a new TCP dial failure. Keep the
+	// official counters, model input and PLD reward on this same decision.
+	connectionFailed := err != nil || pldFailureLatched.failed
+	if connectionFailed {
+		if err != nil {
+			s.onDialFailed(proxy.Type(), err, s.healthCheck)
+		}
 		atomicRecord.AddFailure(1)
-	default:
+	} else {
 		s.onDialSuccess()
 		atomicRecord.AddSuccess(1)
 	}
@@ -2405,7 +2353,7 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, float64(connectionDuration)/60000.0, wildcardTarget,
 		lossRate, cumulLossRate,
 	)
-	input.ConnectionFailed = err != nil
+	input.ConnectionFailed = connectionFailed
 
 	// smart-pld never uses the official LightGBM weight model: the weight
 	// chain (rule-based CalculateWeight + EMA feedback) only feeds the shared
@@ -2421,7 +2369,16 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		networkStr, asnNumber, isUDP, lossRate, emaLossRate)
 
 	// 针对具体 域名/IP 屏蔽节点（wildcardTarget + SmartTarget 双级记录）
-	failedBlock := s.markNodeFailure(metadata, proxyName, isDegraded, checked, blockCode)
+	failedBlock := false
+	if !pldFailureLatched.failed {
+		// A real transfer failure is one strike, independent of the calculated
+		// weight. A gate that already charged this connection must not be
+		// charged again (nor have its strike cleared by a checked success).
+		if err != nil {
+			isDegraded, checked, blockCode = true, true, 3
+		}
+		failedBlock = s.markNodeFailure(metadata, proxyName, isDegraded, checked, blockCode)
+	}
 
 	// NOTE: no force-closing of same-target connections on degrade/block.
 	// The official smart group never closes established connections on a
@@ -2466,9 +2423,9 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 			DurationSec:   float64(connectionDuration) / 1000.0,
 			MaxDownloadKB: maxDownloadRateKB,
 			LossRate:      lossRate,
-			Failed:        err != nil,
+			Failed:        connectionFailed,
 		}
-		if pldFailureLatched != nil && pldFailureLatched.Load() {
+		if pldFailureLatched.failed {
 			// a quality gate already recorded this connection's hard failure in
 			// the PLD state (FillFailure). Keep the training sample and the
 			// scalar reward, but skip the second record mutation so one
@@ -2491,7 +2448,7 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 
 	if s.pldCollect {
 		collectedWeight := adjWeight / priorityFactor
-		if isDegraded || failedBlock {
+		if isDegraded || failedBlock || pldFailureLatched.failed {
 			// 对于异常连接强制调整，便于模型训练时进行识别
 			if collectedWeight >= smart.AllowedWeight {
 				collectedWeight = collectedWeight * 0.1
@@ -2516,8 +2473,9 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		pldReward, pldParts, pldEMA, pldVar, pldSamples, pldBWCeilKBps)
 }
 
-func (s *SmartPLD) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, firstReadLatency *atomic.Int64, firstReadErr *atomic.TypedValue[error], observedReadErr *atomic.TypedValue[error], observedWriteErr *atomic.TypedValue[error], pldFailureLatched *atomic.Bool, pp *callback.PacketPairCallBackConn) C.Conn {
+func (s *SmartPLD) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, firstReadLatency *atomic.Int64, firstReadErr *atomic.TypedValue[error], observedReadErr *atomic.TypedValue[error], observedWriteErr *atomic.TypedValue[error], pldFailureLatched *pldConnectionOutcome, pp *callback.PacketPairCallBackConn) C.Conn {
 	return callback.NewCloseCallbackConn(c, func() {
+		pldFailureLatched.finish()
 		tracker := statistic.DefaultManager.Get(metadata.UUID)
 		if tracker != nil {
 			info := tracker.Info()
@@ -2549,24 +2507,9 @@ func (s *SmartPLD) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metad
 				tcpStats = tcpstats.GetTCPStats(trackerConn)
 			}
 
-			var closeErr error
-			if readErr != nil {
-				if readErr == io.EOF {
-					if writeErr != nil && writeErr != io.EOF {
-						closeErr = writeErr
-					}
-				} else {
-					closeErr = readErr
-				}
-			} else if writeErr != nil && writeErr != io.EOF {
-				// write-only error: the node refused our data even though we
-				// could still read from it — a real failure the old code missed
-				closeErr = writeErr
-			}
-
-			if closeErr != nil {
-				s.markNodeFailure(metadata, proxy.Name(), true, true, 3)
-			}
+			closeErr := callback.TransferError(readErr, writeErr)
+			// Host punishment belongs to recordConnectionStats only; doing it
+			// here as well used to double-charge the same connection.
 
 			go s.recordConnectionStats(metadata, proxy, connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, tcpStats, bytesTo64KMs, closeErr, pldFailureLatched)
 			return
@@ -2590,12 +2533,7 @@ func (s *SmartPLD) registerPacketClosureMetricsCallback(pc C.PacketConn, proxy C
 			// recorded as successes
 			readErr := observedReadErr.Load()
 			writeErr := observedWriteErr.Load()
-			var closeErr error
-			if readErr != nil {
-				closeErr = readErr
-			} else if writeErr != nil && writeErr != io.EOF {
-				closeErr = writeErr
-			}
+			closeErr := callback.TransferError(readErr, writeErr)
 
 			go s.recordConnectionStats(metadata, proxy, connectTime, udpLatency.Load(),
 				uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, nil, 0, closeErr, nil)
@@ -2792,24 +2730,7 @@ func (s *SmartPLD) getPriorityFactor(proxyName string) float64 {
 func (s *SmartPLD) evictStalePLDState() {
 	cutoff := time.Now().AddDate(0, 0, -30).Unix()
 	switchCutoff := time.Now().Add(-24 * time.Hour)
-
-	s.pldRecordMu.Lock()
-	for key, rec := range s.pldRecordCache {
-		if rec.GetLastUpdated() < cutoff {
-			delete(s.pldRecordCache, key)
-		}
-	}
-	s.pldRecordMu.Unlock()
-
-	// lastSwitchAt is guarded by switchMu (not pldRecordMu) — the same mutex
-	// markPrimarySwitch uses. Using the wrong mutex here was a data race.
-	s.switchMu.Lock()
-	for t, at := range s.lastSwitchAt {
-		if at.Before(switchCutoff) {
-			delete(s.lastSwitchAt, t)
-		}
-	}
-	s.switchMu.Unlock()
+	s.rewardCache().Evict(cutoff, switchCutoff)
 
 	s.store.EvictOldPLDRecords(cutoff)
 }
@@ -2875,6 +2796,7 @@ func (s *SmartPLD) Close() error {
 	}
 
 	s.wg.Wait()
+	s.rewardCache().Close()
 
 	if !flushQueueOnce.Swap(true) {
 		s.store.FlushQueue(true)
@@ -2894,31 +2816,14 @@ func (s *SmartPLD) Close() error {
 // reward record. It never touches the official smart stats: PLD data lives
 // under the independent "pld:" key namespace of the shared smart.db.
 func (s *SmartPLD) getPLDRecord(target, node string) *smart.PLDRecord {
-	key := smart.FormatPLDKey(s.configName, s.Name(), target, node)
-	s.pldRecordMu.Lock()
-	defer s.pldRecordMu.Unlock()
-	if rec, ok := s.pldRecordCache[key]; ok {
-		return rec
-	}
-	rec := &smart.PLDRecord{}
-	if data, err := s.store.DBViewGetItem(key); err == nil && len(data) > 0 {
-		if err := json.Unmarshal(data, rec); err != nil {
-			log.Warnln("[PLD] record decode failed for key %s: %v", key, err)
-		}
-	}
-	s.pldRecordCache[key] = rec
-	return rec
+	return s.rewardCache().Get(target, node)
 }
 
 // savePLDRecord persists the PLD reward record to its independent key
 // namespace and updates the in-memory cache.
 func (s *SmartPLD) savePLDRecord(target, node string, rec *smart.PLDRecord) {
 	key := smart.FormatPLDKey(s.configName, s.Name(), target, node)
-	data, err := json.Marshal(rec)
-	if err != nil {
-		return
-	}
-	if err := s.store.DBBatchPutItem(key, data); err != nil {
+	if err := s.rewardCache().Save(target, node, rec); err != nil {
 		log.Warnln("[PLD] record save failed for key %s: %v", key, err)
 	}
 }
@@ -2926,21 +2831,13 @@ func (s *SmartPLD) savePLDRecord(target, node string, rec *smart.PLDRecord) {
 // switchCooldownElapsed reports whether enough time has passed since the last
 // primary switch for this target (default cooldown 3 minutes).
 func (s *SmartPLD) switchCooldownElapsed(target string) bool {
-	s.switchMu.Lock()
-	defer s.switchMu.Unlock()
-	last, ok := s.lastSwitchAt[target]
-	if !ok {
-		return true
-	}
-	return time.Since(last) >= s.switchCooldown
+	return s.rewardCache().SwitchCooldownElapsed(target, s.switchCooldown)
 }
 
 // markPrimarySwitch records the primary-switch time for a target so the switch
 // cooldown applies to the next challenger.
 func (s *SmartPLD) markPrimarySwitch(target string) {
-	s.switchMu.Lock()
-	s.lastSwitchAt[target] = time.Now()
-	s.switchMu.Unlock()
+	s.rewardCache().MarkSwitch(target)
 }
 
 // applyPolicyPriorityPLD parses the smart-pld policy-priority option. It is the

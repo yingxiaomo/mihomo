@@ -1,9 +1,9 @@
 package callback
 
 import (
-	"io"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 
@@ -14,8 +14,8 @@ import (
 
 // errorCallBackConn records the first non-nil error of each direction so a
 // connection that dies mid-transfer is not reported as a success.
-// It must not implement the replaceable protocol or SyscallConn: the copy
-// engine would peel it and the record would go blind for the fast paths.
+// Keep the observer on ordinary copies. The production relay explicitly
+// unwraps its error-reporting contract while retaining the raw socket fast path.
 type errorCallBackConn struct {
 	C.Conn
 	readErr  *atomic.TypedValue[error]
@@ -30,6 +30,22 @@ func isConnectionLifecycle(err error) bool {
 		errors.Is(err, os.ErrDeadlineExceeded) ||
 		errors.Is(err, io.ErrClosedPipe) ||
 		errors.Is(err, context.Canceled)
+}
+
+// IsConnectionLifecycle identifies locally initiated cancellation and socket
+// deadlines. It deliberately does not classify every net.Error timeout as local.
+func IsConnectionLifecycle(err error) bool { return isConnectionLifecycle(err) }
+
+// TransferError selects a genuine transfer failure, ignoring normal EOF and
+// local stream lifecycle signals. First-read and close observers share this
+// classification so a local cancellation cannot bypass the observer filter.
+func TransferError(errs ...error) error {
+	for _, err := range errs {
+		if err != nil && !errors.Is(err, io.EOF) && !isConnectionLifecycle(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *errorCallBackConn) record(slot *atomic.TypedValue[error], err error) {
@@ -61,6 +77,16 @@ func (c *errorCallBackConn) WriteBuffer(buffer *buf.Buffer) error {
 	err := c.Conn.WriteBuffer(buffer)
 	c.record(c.writeErr, err)
 	return err
+}
+
+// These explicit contracts are used by the production relay, not by ordinary
+// sing unwrapping, so raw socket copying retains the direction-specific sinks.
+func (c *errorCallBackConn) UnwrapReadError() (io.Reader, func(error)) {
+	return c.Conn, func(err error) { c.record(c.readErr, err) }
+}
+
+func (c *errorCallBackConn) UnwrapWriteError() (io.Writer, func(error)) {
+	return c.Conn, func(err error) { c.record(c.writeErr, err) }
 }
 
 func (c *errorCallBackConn) Upstream() any {

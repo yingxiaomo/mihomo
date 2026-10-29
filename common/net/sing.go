@@ -74,7 +74,7 @@ func Relay(leftConn, rightConn net.Conn) {
 
 	ch := make(chan struct{})
 	go func() {
-		_, err := bufio.Copy(leftConn, rightConn)
+		_, err := Copy(leftConn, rightConn)
 		if err == nil {
 			_ = closeWrite(leftConn)
 		} else {
@@ -83,7 +83,7 @@ func Relay(leftConn, rightConn net.Conn) {
 		close(ch)
 	}()
 
-	_, err := bufio.Copy(rightConn, leftConn)
+	_, err := Copy(rightConn, leftConn)
 	if err == nil {
 		_ = closeWrite(rightConn)
 	} else {

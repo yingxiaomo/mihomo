@@ -1,12 +1,15 @@
 package naive
 
 import (
-	"sync"
 	"encoding/binary"
 	"io"
 	"math/rand"
 	"net"
+	"os"
+	"sync"
 	"time"
+
+	"github.com/metacubex/mihomo/common/net/deadline"
 )
 
 // flushWriter is the minimal interface a padded HTTP/2 or HTTP/3 response needs.
@@ -145,77 +148,191 @@ type naiveH2Conn struct {
 	localAddr  net.Addr
 	remoteAddr net.Addr
 	paddingConn
-	// deadline support: a timer goroutine closes the reader when the
-	// deadline passes, causing the blocked Read to return an error. Without
-	// this, tunnel Peek(1) (which sets a read deadline then blocks) would
-	// hang forever on server-first protocols like SSH.
-	readTimer *time.Timer
-	closeRead chan struct{}
-	mu        sync.Mutex
+	// HTTP bodies cannot be interrupted reversibly: Close cancels an H2/H3
+	// stream permanently. Keep at most one pending decoded read, on owned
+	// memory, across timeouts. In particular, a half-read padding header or
+	// discarded padding must stay with that read rather than be parsed again.
+	initOnce     sync.Once
+	closeOnce    sync.Once
+	readDeadline deadline.PipeDeadline
+	closed       chan struct{}
+	closeErr     error
+	mu           sync.Mutex // serializes deadline changes with Close
+	readMu       sync.Mutex // serializes readers and guards pending/cache
+	writeMu      sync.Mutex // guards the write padding state and terminal error
+	writeErr     error
+	pending      chan naiveReadResult
+	cache        naiveReadResult
+}
+
+type naiveReadResult struct {
+	data []byte
+	err  error
+}
+
+func (c *naiveH2Conn) initDeadline() {
+	c.initOnce.Do(func() {
+		c.readDeadline = deadline.MakePipeDeadline()
+		c.closed = make(chan struct{})
+	})
 }
 
 func (c *naiveH2Conn) Read(b []byte) (int, error) {
-	return c.readWithPadding(c.reader, b)
+	c.initDeadline()
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
+	}
+	select {
+	case <-c.readDeadline.Wait():
+		return 0, os.ErrDeadlineExceeded
+	default:
+	}
+	if len(b) == 0 {
+		return 0, nil
+	}
+	if len(c.cache.data) == 0 && c.cache.err == nil {
+		if c.pending == nil {
+			c.pending = make(chan naiveReadResult, 1)
+			// Only this worker touches the read padding state. The buffered
+			// channel lets it exit even after Close, without touching b. A
+			// timed-out caller reuses this pending read, never starts another.
+			go c.readAsync(c.pending, min(len(b), 65535))
+		}
+		select {
+		case <-c.closed:
+			return 0, net.ErrClosed
+		case <-c.readDeadline.Wait():
+			return 0, os.ErrDeadlineExceeded
+		case c.cache = <-c.pending:
+			c.pending = nil
+		}
+	}
+	// Close can release the body and make both select cases ready at once.
+	// Preserve a ready result on expiry, but never report a body-close error
+	// as a deadline or copy its bytes after observing Close.
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	case <-c.readDeadline.Wait():
+		return 0, os.ErrDeadlineExceeded
+	default:
+	}
+	n := copy(b, c.cache.data)
+	c.cache.data = c.cache.data[n:]
+	if len(c.cache.data) > 0 {
+		return n, nil
+	}
+	err := c.cache.err
+	c.cache = naiveReadResult{}
+	return n, err
+}
+
+func (c *naiveH2Conn) readAsync(result chan<- naiveReadResult, size int) {
+	buffer := make([]byte, size)
+	n, err := c.readWithPadding(c.reader, buffer)
+	result <- naiveReadResult{data: buffer[:n], err: err}
 }
 
 func (c *naiveH2Conn) Write(b []byte) (n int, err error) {
-	n, err = c.writeWithPadding(c.writer, b)
-	if err == nil && c.flusher != nil {
-		c.flusher.Flush()
+	c.initDeadline()
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
 	}
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
+	n, err = c.writeWithPadding(completeWriter{c.writer}, b)
+	if err == nil && c.flusher != nil {
+		if flusher, ok := c.flusher.(interface{ FlushError() error }); ok {
+			err = flusher.FlushError()
+		} else {
+			c.flusher.Flush()
+		}
+	}
+	// A failed framed write may have emitted part of its header or data.
+	// Never resume with a new frame after clearing a native write deadline.
+	c.writeErr = err
 	return
 }
 
-func (c *naiveH2Conn) Close() error {
-	if closer, ok := c.reader.(io.Closer); ok {
-		return closer.Close()
+type completeWriter struct{ io.Writer }
+
+func (w completeWriter) Write(b []byte) (int, error) {
+	n, err := w.Writer.Write(b)
+	if err == nil && n != len(b) {
+		err = io.ErrShortWrite
 	}
-	return nil
+	return n, err
+}
+
+func (c *naiveH2Conn) Close() error {
+	c.initDeadline()
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		close(c.closed)
+		c.readDeadline.Set(time.Time{}) // release the timer, not the body
+		c.mu.Unlock()
+		// Actual request bodies are closable, so this also releases the
+		// single outstanding worker. Arbitrary non-closable io.Readers
+		// cannot be forcibly interrupted, but cannot accumulate workers.
+		if closer, ok := c.reader.(io.Closer); ok {
+			c.closeErr = closer.Close()
+		}
+	})
+	return c.closeErr
 }
 
 func (c *naiveH2Conn) LocalAddr() net.Addr  { return c.localAddr }
 func (c *naiveH2Conn) RemoteAddr() net.Addr { return c.remoteAddr }
 
-// SetReadDeadline implements a real deadline: a timer closes the underlying
-// reader when the deadline passes, causing the blocked Read to return
-// io.EOF. A zero time cancels the timer. This is required for tunnel
-// Peek(1), which sets a read deadline then blocks waiting for the banner —
-// server-first protocols (SSH, SMTP, FTP) hang forever without it.
 func (c *naiveH2Conn) SetReadDeadline(t time.Time) error {
+	c.initDeadline()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.readTimer != nil {
-		c.readTimer.Stop()
-		c.readTimer = nil
+	select {
+	case <-c.closed:
+		return net.ErrClosed
+	default:
+	}
+	c.readDeadline.Set(t)
+	return nil
+}
+
+// Write deadlines use the response writer's native stream implementation, not
+// asynchronous writes: returning while a padded frame is still being written
+// would corrupt subsequent frames. H2 write expiry may reset that stream and
+// is not recoverable. Writers without deadline support report it explicitly.
+func (c *naiveH2Conn) SetWriteDeadline(t time.Time) error {
+	c.initDeadline()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.closed:
+		return net.ErrClosed
+	default:
+	}
+	if writer, ok := c.writer.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		return writer.SetWriteDeadline(t)
 	}
 	if t.IsZero() {
 		return nil
 	}
-	d := time.Until(t)
-	if d <= 0 {
-		return nil // already passed — don't close, the caller will handle it
-	}
-	closer, canClose := c.reader.(io.Closer)
-	if !canClose {
-		return nil
-	}
-	c.closeRead = make(chan struct{})
-	ch := c.closeRead
-	c.readTimer = time.AfterFunc(d, func() {
-		select {
-		case <-ch:
-			return // deadline was cancelled
-		default:
-			closer.Close()
-		}
-	})
-	return nil
+	return os.ErrNoDeadline
 }
 
-func (c *naiveH2Conn) SetWriteDeadline(t time.Time) error { return nil }
-
 func (c *naiveH2Conn) SetDeadline(t time.Time) error {
-	return c.SetReadDeadline(t)
+	if err := c.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.SetWriteDeadline(t)
 }
 
 var _ net.Conn = (*naiveH2Conn)(nil)

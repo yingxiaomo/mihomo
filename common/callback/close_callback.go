@@ -5,6 +5,7 @@ import (
 
 	C "github.com/metacubex/mihomo/constant"
 
+	"github.com/metacubex/sing/common"
 	"github.com/metacubex/sing/common/network"
 )
 
@@ -20,11 +21,12 @@ func (w *closeCallbackConn) Close() error {
 }
 
 func (w *closeCallbackConn) CloseWrite() error {
-	w.closeOnce.Do(w.closeFunc)
-	if wc, ok := w.Conn.(network.WriteCloser); ok {
+	// Measurement/first-read wrappers may hide a raw connection's half-close.
+	// Keep the read direction and defer final accounting until full Close.
+	if wc, ok := common.Cast[network.WriteCloser](w.Conn); ok {
 		return wc.CloseWrite()
 	}
-	return w.Conn.Close()
+	return w.Close()
 }
 
 func (w *closeCallbackConn) ReaderReplaceable() bool {
@@ -55,11 +57,10 @@ func (w *closeCallbackPacketConn) Close() error {
 }
 
 func (w *closeCallbackPacketConn) CloseWrite() error {
-	w.closeOnce.Do(w.closeFunc)
-	if wc, ok := w.PacketConn.(network.WriteCloser); ok {
+	if wc, ok := common.Cast[network.WriteCloser](w.PacketConn); ok {
 		return wc.CloseWrite()
 	}
-	return w.PacketConn.Close()
+	return w.Close()
 }
 
 func (w *closeCallbackPacketConn) ReaderReplaceable() bool {

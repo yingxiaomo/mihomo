@@ -61,13 +61,15 @@ type (
 	Store struct{}
 
 	StoreOperation struct {
-		Type    int
-		KeyType string // used by OpDeleteData to identify the target key type
-		Group   string
-		Config  string
-		Target  string
-		Node    string
-		Data    []byte
+		Type          int
+		KeyType       string // used by OpDeleteData to identify the target key type
+		Group         string
+		Config        string
+		Target        string
+		Node          string
+		Data          []byte
+		StatsSnapshot *StatsRecord     `json:"-"` // runtime source identity; Data keeps the existing JSON schema
+		generation    *writeGeneration // cancels queued and detached writes across invalidation
 	}
 
 	// operationQueue holds one pending operation per key, so a repeated update of a node
@@ -145,6 +147,25 @@ func formatOperationKey(op *StoreOperation) string {
 	}
 }
 
+// validStoreOperation runs with storeBarrier held through insertion or actual
+// DB commit. Raw/manual operations remain valid; sourced snapshots must retain
+// their original record generation and may not overwrite another incarnation.
+func validStoreOperation(op *StoreOperation) bool {
+	if op.generation != nil && op.generation.invalid.Load() {
+		return false
+	}
+	snapshot := op.StatsSnapshot
+	if snapshot == nil || snapshot.origin == nil {
+		return true
+	}
+	origin := snapshot.origin
+	if op.Type != OpSaveStats || origin.generation.invalid.Load() || origin.key != formatOperationKey(op) {
+		return false
+	}
+	current, found := recordCache.Get(origin.key)
+	return !found || current == snapshot.source
+}
+
 func (q *operationQueue) reset() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -179,6 +200,9 @@ func (q *operationQueue) append(operations []StoreOperation) []StoreOperation {
 		q.index = make(map[string]int)
 	}
 	for i := range operations {
+		if !validStoreOperation(&operations[i]) {
+			continue
+		}
 		key := formatOperationKey(&operations[i])
 		if key == "" {
 			continue
@@ -260,7 +284,10 @@ func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 		return
 	}
 
+	storeBarrier.RLock()
+	stampOperations(operations)
 	snapshot := opQueue.append(operations)
+	storeBarrier.RUnlock()
 	if len(snapshot) == 0 {
 		return
 	}
@@ -304,6 +331,12 @@ func (s *Store) FlushByLevel(level string, config string, group string) error {
 	if level == "" {
 		return errors.New("flush level cannot be empty")
 	}
+	if level != "all" && level != "config" && level != "group" {
+		return errors.New("unknown flush level: " + level)
+	}
+	storeBarrier.Lock()
+	defer storeBarrier.Unlock()
+	invalidateLive(level, config, group, nil)
 
 	switch level {
 	case "all":
@@ -312,33 +345,35 @@ func (s *Store) FlushByLevel(level string, config string, group string) error {
 		opQueue.remove(func(op StoreOperation) bool { return op.Config == config })
 	case "group":
 		opQueue.remove(func(op StoreOperation) bool { return op.Group == group && op.Config == config })
-	default:
-		return errors.New("unknown flush level: " + level)
 	}
 
 	s.clearCache(level, config, group)
 
 	switch level {
 	case "all":
-		s.DBBatchDeletePrefix([]string{"smart", PLDKeyPrefix}, false)
+		return s.DBBatchDeletePrefix([]string{"smart", PLDKeyPrefix}, false)
 	case "config":
-		s.DBBatchDeletePrefix([]string{
+		if err := s.DBBatchDeletePrefix([]string{
 			FormatDBKey(KeyTypeStats, config),
 			FormatDBKey(KeyTypeNode, config),
 			FormatDBKey(KeyTypeRanking, config),
 			FormatDBKey(KeyTypePrefetch, config),
 			FormatDBKey(KeyTypeHostFailures, config),
-			PLDKeyPrefix + escapeKeyPart(config) + ":",
-		}, false)
+		}, true); err != nil {
+			return err
+		}
+		return s.DBBatchDeletePrefix([]string{PLDKeyPrefix + escapeKeyPart(config) + ":"}, false)
 	case "group":
-		s.DBBatchDeletePrefix([]string{
-			PLDKeyPrefix + escapeKeyPart(config) + ":" + escapeKeyPart(group) + ":",
+		if err := s.DBBatchDeletePrefix([]string{
 			FormatDBKey(KeyTypeStats, config, group),
 			FormatDBKey(KeyTypeNode, config, group),
 			FormatDBKey(KeyTypeRanking, config, group),
 			FormatDBKey(KeyTypePrefetch, config, group),
 			FormatDBKey(KeyTypeHostFailures, config, group),
-		}, false)
+		}, true); err != nil {
+			return err
+		}
+		return s.DBBatchDeletePrefix([]string{PLDKeyPrefix + escapeKeyPart(config) + ":" + escapeKeyPart(group) + ":"}, false)
 	}
 
 	return nil
@@ -444,6 +479,8 @@ func (s *Store) BatchSave(operations []StoreOperation) error {
 	if len(operations) == 0 {
 		return nil
 	}
+	storeBarrier.RLock()
+	defer storeBarrier.RUnlock()
 	if db == nil {
 		return errors.New("DB Cache file load failed")
 	}
@@ -460,6 +497,9 @@ func (s *Store) BatchSave(operations []StoreOperation) error {
 	entries := make([]writeEntry, 0, len(operations))
 
 	for i := range operations {
+		if !validStoreOperation(&operations[i]) {
+			continue
+		}
 		key := formatOperationKey(&operations[i])
 		if key == "" {
 			continue
@@ -580,10 +620,35 @@ func mergeIntoByPrefix(from, into map[string][]byte, queryPrefix string, strict 
 	return merged
 }
 
+// refreshViewCache shares the synchronous and background scan/publication path.
+// scan is supplied explicitly so regression tests can pause after a real DB view.
+func (s *Store) refreshViewCache(prefix string, maxResults int, strict bool, scan func(string, int, bool) (map[string][]byte, error)) (map[string][]byte, error) {
+	token := beginView(prefix)
+	rows, err := scan(prefix, maxResults, strict)
+	storeBarrier.RLock()
+	defer storeBarrier.RUnlock()
+	if token != nil && token.invalid.Load() {
+		clear(rows)
+		return rows, err
+	}
+	if err == nil {
+		cacheView(prefix, rows)
+	}
+	return rows, err
+}
+
 // GetSubBytesByPath merges what the write queue, the view cache and the DB hold for a
 // prefix; a stale cached view is returned at once and refreshed in the background.
-func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
-	result := make(map[string][]byte)
+func (s *Store) GetSubBytesByPath(prefix string) (result map[string][]byte, err error) {
+	result = make(map[string][]byte)
+	token := beginView(prefix)
+	defer func() {
+		storeBarrier.RLock()
+		defer storeBarrier.RUnlock()
+		if token != nil && token.invalid.Load() {
+			clear(result)
+		}
+	}()
 
 	globalCacheParams.mutex.RLock()
 	maxTargets := globalCacheParams.MaxTargets
@@ -612,19 +677,22 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 		seg5, _, _ = strings.Cut(rest, "/")
 	}
 
-	strict := false
+	// Every slash-delimited query denotes an exact key/subtree, never a
+	// textual prefix such as grp matching grp-other or target matching target2.
+	strict := true
+	exact := false
 	switch keyType {
 	case KeyTypeNode, KeyTypePrefetch, KeyTypeHostFailures:
 		if depth == 5 {
-			strict = true
+			exact = true
 		}
 	case KeyTypeRanking:
 		if depth == 4 {
-			strict = true
+			exact = true
 		}
 	case KeyTypeStats:
 		if depth == 6 {
-			strict = true
+			exact = true
 		}
 	}
 
@@ -684,7 +752,7 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 		}
 	}
 
-	if strict && len(result) > 0 {
+	if exact && len(result) > 0 {
 		return result, nil
 	}
 
@@ -713,7 +781,7 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 		return result, nil
 	}
 	if keyType == KeyTypeStats && depth == 5 {
-		if rows, err := s.DBViewPrefixScan(prefix, maxResults, false); err == nil {
+		if rows, err := s.DBViewPrefixScan(prefix, maxResults, true); err == nil {
 			for k, v := range rows {
 				if _, exists := result[k]; !exists {
 					result[k] = v
@@ -743,9 +811,7 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 				if _, loading := dbResultRefreshFlags.LoadOrStore(groupPrefix, true); !loading {
 					go func() {
 						defer dbResultRefreshFlags.Delete(groupPrefix)
-						if groupResult, err := s.DBViewPrefixScan(groupPrefix, maxResults, false); err == nil {
-							cacheView(groupPrefix, groupResult)
-						}
+						_, _ = s.refreshViewCache(groupPrefix, maxResults, true, s.DBViewPrefixScan)
 					}()
 				}
 			}
@@ -754,16 +820,14 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 				return result, nil
 			}
 			if strict {
-				groupResult, err := s.DBViewPrefixScan(groupPrefix, maxResults, false)
+				groupResult, err := s.refreshViewCache(groupPrefix, maxResults, true, s.DBViewPrefixScan)
 				if err == nil {
-					cacheView(groupPrefix, groupResult)
 					_ = mergeIntoByPrefix(groupResult, result, prefix, strict)
 				}
 			}
 		} else {
-			groupResult, err := s.DBViewPrefixScan(groupPrefix, maxResults, false)
+			groupResult, err := s.refreshViewCache(groupPrefix, maxResults, true, s.DBViewPrefixScan)
 			if err == nil {
-				cacheView(groupPrefix, groupResult)
 				_ = mergeIntoByPrefix(groupResult, result, prefix, strict)
 			}
 		}
@@ -783,22 +847,21 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 				if _, loading := dbResultRefreshFlags.LoadOrStore(prefix, true); !loading {
 					go func() {
 						defer dbResultRefreshFlags.Delete(prefix)
-						if dbResult, err := s.DBViewPrefixScan(prefix, maxResults, strict); err == nil {
-							cacheView(prefix, dbResult)
-						}
+						_, _ = s.refreshViewCache(prefix, maxResults, strict, s.DBViewPrefixScan)
 					}()
 				}
 			}
 		}
 	} else {
-		dbResult, err := s.DBViewPrefixScan(prefix, maxResults, strict)
+		var dbResult map[string][]byte
+		var err error
+		if maxResults > 0 && !hasGroupLevel && keyType != KeyTypeStats && keyType != KeyTypeHostFailures {
+			dbResult, err = s.refreshViewCache(prefix, maxResults, strict, s.DBViewPrefixScan)
+		} else {
+			dbResult, err = s.DBViewPrefixScan(prefix, maxResults, strict)
+		}
 		if err != nil {
 			return result, nil
-		}
-		if maxResults > 0 && !hasGroupLevel {
-			if keyType != KeyTypeStats && keyType != KeyTypeHostFailures {
-				cacheView(prefix, dbResult)
-			}
 		}
 		for k, v := range dbResult {
 			if _, exists := result[k]; !exists {

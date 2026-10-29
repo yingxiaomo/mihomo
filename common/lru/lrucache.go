@@ -150,6 +150,38 @@ func (c *LruCache[K, V]) Set(key K, value V) {
 	c.set(key, value)
 }
 
+// SetIf evaluates the predicate and writes under the same cache lock. A rejected
+// write does not renew the old entry. The predicate must not call this cache.
+// The predicate observes the raw entry (including stale entries) and its expiry.
+func (c *LruCache[K, V]) SetIf(key K, value V, predicate func(V, time.Time, bool) bool) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var old V
+	var expires time.Time
+	el, found := c.cache[key]
+	if found {
+		old, expires = el.Value.value, time.Unix(el.Value.expires, 0)
+	}
+	if !predicate(old, expires, found) {
+		return false
+	}
+	c.set(key, value)
+	return true
+}
+
+// DeleteIf atomically removes an entry only if its current value matches.
+// The predicate must not call this cache.
+func (c *LruCache[K, V]) DeleteIf(key K, predicate func(V) bool) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, found := c.cache[key]
+	if !found || !predicate(el.Value.value) {
+		return false
+	}
+	c.delete(key)
+	return true
+}
+
 func (c *LruCache[K, V]) set(key K, value V) {
 	expires := int64(0)
 	if c.maxAge > 0 {
