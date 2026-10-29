@@ -43,14 +43,15 @@ func copySplice(source, destination syscall.RawConn, readCounters, writeCounters
 	for {
 		var readN int64
 		var readErr error
-		err = source.Read(func(fd uintptr) bool {
-			for {
-				readN, readErr = unix.Splice(int(fd), nil, pipeFDs[1], nil, maxCopySpliceSize, unix.SPLICE_F_NONBLOCK)
-				if readErr != unix.EINTR {
-					return readErr != unix.EAGAIN
+			err = source.Read(func(fd uintptr) bool {
+				for {
+					n, spliceErr := unix.Splice(int(fd), nil, pipeFDs[1], nil, maxCopySpliceSize, unix.SPLICE_F_NONBLOCK)
+					readN, readErr = int64(n), spliceErr
+					if readErr != unix.EINTR {
+						return readErr != unix.EAGAIN
+					}
 				}
-			}
-		})
+			})
 		if err != nil {
 			readErr = err
 		}

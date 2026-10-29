@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -155,8 +156,18 @@ func TestPLDRawCopyResetRecordsFailure(t *testing.T) {
 			if e := <-done; e != nil {
 				t.Fatal(e)
 			}
-			if n != callback.PPProbeBytes || callback.TransferError(err) == nil {
-				t.Fatalf("RST not reached: bytes=%d err=%v", n, err)
+			// Windows TCP RST discards the receive buffer (Linux retains it),
+			// so the copy may see fewer bytes than were sent before the RST.
+			// Accept any nonzero transfer with a transfer error on those
+			// platforms; require exact byte count elsewhere.
+			if runtime.GOOS == "windows" {
+				if n == 0 || callback.TransferError(err) == nil {
+					t.Fatalf("RST not reached: bytes=%d err=%v", n, err)
+				}
+			} else {
+				if n != callback.PPProbeBytes || callback.TransferError(err) == nil {
+					t.Fatalf("RST not reached: bytes=%d err=%v", n, err)
+				}
 			}
 			if e := tracker.Close(); e != nil {
 				t.Fatal(e)
