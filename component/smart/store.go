@@ -332,6 +332,7 @@ func (s *Store) FlushByLevel(level string, config string, group string) error {
 		}, false)
 	case "group":
 		s.DBBatchDeletePrefix([]string{
+			PLDKeyPrefix + escapeKeyPart(config) + ":" + escapeKeyPart(group) + ":",
 			FormatDBKey(KeyTypeStats, config, group),
 			FormatDBKey(KeyTypeNode, config, group),
 			FormatDBKey(KeyTypeRanking, config, group),

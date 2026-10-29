@@ -809,12 +809,15 @@ func (s *SmartPLD) WrapPacketConnWithMetric(pc C.PacketConn, proxy C.Proxy, meta
 	pc.AppendToChains(s)
 
 	var udpLatency atomic.Int64
+	var observedReadErr atomic.TypedValue[error]
+	var observedWriteErr atomic.TypedValue[error]
 
+	pc = callback.NewErrorCallBackPacketConn(pc, &observedReadErr, &observedWriteErr)
 	pc = callback.NewFirstReadCallBackPacketConn(pc, func(latency int64) {
 		udpLatency.Store(latency)
 	})
 
-	return s.registerPacketClosureMetricsCallback(pc, proxy, metadata, connectTime, &udpLatency)
+	return s.registerPacketClosureMetricsCallback(pc, proxy, metadata, connectTime, &udpLatency, &observedReadErr, &observedWriteErr)
 }
 
 func (s *SmartPLD) Set(name string) error {
@@ -1290,8 +1293,8 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		// unwrap stays pinned to a node that selectProxies will reject on
 		// every request, wasting a round-trip and causing brief stalls.
 		if s.usePLD {
-			if rec := s.getPLDRecord(target, old[0]); rec.SoftFailed() {
-				rew, _, _ := rec.ChannelStats(largeMode)
+			rec := s.getPLDRecord(target, old[0])
+			if rew, _, cnt := rec.ChannelStats(largeMode); cnt >= 2 && rew < 0 {
 				s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget)
 				log.Debugln("[PLD] Group: [%s] Target: [%s] unwrap refresh deleted soft-failed primary [%s] (reward=%.3f)",
 					s.Name(), target, old[0], rew)
@@ -1420,14 +1423,18 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		}
 		if allowSwitch {
 			s.markPrimarySwitch(target)
-			// Persist the switch: drop the old primary's unwrap entry so the
-			// next request re-ranks the full pool and stores the new primary.
-			// Without this, StoreUnwrapResult in DialContext silently drops the
-			// new primary's write (first-writer-wins: the old entry is still
-			// unexpired), the async refresh re-stores the old primary, and the
-			// switch never actually takes effect — the margin-based switch was
-			// structurally unable to displace a healthy primary.
-			s.store.DeleteUnwrapResult(s.Name(), s.configName, target)
+			// Persist the switch immediately: store the new primary in the
+			// unwrap cache so the next request's unwrap hit returns it.
+			// The previous approach (DeleteUnwrapResult only) left a window:
+			// the stale prefetch cache still had the old primary first, and
+			// the switch cooldown blocked re-switching, so the old primary
+			// was re-pinned on the very next request.
+			for _, p := range proxies {
+				if p.Name() == resultNames[0] {
+					s.store.StoreUnwrapResult(s.Name(), s.configName, target, []C.Proxy{p})
+					break
+				}
+			}
 		} else {
 			// 保持当前 primary：把 primary 移回首位（若它仍在候选里）
 			for i, n := range resultNames {
@@ -2544,6 +2551,10 @@ func (s *SmartPLD) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metad
 				} else {
 					closeErr = readErr
 				}
+			} else if writeErr != nil && writeErr != io.EOF {
+				// write-only error: the node refused our data even though we
+				// could still read from it — a real failure the old code missed
+				closeErr = writeErr
 			}
 
 			if closeErr != nil {
@@ -2556,7 +2567,7 @@ func (s *SmartPLD) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metad
 	})
 }
 
-func (s *SmartPLD) registerPacketClosureMetricsCallback(pc C.PacketConn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, udpLatency *atomic.Int64) C.PacketConn {
+func (s *SmartPLD) registerPacketClosureMetricsCallback(pc C.PacketConn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, udpLatency *atomic.Int64, observedReadErr *atomic.TypedValue[error], observedWriteErr *atomic.TypedValue[error]) C.PacketConn {
 	return callback.NewCloseCallbackPacketConn(pc, func() {
 		tracker := statistic.DefaultManager.Get(metadata.UUID)
 		if tracker != nil {
@@ -2567,8 +2578,20 @@ func (s *SmartPLD) registerPacketClosureMetricsCallback(pc C.PacketConn, proxy C
 			maxUploadRate := info.MaxUploadRate.Load()
 			maxDownloadRate := info.MaxDownloadRate.Load()
 
+			// derive closeErr from the full-lifecycle observers: UDP I/O
+			// errors were previously always nil, so real failures were
+			// recorded as successes
+			readErr := observedReadErr.Load()
+			writeErr := observedWriteErr.Load()
+			var closeErr error
+			if readErr != nil {
+				closeErr = readErr
+			} else if writeErr != nil && writeErr != io.EOF {
+				closeErr = writeErr
+			}
+
 			go s.recordConnectionStats(metadata, proxy, connectTime, udpLatency.Load(),
-				uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, nil, 0, nil, nil)
+				uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, nil, 0, closeErr, nil)
 			return
 		}
 	})
@@ -2769,12 +2792,17 @@ func (s *SmartPLD) evictStalePLDState() {
 			delete(s.pldRecordCache, key)
 		}
 	}
+	s.pldRecordMu.Unlock()
+
+	// lastSwitchAt is guarded by switchMu (not pldRecordMu) — the same mutex
+	// markPrimarySwitch uses. Using the wrong mutex here was a data race.
+	s.switchMu.Lock()
 	for t, at := range s.lastSwitchAt {
 		if at.Before(switchCutoff) {
 			delete(s.lastSwitchAt, t)
 		}
 	}
-	s.pldRecordMu.Unlock()
+	s.switchMu.Unlock()
 
 	s.store.EvictOldPLDRecords(cutoff)
 }

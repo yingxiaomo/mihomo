@@ -80,7 +80,11 @@ func (l *Listener) Close() error {
 	}
 	if l.tcpListener != nil {
 		if err := l.tcpListener.Close(); err != nil {
-			errs = append(errs, err)
+			// httpServer.Close() already closes the TCP listener it was
+			// given; a 'use of closed' error here is expected and not real
+			if !strings.Contains(err.Error(), "use of closed") {
+				errs = append(errs, err)
+			}
 		}
 	}
 	return errors.Join(errs...)

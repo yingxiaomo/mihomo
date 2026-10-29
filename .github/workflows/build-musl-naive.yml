@@ -119,7 +119,7 @@ jobs:
           # Map Go arch variants (amd64-v2/v3, arm5/6/7) back to the base
           # chromium target: they reuse one toolchain each.
           if [[ "$TARGET_ARCH" == amd64* ]]; then TARGET_ARCH="amd64"; fi
-          if [[ "$TARGET_ARCH" == arm* ]]; then TARGET_ARCH="arm"; fi
+          if [[ "$TARGET_ARCH" == arm5 || "$TARGET_ARCH" == arm6 || "$TARGET_ARCH" == arm7 ]]; then TARGET_ARCH="arm"; fi
           go run ./cmd/build-naive --target=linux/${TARGET_ARCH} --libc=musl download-toolchain
         shell: bash
 
@@ -129,7 +129,7 @@ jobs:
           cd ~/cronet-go
           TARGET_ARCH="${{ matrix.arch }}"
           if [[ "$TARGET_ARCH" == amd64* ]]; then TARGET_ARCH="amd64"; fi
-          if [[ "$TARGET_ARCH" == arm* ]]; then TARGET_ARCH="arm"; fi
+          if [[ "$TARGET_ARCH" == arm5 || "$TARGET_ARCH" == arm6 || "$TARGET_ARCH" == arm7 ]]; then TARGET_ARCH="arm"; fi
           go run ./cmd/build-naive --target=linux/${TARGET_ARCH} --libc=musl env >> $GITHUB_ENV
         shell: bash
 
