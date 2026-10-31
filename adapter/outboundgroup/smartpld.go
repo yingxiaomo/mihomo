@@ -2255,9 +2255,27 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	}
 	err = callback.TransferError(err)
 	// A local cancellation before any response is a neutral lifecycle event.
-	// Phase 1: neutral closes still contribute their metric observation
-	// (AttemptCount, ConnectEMA) — only the reward mutation is skipped.
 	neutralClose := pldFailureLatched.localClose && !pldFailureLatched.failed && err == nil && downloadTotal == 0
+
+	// Phase 1: neutral closes still contribute AttemptCount and ConnectEMA
+	// (via ObserveMetrics) so the metric denominator is consistent across
+	// all settlement types. The quality check, PLD reward mutation, and
+	// host strikes are skipped — a local close is not a node failure.
+	if neutralClose && s.usePLD && metadata.SmartTarget != "" {
+		tgt := metadata.SmartTarget
+		rec := s.getPLDRecord(tgt, proxy.Name())
+		rec.ObserveMetrics(smart.RewardedMetrics{
+			ConnectTimeMs: connectTime,
+			Failed:        false,
+		})
+		s.savePLDRecord(tgt, proxy.Name(), rec)
+	}
+
+	// A local cancellation before any response is a neutral lifecycle event:
+	// skip quality check, PLD reward, and host strikes below.
+	if neutralClose {
+		return
+	}
 
 	if proxy.Type() == C.Compatible || proxy.Type() == C.Reject || proxy.Type() == C.Pass || proxy.Type() == C.RejectDrop {
 		return
