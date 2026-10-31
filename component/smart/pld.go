@@ -58,6 +58,7 @@ type RewardedMetrics struct {
 	DurationSec   float64
 	MaxDownloadKB float64 // peak KB/s
 	LossRate      float64
+	LossValid     bool  // true when TCP stats were available for this connection
 	Failed        bool
 }
 
@@ -374,21 +375,24 @@ func (r *PLDRecord) ObserveMetrics(m RewardedMetrics) {
 	}
 
 	// ConnectionTTFR: time from conn wrap install to first successful
-	// downlink byte. Valid whenever a first byte arrived — the connection's
-	// ultimate outcome does not invalidate this observation. EOF and read
-	// errors mean no valid first-byte sample (FirstByteMs stays 0).
-	if m.FirstByteMs > 0 {
+	// downlink byte. Valid only when actual downlink data was received —
+	// a zero-byte EOF or error read still sets firstReadLatency > 0 (the
+	// read callback quantizes to >=1ms) but does not represent a valid
+	// "time to first response." DownloadMB > 0 confirms bytes arrived.
+	// The connection's ultimate outcome does not invalidate this
+	// observation: a connection that received its first byte on time and
+	// then failed mid-transfer still has a valid TTFR measurement.
+	if m.FirstByteMs > 0 && m.DownloadMB > 0 {
 		newT, _, tCnt := UpdateRewardEMA(r.ConnectionTTFR_EMA, 0, r.ConnectionTTFR_Cnt, float64(m.FirstByteMs))
 		r.ConnectionTTFR_EMA, r.ConnectionTTFR_Cnt = newT, tCnt
 	}
 
-	// Loss rate: valid only for non-UDP large transfers. UDP does not carry
-	// TCP-style loss tracking; a zero LossRate on UDP means "not measured,"
-	// not "no loss." Small transfers do not carry meaningful loss either.
-	// Failed large transfers may still have valid partial loss observations
-	// (partial success semantics), but the current loss measurement from
-	// TCP stats requires a live connection — skip failed connections.
-	if !m.SmallFlow() && !m.Failed && !m.IsUDP {
+	// Loss rate: valid only when TCP stats were actually available for this
+	// connection. UDP connections and connections where the tracker doesn't
+	// implement net.Conn have no TCP loss measurement — a zero LossRate in
+	// those cases means "not measured," not "no loss." TCP connections with
+	// measurable zero loss ARE valid observations.
+	if !m.SmallFlow() && m.LossValid {
 		newL, _, lCnt := UpdateRewardEMA(r.LossEMA, 0, r.LossCnt, m.LossRate)
 		r.LossEMA, r.LossCnt = newL, lCnt
 	}

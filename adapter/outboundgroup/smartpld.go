@@ -2425,6 +2425,7 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 			DurationSec:   float64(connectionDuration) / 1000.0,
 			MaxDownloadKB: maxDownloadRateKB,
 			LossRate:      lossRate,
+			LossValid:     tcpStats != nil,
 			Failed:        connectionFailed,
 		}
 		if pldFailureLatched.failed {
