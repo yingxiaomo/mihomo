@@ -244,9 +244,15 @@ func (s *Store) ForceStoreUnwrapResult(group, config string, target string, prox
 // where a stale request's ForceStore would overwrite a newer primary stored
 // by a concurrent request. expectedVersion == 0 means "no prior observation"
 // (fresh computation) — in that case, store unconditionally.
-func (s *Store) CASStoreUnwrapResult(group, config string, target string, proxies []C.Proxy, expectedVersion uint64) {
+// CASStoreUnwrapResult atomically replaces the unwrap result only if the
+// currently stored version matches expectedVersion. Returns true when the
+// write succeeded (the caller should consume the switch cooldown only on
+// success). expectedVersion == 0 means "no prior observation" (fresh
+// computation) — in that case, store only if no entry was created by a
+// concurrent request between our observation and now.
+func (s *Store) CASStoreUnwrapResult(group, config string, target string, proxies []C.Proxy, expectedVersion uint64) bool {
 	if target == "" || len(proxies) == 0 {
-		return
+		return false
 	}
 	names := make([]string, len(proxies))
 	for i, p := range proxies {
@@ -258,12 +264,11 @@ func (s *Store) CASStoreUnwrapResult(group, config string, target string, proxie
 		// concurrent request between our observation and now. Prevents
 		// a stale fresh-computation result from overwriting a newer
 		// primary stored by a concurrent switch or renewal.
-		unwrapCache.SetIf(targetKey, UnwrapMap{Proxies: names, Version: unwrapVersion.Add(1)}, func(_ UnwrapMap, _ time.Time, found bool) bool {
+		return unwrapCache.SetIf(targetKey, UnwrapMap{Proxies: names, Version: unwrapVersion.Add(1)}, func(_ UnwrapMap, _ time.Time, found bool) bool {
 			return !found
 		})
-		return
 	}
-	unwrapCache.SetIf(targetKey, UnwrapMap{Proxies: names, Version: unwrapVersion.Add(1)}, func(existing UnwrapMap, _ time.Time, _ bool) bool {
+	return unwrapCache.SetIf(targetKey, UnwrapMap{Proxies: names, Version: unwrapVersion.Add(1)}, func(existing UnwrapMap, _ time.Time, _ bool) bool {
 		return existing.Version == expectedVersion
 	})
 }

@@ -1372,15 +1372,15 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 			}
 		}
 		if allowSwitch {
-			s.markPrimarySwitch(target)
 			// Atomically replace the primary: CAS on the observed unwrap
-			// version. If another request has already replaced the primary
-			// (version mismatch), this switch's write is dropped — the
-			// latest decision wins. This closes the race where R1's stale
-			// ForceStore would overwrite R2's newer primary.
+			// version. Only consume the switch cooldown if the CAS succeeded —
+			// a failed CAS means another request already changed the primary,
+			// and the next request will evaluate fresh against that primary.
 			for _, p := range proxies {
 				if p.Name() == resultNames[0] {
-					s.store.CASStoreUnwrapResult(s.Name(), s.configName, target, []C.Proxy{p}, observedUnwrapVersion)
+					if s.store.CASStoreUnwrapResult(s.Name(), s.configName, target, []C.Proxy{p}, observedUnwrapVersion) {
+						s.markPrimarySwitch(target)
+					}
 					break
 				}
 			}
