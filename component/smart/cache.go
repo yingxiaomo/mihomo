@@ -239,6 +239,29 @@ func (s *Store) ForceStoreUnwrapResult(group, config string, target string, prox
 	unwrapCache.Set(FormatDBKey(config, group, target), UnwrapMap{Proxies: names, Version: unwrapVersion.Add(1)})
 }
 
+// CASStoreUnwrapResult atomically replaces the unwrap result only if the
+// currently stored version matches expectedVersion. This closes the race
+// where a stale request's ForceStore would overwrite a newer primary stored
+// by a concurrent request. expectedVersion == 0 means "no prior observation"
+// (fresh computation) — in that case, store unconditionally.
+func (s *Store) CASStoreUnwrapResult(group, config string, target string, proxies []C.Proxy, expectedVersion uint64) {
+	if target == "" || len(proxies) == 0 {
+		return
+	}
+	names := make([]string, len(proxies))
+	for i, p := range proxies {
+		names[i] = p.Name()
+	}
+	targetKey := FormatDBKey(config, group, target)
+	if expectedVersion == 0 {
+		unwrapCache.Set(targetKey, UnwrapMap{Proxies: names, Version: unwrapVersion.Add(1)})
+		return
+	}
+	unwrapCache.SetIf(targetKey, UnwrapMap{Proxies: names, Version: unwrapVersion.Add(1)}, func(existing UnwrapMap, _ time.Time, _ bool) bool {
+		return existing.Version == expectedVersion
+	})
+}
+
 // GetUnwrapSnapshot captures the identity checked by asynchronous refresh. The
 // proxy names alone are not an identity: a new write of A must survive old A work.
 func (s *Store) GetUnwrapSnapshot(group, config, target string) (UnwrapMap, bool) {

@@ -591,7 +591,26 @@ func (s *SmartPLD) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 		}
 	}
 
+	pool := proxies
 	proxies, _ = s.selectProxies(metadata, proxies)
+
+	// Empty-candidate contract: when every node is filtered out (e.g. all
+	// TCP-only for a UDP request, or all soft-failed/cooled), selectProxies
+	// returns empty. Fall back to the first alive proxy from the raw pool —
+	// the connection will likely fail at the transport level, but the group
+	// and tracking remain consistent and the kernel does not panic.
+	if len(proxies) == 0 {
+		log.Debugln("[PLD] Group: [%s] Target: [%s] all candidates filtered, falling back to raw pool",
+			s.Name(), metadata.SmartTarget)
+		for _, p := range pool {
+			if p.AliveForTestUrl(s.testUrl) {
+				return p
+			}
+		}
+		if len(pool) > 0 {
+			return pool[0]
+		}
+	}
 
 	return proxies[0]
 }
@@ -740,7 +759,8 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 					// stream, and a false positive would cool down healthy
 					// nodes on quiet targets.
 					rec := s.getPLDRecord(target, proxy.Name())
-					rec.RecordStall()
+				rec.RecordStall()
+					s.savePLDRecord(target, proxy.Name(), rec)
 					log.Infoln("%s", fmt.Sprintf("[PLD] Group: [%s] Node: [%s] Target: [%s] header-then-stall suspected (%d bytes up, %d bytes down, no progress for %s)",
 						s.Name(), proxy.Name(), target, upload1, download1, time.Since(firstSample).Round(time.Second)))
 					return
@@ -1235,7 +1255,7 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 	// selectProxies 的实时 D-UCB 排名可能不一致，用它换人会让 primary 与
 	// PLD 决策脱节；primary 的变更只由 失败信号（冷却/block 排除）或
 	// selectProxies 的滞回切换（领先 ≥switch-margin）驱动。
-	trySelector := func(isUDP bool) ([]string, []float64, bool) {
+	trySelector := func(isUDP bool) ([]string, []float64, bool, uint64) {
 		// 检查匹配缓存
 		if snapshot, expired, ok := s.store.GetUnwrapSnapshotWithExpiry(s.Name(), s.configName, target); ok && len(snapshot.Proxies) > 0 {
 			if expired {
@@ -1243,14 +1263,14 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 				// before scheduling; refresh never reads a later primary as old work.
 				go s.refreshUnwrapCache(isUDP, largeMode, target, snapshot)
 			}
-			return append([]string(nil), snapshot.Proxies...), nil, true
+			return append([]string(nil), snapshot.Proxies...), nil, true, snapshot.Version
 		}
 		names, weights := computeFreshNodes(isUDP)
-		return names, weights, false
+		return names, weights, false, 0
 	}
 
 	isUDP := metadata.NetWork == C.UDP
-	resultNames, resultWeights, pinned := trySelector(isUDP)
+	resultNames, resultWeights, pinned, observedUnwrapVersion := trySelector(isUDP)
 
 	// Single-candidate deadlock fix: an unwrap hit returns only the pinned
 	// primary, which starves every downstream mechanism — PLD re-rank has no
@@ -1353,13 +1373,14 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		}
 		if allowSwitch {
 			s.markPrimarySwitch(target)
-			// Atomically replace the primary: StoreUnwrapResult has a
-			// first-writer-wins guard that silently drops writes when the
-			// old entry is unexpired — ForceStoreUnwrapResult bypasses that
-			// guard to guarantee the new primary is persisted.
+			// Atomically replace the primary: CAS on the observed unwrap
+			// version. If another request has already replaced the primary
+			// (version mismatch), this switch's write is dropped — the
+			// latest decision wins. This closes the race where R1's stale
+			// ForceStore would overwrite R2's newer primary.
 			for _, p := range proxies {
 				if p.Name() == resultNames[0] {
-					s.store.ForceStoreUnwrapResult(s.Name(), s.configName, target, []C.Proxy{p})
+					s.store.CASStoreUnwrapResult(s.Name(), s.configName, target, []C.Proxy{p}, observedUnwrapVersion)
 					break
 				}
 			}

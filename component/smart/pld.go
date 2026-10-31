@@ -296,6 +296,7 @@ type PLDRecord struct {
 	LossCnt             int64   `json:"loss_cnt,omitempty"`               // valid loss observations
 	SuspectedStallCount int64   `json:"suspected_stall_count,omitempty"`  // header-then-stall observations (not confirmed failures)
 	AttemptCount        int64   `json:"attempt_count,omitempty"`          // completed connection settlements (denominator for stall rate)
+	FailureCount        int64   `json:"failure_count,omitempty"`          // hard failures charged to this record
 }
 
 // FailureCooldownDefaultSec is the default cool-off window (seconds) applied
@@ -317,6 +318,7 @@ func (r *PLDRecord) FillFailure(cooldownSec int64) {
 // fillFailureLocked is the unlocked body of FillFailure — callers must hold
 // r.mu (sync.Mutex is not reentrant: UpdateWithMetrics already holds it).
 func (r *PLDRecord) fillFailureLocked(cooldownSec int64) {
+	r.FailureCount++
 	rew := -2.0
 	newR, newVar, newCnt := UpdateRewardEMA(r.Reward, r.RewardVar, r.SampleCount, rew)
 	r.Reward, r.RewardVar, r.SampleCount = newR, newVar, newCnt
@@ -452,6 +454,12 @@ func (r *PLDRecord) ScenarioScore(large bool) float64 {
 			return neutral
 		}
 		score := sum/weights*(1.0-stallRate) + stallRate*0.0
+		if r.SampleCount >= 2 {
+			failureRate := math.Min(1.0, float64(r.FailureCount)/float64(r.SampleCount))
+			if failureRate > 0.3 {
+				score *= (1.0 - failureRate*0.5)
+			}
+		}
 		return math.Min(1.0, math.Max(0.0, score))
 	}
 
@@ -472,6 +480,16 @@ func (r *PLDRecord) ScenarioScore(large bool) float64 {
 		return neutral
 	}
 	score := sum/weights*(1.0-stallRate) + stallRate*0.0
+	// Success rate factor: a node with a high failure rate gets penalized
+	// regardless of individual metric quality. A fast connect to a node
+	// that doesn't deliver responses is not a good node — the raw metrics
+	// cannot express this without incorporating the outcome.
+	if r.SampleCount >= 2 {
+		failureRate := math.Min(1.0, float64(r.FailureCount)/float64(r.SampleCount))
+		if failureRate > 0.3 {
+			score = score * (1.0 - failureRate*0.5)
+		}
+	}
 	return math.Min(1.0, math.Max(0.0, score))
 }
 
