@@ -455,7 +455,7 @@ func (r *PLDRecord) ScenarioScore(large bool) float64 {
 		}
 		score := sum/weights*(1.0-stallRate) + stallRate*0.0
 		if r.SampleCount >= 2 {
-			failureRate := math.Min(1.0, float64(r.FailureCount)/float64(r.SampleCount))
+			failureRate := math.Min(1.0, float64(r.FailureCount)/float64(max(r.AttemptCount, 1)))
 			if failureRate > 0.3 {
 				score *= (1.0 - failureRate*0.5)
 			}
@@ -485,7 +485,7 @@ func (r *PLDRecord) ScenarioScore(large bool) float64 {
 	// that doesn't deliver responses is not a good node — the raw metrics
 	// cannot express this without incorporating the outcome.
 	if r.SampleCount >= 2 {
-		failureRate := math.Min(1.0, float64(r.FailureCount)/float64(r.SampleCount))
+		failureRate := math.Min(1.0, float64(r.FailureCount)/float64(max(r.AttemptCount, 1)))
 		if failureRate > 0.3 {
 			score = score * (1.0 - failureRate*0.5)
 		}

@@ -2255,9 +2255,9 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	}
 	err = callback.TransferError(err)
 	// A local cancellation before any response is a neutral lifecycle event.
-	if pldFailureLatched.localClose && !pldFailureLatched.failed && err == nil && downloadTotal == 0 {
-		return
-	}
+	// Phase 1: neutral closes still contribute their metric observation
+	// (AttemptCount, ConnectEMA) — only the reward mutation is skipped.
+	neutralClose := pldFailureLatched.localClose && !pldFailureLatched.failed && err == nil && downloadTotal == 0
 
 	if proxy.Type() == C.Compatible || proxy.Type() == C.Reject || proxy.Type() == C.Pass || proxy.Type() == C.RejectDrop {
 		return
@@ -2455,6 +2455,12 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 			// scalar reward, but skip the second record mutation so one
 			// connection produces exactly one outcome in the online state.
 			rm.Failed = true
+			r, parts = smart.ComputeRewardDetail(rm)
+		} else if neutralClose {
+			// locally cancelled after a successful dial, zero downlink: the
+			// reward stays neutral but the observation still runs (AttemptCount,
+			// ConnectEMA) so the metric has the same denominator as all other
+			// settlements
 			r, parts = smart.ComputeRewardDetail(rm)
 		} else {
 			r, parts = rec.UpdateWithMetrics(rm, s.failureCooldownSec())

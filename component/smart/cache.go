@@ -254,7 +254,13 @@ func (s *Store) CASStoreUnwrapResult(group, config string, target string, proxie
 	}
 	targetKey := FormatDBKey(config, group, target)
 	if expectedVersion == 0 {
-		unwrapCache.Set(targetKey, UnwrapMap{Proxies: names, Version: unwrapVersion.Add(1)})
+		// Fresh computation: only store if no entry was created by a
+		// concurrent request between our observation and now. Prevents
+		// a stale fresh-computation result from overwriting a newer
+		// primary stored by a concurrent switch or renewal.
+		unwrapCache.SetIf(targetKey, UnwrapMap{Proxies: names, Version: unwrapVersion.Add(1)}, func(_ UnwrapMap, _ time.Time, found bool) bool {
+			return !found
+		})
 		return
 	}
 	unwrapCache.SetIf(targetKey, UnwrapMap{Proxies: names, Version: unwrapVersion.Add(1)}, func(existing UnwrapMap, _ time.Time, _ bool) bool {
