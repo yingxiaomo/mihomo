@@ -52,14 +52,21 @@ func UpdateRewardEMA(mean, variance float64, count int64, reward float64) (float
 type RewardedMetrics struct {
 	IsUDP         bool
 	ConnectTimeMs int64 // full proxy dial (incl handshake)
-	FirstByteMs   int64 // end-to-end time to first response byte (TTFR)
+	FirstByteMs   int64 // legacy first-read latency used by reward/training (unchanged)
 	BytesTo64KMs  int64 // ms from first byte to 64KiB received (packet-pair)
 	DownloadMB    float64
 	DurationSec   float64
 	MaxDownloadKB float64 // peak KB/s
 	LossRate      float64
-	LossValid     bool  // true when TCP stats were available for this connection
+	LossValid     bool // true when TCP stats were available for this connection
 	Failed        bool
+
+	// Shadow-only, explicitly valid raw observations; never reward/model inputs.
+	// Separate validity permits real sub-millisecond/zero-duration observations.
+	TCPConnectionTTFRMs    float64 // TCP wrapper install → first positive downlink
+	TCPConnectionTTFRValid bool
+	UDPResponseMs          float64 // UDP first payload send → first positive response
+	UDPResponseValid       bool
 }
 
 // SmallTransferKB is the threshold below which a transfer is treated as
@@ -288,15 +295,21 @@ type PLDRecord struct {
 	// connection may still have a valid connect time but no valid TTFR or
 	// throughput observation. Shadow only in Phase 1: these fields are
 	// written and exposed via /cache/smart/pld, but do not affect selection.
-	ConnectEMA          float64 `json:"connect_ema,omitempty"`           // EMA of outbound dial path duration (ms)
-	ConnectCnt          int64   `json:"connect_cnt,omitempty"`            // completed dial observations
-	ConnectionTTFR_EMA  float64 `json:"conn_ttfr_ema,omitempty"`          // EMA: wrap install → first successful downlink byte (ms)
-	ConnectionTTFR_Cnt  int64   `json:"conn_ttfr_cnt,omitempty"`          // valid first-byte observations
-	LossEMA             float64 `json:"loss_ema,omitempty"`               // EMA of loss rate on large transfers with TCP stats
-	LossCnt             int64   `json:"loss_cnt,omitempty"`               // valid loss observations
-	SuspectedStallCount int64   `json:"suspected_stall_count,omitempty"`  // header-then-stall observations (not confirmed failures)
-	AttemptCount        int64   `json:"attempt_count,omitempty"`          // completed connection settlements (denominator for stall rate)
-	FailureCount        int64   `json:"failure_count,omitempty"`          // hard failures charged to this record
+	ConnectEMA float64 `json:"connect_ema,omitempty"` // EMA of outbound dial path duration (ms)
+	ConnectCnt int64   `json:"connect_cnt,omitempty"` // completed dial observations
+	// Historical mixed TCP/UDP observations: preserved, frozen, not scored.
+	ConnectionTTFR_EMA float64 `json:"conn_ttfr_ema,omitempty"`
+	ConnectionTTFR_Cnt int64   `json:"conn_ttfr_cnt,omitempty"`
+	// New transport-specific fields start empty for every pre-split record.
+	TCPConnectionTTFR_EMA float64 `json:"tcp_conn_ttfr_ema,omitempty"`
+	TCPConnectionTTFR_Cnt int64   `json:"tcp_conn_ttfr_cnt,omitempty"`
+	UDPResponseEMA        float64 `json:"udp_response_ema,omitempty"`
+	UDPResponseCnt        int64   `json:"udp_response_cnt,omitempty"`
+	LossEMA               float64 `json:"loss_ema,omitempty"`              // EMA of loss rate on large transfers with TCP stats
+	LossCnt               int64   `json:"loss_cnt,omitempty"`              // valid loss observations
+	SuspectedStallCount   int64   `json:"suspected_stall_count,omitempty"` // header-then-stall observations (not confirmed failures)
+	AttemptCount          int64   `json:"attempt_count,omitempty"`         // completed connection settlements (denominator for stall rate)
+	FailureCount          int64   `json:"failure_count,omitempty"`         // hard failures charged to this record
 }
 
 // FailureCooldownDefaultSec is the default cool-off window (seconds) applied
@@ -361,8 +374,8 @@ func (r *PLDRecord) SoftFailed() bool {
 // of the reward channels. Called exactly once per connection settlement from
 // recordConnectionStats, after reward and failure processing. Each metric
 // updates only when the observation is valid for that metric type.
-// This method is idempotent per connection: recordConnectionStats is called
-// once per completed connection settlement.
+// Deduplication belongs to recordConnectionStats's connection outcome, not
+// this aggregate: calling ObserveMetrics twice would count two settlements.
 func (r *PLDRecord) ObserveMetrics(m RewardedMetrics) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -376,17 +389,16 @@ func (r *PLDRecord) ObserveMetrics(m RewardedMetrics) {
 		r.ConnectEMA, r.ConnectCnt = newC, cCnt
 	}
 
-	// ConnectionTTFR: time from conn wrap install to first successful
-	// downlink byte. Valid only when actual downlink data was received —
-	// a zero-byte EOF or error read still sets firstReadLatency > 0 (the
-	// read callback quantizes to >=1ms) but does not represent a valid
-	// "time to first response." DownloadMB > 0 confirms bytes arrived.
-	// The connection's ultimate outcome does not invalidate this
-	// observation: a connection that received its first byte on time and
-	// then failed mid-transfer still has a valid TTFR measurement.
-	if m.FirstByteMs > 0 && m.DownloadMB > 0 {
-		newT, _, tCnt := UpdateRewardEMA(r.ConnectionTTFR_EMA, 0, r.ConnectionTTFR_Cnt, float64(m.FirstByteMs))
-		r.ConnectionTTFR_EMA, r.ConnectionTTFR_Cnt = newT, tCnt
+	// Do not infer shadow validity from the legacy timer or aggregate bytes:
+	// first-read callbacks include zero-byte errors and pre-send UDP data.
+	// A valid earlier byte survives terminal failure; zero ms can be valid.
+	if !m.IsUDP && m.TCPConnectionTTFRValid && validShadowDuration(m.TCPConnectionTTFRMs) {
+		newT, _, tCnt := UpdateRewardEMA(r.TCPConnectionTTFR_EMA, 0, r.TCPConnectionTTFR_Cnt, m.TCPConnectionTTFRMs)
+		r.TCPConnectionTTFR_EMA, r.TCPConnectionTTFR_Cnt = newT, tCnt
+	}
+	if m.IsUDP && m.UDPResponseValid && validShadowDuration(m.UDPResponseMs) {
+		newT, _, tCnt := UpdateRewardEMA(r.UDPResponseEMA, 0, r.UDPResponseCnt, m.UDPResponseMs)
+		r.UDPResponseEMA, r.UDPResponseCnt = newT, tCnt
 	}
 
 	// Loss rate: valid only when TCP stats were actually available for this
@@ -394,10 +406,27 @@ func (r *PLDRecord) ObserveMetrics(m RewardedMetrics) {
 	// implement net.Conn have no TCP loss measurement — a zero LossRate in
 	// those cases means "not measured," not "no loss." TCP connections with
 	// measurable zero loss ARE valid observations.
-	if !m.SmallFlow() && m.LossValid {
+	if !m.IsUDP && !m.SmallFlow() && m.LossValid {
 		newL, _, lCnt := UpdateRewardEMA(r.LossEMA, 0, r.LossCnt, m.LossRate)
 		r.LossEMA, r.LossCnt = newL, lCnt
 	}
+}
+
+// ObserveUDPResponse completes a confirmed pending-send shadow observation
+// after the one-time connection settlement. It deliberately changes no reward,
+// attempt, failure, connect, training or policy state.
+func (r *PLDRecord) ObserveUDPResponse(ms float64) {
+	if !validShadowDuration(ms) {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	newT, _, count := UpdateRewardEMA(r.UDPResponseEMA, 0, r.UDPResponseCnt, ms)
+	r.UDPResponseEMA, r.UDPResponseCnt = newT, count
+}
+
+func validShadowDuration(ms float64) bool {
+	return ms >= 0 && !math.IsNaN(ms) && !math.IsInf(ms, 0)
 }
 
 // RecordStall increments the suspected stall counter. Called from the
@@ -417,7 +446,9 @@ func (r *PLDRecord) RecordStall() {
 //
 // large=true selects the throughput-focused formula (sustained throughput,
 // loss, stalls); large=false selects the latency-focused formula (connect
-// speed, first response, stalls). Returns 0.5 (neutral) when there are
+// speed, TCP wrapper-to-first-downlink, stalls). UDP response remains a
+// separate raw diagnostic, not a component of this TCP-oriented score.
+// Returns 0.5 (neutral) when there are
 // fewer than 2 attempts (not enough observations for a meaningful score).
 func (r *PLDRecord) ScenarioScore(large bool) float64 {
 	r.mu.Lock()
@@ -435,7 +466,7 @@ func (r *PLDRecord) ScenarioScore(large bool) float64 {
 	stallRate := math.Min(1.0, float64(r.SuspectedStallCount)/float64(r.AttemptCount))
 
 	if !large {
-		if r.ConnectCnt == 0 && r.ConnectionTTFR_Cnt == 0 {
+		if r.ConnectCnt == 0 && r.TCPConnectionTTFR_Cnt == 0 {
 			return neutral
 		}
 		// Only include metrics with actual observations — a zero-valued
@@ -446,8 +477,8 @@ func (r *PLDRecord) ScenarioScore(large bool) float64 {
 			sum += 0.5 * (1.0 / (1.0 + r.ConnectEMA/500.0))
 			weights += 0.5
 		}
-		if r.ConnectionTTFR_Cnt > 0 {
-			sum += 0.5 * (1.0 / (1.0 + r.ConnectionTTFR_EMA/500.0))
+		if r.TCPConnectionTTFR_Cnt > 0 {
+			sum += 0.5 * (1.0 / (1.0 + r.TCPConnectionTTFR_EMA/500.0))
 			weights += 0.5
 		}
 		if weights == 0 {
@@ -621,18 +652,17 @@ func escapeKeyPart(s string) string {
 	return strings.ReplaceAll(s, ":", "%3A")
 }
 
-
 // PLDKeyState pairs one persisted PLDRecord with its storage-key parts for the
 // /cache/smart/pld debug endpoint: the record is what selection reads, the parts
 // identify which (config, group, target, node) it belongs to.
 type PLDKeyState struct {
-	Config        string     `json:"config"`
-	Group         string     `json:"group"`
-	Target        string     `json:"target"`
-	Node          string     `json:"node"`
-	Record        *PLDRecord `json:"record"`
-	SmallScore    float64    `json:"small_score"`    // ScenarioScore(false) — latency-focused
-	LargeScore    float64    `json:"large_score"`    // ScenarioScore(true) — throughput-focused
+	Config     string     `json:"config"`
+	Group      string     `json:"group"`
+	Target     string     `json:"target"`
+	Node       string     `json:"node"`
+	Record     *PLDRecord `json:"record"`
+	SmallScore float64    `json:"small_score"` // ScenarioScore(false) — latency-focused
+	LargeScore float64    `json:"large_score"` // ScenarioScore(true) — throughput-focused
 }
 
 // MarshalJSON snapshots the record under its lock so a concurrent mutation

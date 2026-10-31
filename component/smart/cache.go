@@ -240,11 +240,6 @@ func (s *Store) ForceStoreUnwrapResult(group, config string, target string, prox
 }
 
 // CASStoreUnwrapResult atomically replaces the unwrap result only if the
-// currently stored version matches expectedVersion. This closes the race
-// where a stale request's ForceStore would overwrite a newer primary stored
-// by a concurrent request. expectedVersion == 0 means "no prior observation"
-// (fresh computation) — in that case, store unconditionally.
-// CASStoreUnwrapResult atomically replaces the unwrap result only if the
 // currently stored version matches expectedVersion. Returns true when the
 // write succeeded (the caller should consume the switch cooldown only on
 // success). expectedVersion == 0 means "no prior observation" (fresh
@@ -350,6 +345,7 @@ func invalidateNodeCaches(group, config string, nodes map[string]struct{}) {
 }
 
 func (s *Store) UpdateBlockedNodesCache(group, config string, updates map[string]*NodeState) {
+	token := beginView(FormatDBKey(KeyTypeNode, config, group))
 	cacheKey := FormatDBKey(config, group)
 	blocked, _, _ := blockedNodesCache.GetWithExpire(cacheKey)
 
@@ -371,14 +367,32 @@ func (s *Store) UpdateBlockedNodesCache(group, config string, updates map[string
 		}
 	}
 
-	blockedNodesCache.Set(cacheKey, newBlocked)
+	if s.beforeBlockedNodesUpdatePublish != nil {
+		s.beforeBlockedNodesUpdatePublish()
+	}
+	publishBlockedNodes(token, cacheKey, newBlocked)
 }
 
-func (s *Store) loadBlockedNodes(group, config string) map[string]bool {
+// The outer consumer keeps its source token until the final derived Set: a
+// guarded GetNodeStates alone cannot protect work done after that call returns.
+func publishBlockedNodes(token *writeGeneration, key string, nodes map[string]bool) bool {
+	storeBarrier.RLock()
+	defer storeBarrier.RUnlock()
+	if token != nil && token.invalid.Load() {
+		return false
+	}
+	blockedNodesCache.Set(key, nodes)
+	return true
+}
+
+func (s *Store) loadBlockedNodes(group, config string, token *writeGeneration) map[string]bool {
 	cacheKey := FormatDBKey(config, group)
 	stateData, err := s.GetNodeStates(group, config)
 	if err != nil {
 		return nil
+	}
+	if s.afterBlockedNodesLoad != nil {
+		s.afterBlockedNodesLoad()
 	}
 	now := time.Now().Unix()
 	blockedNodes := make(map[string]bool)
@@ -392,24 +406,27 @@ func (s *Store) loadBlockedNodes(group, config string) map[string]bool {
 		}
 	}
 
-	blockedNodesCache.Set(cacheKey, blockedNodes)
+	if !publishBlockedNodes(token, cacheKey, blockedNodes) {
+		return nil
+	}
 	return blockedNodes
 }
 
 func (s *Store) GetBlockedNodes(group, config string) map[string]bool {
+	token := beginView(FormatDBKey(KeyTypeNode, config, group))
 	cacheKey := FormatDBKey(config, group)
 	if cached, expireTime, ok := blockedNodesCache.GetWithExpire(cacheKey); ok {
 		if expireTime.Before(time.Now()) {
 			if _, loading := blockedNodesRefreshFlags.LoadOrStore(cacheKey, true); !loading {
 				go func() {
 					defer blockedNodesRefreshFlags.Delete(cacheKey)
-					s.loadBlockedNodes(group, config)
+					s.loadBlockedNodes(group, config, token)
 				}()
 			}
 		}
 		return cached
 	}
-	return s.loadBlockedNodes(group, config)
+	return s.loadBlockedNodes(group, config, token)
 }
 
 func (s *Store) AdjustCacheParameters() {
@@ -476,6 +493,7 @@ func (s *Store) clearCache(level string, config string, group string) {
 			dbResultCache.Delete(prefix)
 			dbResultCache.RemoveByKeyPrefix(prefix + "/")
 		}
+		blockedNodesCache.Delete(FormatDBKey(config))
 		blockedNodesCache.RemoveByKeyPrefix(FormatDBKey(config) + "/")
 		hostStatusCache.RemoveByKeyPrefix(FormatDBKey(KeyTypeHostFailures, config) + "/")
 	} else if level == "group" {
@@ -486,6 +504,7 @@ func (s *Store) clearCache(level string, config string, group string) {
 			dbResultCache.Delete(FormatDBKey(kt, config, group))
 		}
 		blockedNodesCache.Delete(groupKey)
+		blockedNodesCache.Delete(FormatDBKey(config)) // config ancestor includes this group
 		hostStatusCache.RemoveByKeyPrefix(FormatDBKey(KeyTypeHostFailures, config, group) + "/")
 	}
 }

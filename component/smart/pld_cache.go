@@ -1,12 +1,15 @@
 package smart
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 	"weak"
+
+	"github.com/metacubex/bbolt"
 )
 
 // Lock order: storeBarrier -> PLDCache.mu -> PLDRecord.mu -> bbolt. Flush and
@@ -173,19 +176,153 @@ func (c *PLDCache) Nodes() []string {
 	return result
 }
 
+// pldWrites is ordered after live-record locks and before DB transactions.
+// It retains only written keys; eviction and scoped invalidation remove them.
+var pldWrites struct {
+	mu       sync.Mutex
+	next     uint64
+	versions map[string]uint64
+}
+
 func (c *PLDCache) Evict(cutoff int64, switchCutoff time.Time) {
-	storeBarrier.RLock()
-	defer storeBarrier.RUnlock()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for key, r := range c.records {
-		if r.GetLastUpdated() < cutoff {
-			delete(c.records, key)
+	c.store.evictPLDRecords(cutoff, c.config, c.group, true, switchCutoff)
+}
+
+// evictPLDRecords scans without storeBarrier, then retires DB rows and every
+// live owner as one transition. Updates of live records are locked until both
+// deletion and identity invalidation finish, so stale saves cannot reload/revive.
+func (s *Store) evictPLDRecords(cutoff int64, config, group string, scoped bool, switchCutoff time.Time) {
+	prefix := PLDKeyPrefix
+	if scoped {
+		prefix += escapeKeyPart(config) + ":" + escapeKeyPart(group) + ":"
+	}
+	pldWrites.mu.Lock()
+	versions := make(map[string]uint64)
+	for key, version := range pldWrites.versions {
+		if strings.HasPrefix(key, prefix) {
+			versions[key] = version
 		}
 	}
-	for target, at := range c.switches {
-		if at.Before(switchCutoff) {
-			delete(c.switches, target)
+	pldWrites.mu.Unlock()
+	items, err := s.DBViewPrefixScan(prefix, -1, false)
+	if err != nil {
+		return
+	}
+	if s.afterPLDEvictionScan != nil {
+		s.afterPLDEvictionScan()
+	}
+
+	storeBarrier.Lock()
+	defer storeBarrier.Unlock()
+	cacheRegistry.mu.Lock()
+	defer cacheRegistry.mu.Unlock()
+	var owners []*PLDCache
+	for p := range cacheRegistry.caches {
+		owner := p.Value()
+		if owner == nil {
+			delete(cacheRegistry.caches, p)
+			continue
+		}
+		if scoped && (owner.config != config || owner.group != group) {
+			continue
+		}
+		owner.mu.Lock()
+		owners = append(owners, owner)
+	}
+	defer func() {
+		for _, owner := range owners {
+			owner.mu.Unlock()
+		}
+	}()
+
+	candidates := make(map[string]bool)
+	for key, data := range items {
+		var probe struct {
+			LastUpdated int64 `json:"last_updated,omitempty"`
+		}
+		if json.Unmarshal(data, &probe) == nil && probe.LastUpdated > 0 && probe.LastUpdated < cutoff {
+			candidates[key] = true
+		}
+	}
+	locked := make(map[*PLDRecord]struct{})
+	fresh := make(map[string]bool)
+	for _, owner := range owners {
+		for key, record := range owner.records {
+			if _, ok := locked[record]; !ok {
+				record.mu.Lock()
+				locked[record] = struct{}{}
+			}
+			if record.LastUpdated >= cutoff {
+				fresh[key] = true
+			} else {
+				candidates[key] = true
+			}
+		}
+	}
+	defer func() {
+		for record := range locked {
+			record.mu.Unlock()
+		}
+	}()
+
+	pldWrites.mu.Lock()
+	defer pldWrites.mu.Unlock()
+	retired := make(map[string]struct{})
+	if db == nil {
+		return
+	}
+	// Update, not Batch: the committed set must belong to exactly this
+	// transaction, never to a callback that bbolt may retry or roll back.
+	err = db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(bucketSmartStats)
+		for key := range candidates {
+			if fresh[key] || pldWrites.versions[key] != versions[key] {
+				continue
+			}
+			var current []byte
+			if bucket != nil {
+				current = bucket.Get([]byte(key))
+			}
+			if !bytes.Equal(current, items[key]) {
+				continue
+			}
+			if current != nil {
+				var probe struct {
+					LastUpdated int64 `json:"last_updated,omitempty"`
+				}
+				if json.Unmarshal(current, &probe) != nil || probe.LastUpdated == 0 {
+					// Retire a corrupt/empty live incarnation without broad
+					// deletion of rows the age scan could not classify.
+					retired[key] = struct{}{}
+					continue
+				}
+				if probe.LastUpdated >= cutoff {
+					continue
+				}
+				if err := bucket.Delete([]byte(key)); err != nil {
+					return err
+				}
+			}
+			retired[key] = struct{}{}
+		}
+		return nil
+	})
+	if err != nil {
+		return
+	}
+	for key := range retired {
+		delete(pldWrites.versions, key)
+		for _, owner := range owners {
+			delete(owner.records, key)
+		}
+	}
+	if !switchCutoff.IsZero() {
+		for _, owner := range owners {
+			for target, at := range owner.switches {
+				if at.Before(switchCutoff) {
+					delete(owner.switches, target)
+				}
+			}
 		}
 	}
 }
@@ -197,6 +334,24 @@ func matchesScope(level, config, group, c, g string) bool {
 // invalidateLive is called only with storeBarrier's write side held. Node
 // invalidation drops only matching rewards and their targets' switch clocks.
 func invalidateLive(level, config, group string, nodes map[string]struct{}) {
+	pldWrites.mu.Lock()
+	for key := range pldWrites.versions {
+		if level == "all" {
+			delete(pldWrites.versions, key)
+			continue
+		}
+		c, g, _, node, ok := ParsePLDKey(key)
+		if !ok || !matchesScope(level, config, group, c, g) {
+			continue
+		}
+		if nodes != nil {
+			if _, removed := nodes[node]; !removed {
+				continue
+			}
+		}
+		delete(pldWrites.versions, key)
+	}
+	pldWrites.mu.Unlock()
 	// Config-level views include this group's rows; invalidate only the
 	// ancestor views, not neighboring groups' cached views or records.
 	if level == "group" {

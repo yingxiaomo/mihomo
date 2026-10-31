@@ -58,7 +58,13 @@ var (
 )
 
 type (
-	Store struct{}
+	Store struct {
+		// Optional lifecycle observation seams run outside storeBarrier. Tests
+		// pause completed real reads here, never replace DB responses.
+		afterBlockedNodesLoad           func()
+		beforeBlockedNodesUpdatePublish func()
+		afterPLDEvictionScan            func()
+	}
 
 	StoreOperation struct {
 		Type          int
@@ -877,21 +883,7 @@ func (s *Store) GetSubBytesByPath(prefix string) (result map[string][]byte, err 
 // older than the cutoff (unix seconds). The records are self-rebuilding
 // reward state; dropping stale ones keeps the namespace bounded.
 func (s *Store) EvictOldPLDRecords(cutoff int64) {
-	items, err := s.DBViewPrefixScan(PLDKeyPrefix, -1, false)
-	if err != nil {
-		return
-	}
-	for key, data := range items {
-		var probe struct {
-			LastUpdated int64 `json:"last_updated,omitempty"`
-		}
-		if json.Unmarshal(data, &probe) != nil || probe.LastUpdated == 0 {
-			continue
-		}
-		if probe.LastUpdated < cutoff {
-			s.DBBatchDeletePrefix([]string{key}, true)
-		}
-	}
+	s.evictPLDRecords(cutoff, "", "", false, time.Time{})
 }
 
 func (s *Store) DBViewGetItem(key string) ([]byte, error) {
@@ -923,8 +915,15 @@ func (s *Store) DBBatchPutItem(key string, value []byte) error {
 		return errors.New("DB Cache file load failed")
 	}
 	keyBytes := []byte(key)
+	pld := strings.HasPrefix(key, PLDKeyPrefix)
+	if pld {
+		// Also serialize raw PLD puts with eviction. Versions distinguish an
+		// identical-value save from the row observed by the earlier scan.
+		pldWrites.mu.Lock()
+		defer pldWrites.mu.Unlock()
+	}
 
-	return db.Batch(func(tx *bbolt.Tx) error {
+	err := db.Batch(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(bucketSmartStats)
 		if bucket == nil {
 			var err error
@@ -935,6 +934,14 @@ func (s *Store) DBBatchPutItem(key string, value []byte) error {
 		}
 		return bucket.Put(keyBytes, value)
 	})
+	if err == nil && pld {
+		if pldWrites.versions == nil {
+			pldWrites.versions = make(map[string]uint64)
+		}
+		pldWrites.next++
+		pldWrites.versions[key] = pldWrites.next
+	}
+	return err
 }
 
 // DBViewPrefixScan answers a prefix holding more records than maxResults with a uniform

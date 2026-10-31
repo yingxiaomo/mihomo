@@ -479,8 +479,30 @@ func (s *SmartPLD) selectProxiesFull(metadata *C.Metadata, proxies []C.Proxy) []
 }
 
 func (s *SmartPLD) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
+	if metadata == nil {
+		return nil, fmt.Errorf("smart-pld [%s]: UDP metadata is nil: %w", s.Name(), C.ErrNotSupport)
+	}
+	if s.disableUDP {
+		return nil, s.noCandidateError(true)
+	}
+	pool := nonNilPLDProxies(s.GetProxies(true))
+	if len(pool) == 0 {
+		return nil, s.noCandidateError(true)
+	}
+	// Manual selection is authoritative, even when that choice cannot do UDP.
+	// Do not retry another node or punish this capability mismatch as a failure.
+	manual := false
+	for _, p := range pool {
+		if s.selected != "" && p.Name() == s.selected {
+			manual = true
+			if !p.SupportUDP() {
+				return nil, s.unsupportedUDPError(p)
+			}
+			break
+		}
+	}
 	tryPacket := func(proxies []C.Proxy, asnNumber string) (C.PacketConn, error) {
-		var finalErr error
+		finalErr := s.noCandidateError(true)
 		limit := len(proxies)
 		if limit > maxSelected {
 			limit = maxSelected
@@ -490,6 +512,9 @@ func (s *SmartPLD) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 
 		for i := 0; i < limit; i++ {
 			proxy := proxies[i]
+			if proxy == nil || !proxy.SupportUDP() {
+				continue
+			}
 			attempts := 1
 			if singleProxyRetry {
 				attempts = maxRetries
@@ -509,6 +534,10 @@ func (s *SmartPLD) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 				pc, err := proxy.ListenPacketContext(ctxDial, metadata)
 				cancel()
 				connectTime := time.Since(start).Milliseconds()
+				if pc == nil && err == nil {
+					// A broken adapter must not become a successful nil packet conn.
+					return nil, fmt.Errorf("smart-pld [%s]: proxy [%s] returned a nil UDP connection", s.Name(), proxy.Name())
+				}
 
 				if err != nil {
 					if tunnel.ShouldStopRetry(err) {
@@ -553,13 +582,13 @@ func (s *SmartPLD) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 	}
 
 	asnNumber := s.getASNCode(metadata)
-	proxies, _ := s.selectProxies(metadata, s.GetProxies(true))
+	proxies, _ := s.selectProxies(metadata, pool)
 
 	// Same single-node unwrap-cache pitfall as DialContext: fall back to the
 	// full healthy pool when the pinned node cannot establish a packet conn.
 	pc, err := tryPacket(proxies, asnNumber)
-	if err != nil && !tunnel.ShouldStopRetry(err) && len(proxies) < maxSelected {
-		fallbackProxies := s.selectProxiesFull(metadata, s.GetProxies(true))
+	if err != nil && !manual && !tunnel.ShouldStopRetry(err) && len(proxies) < maxSelected {
+		fallbackProxies := s.selectProxiesFull(metadata, nonNilPLDProxies(s.GetProxies(true)))
 		if len(fallbackProxies) > len(proxies) {
 			log.Debugln("[PLD] group [%s] target [%s]: %d-candidate UDP selection failed (%v), retrying over %d-node full pool",
 				s.Name(), metadata.SmartTarget, len(proxies), err, len(fallbackProxies))
@@ -577,7 +606,11 @@ func (s *SmartPLD) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 }
 
 func (s *SmartPLD) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
-	proxies := s.GetProxies(touch)
+	proxies := nonNilPLDProxies(s.GetProxies(touch))
+	isUDP := metadata != nil && metadata.NetWork == C.UDP
+	if len(proxies) == 0 {
+		return s.unavailableProxy(s.noCandidateError(isUDP))
+	}
 
 	if metadata == nil {
 		return proxies[0]
@@ -586,32 +619,21 @@ func (s *SmartPLD) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 	if s.selected != "" {
 		for _, p := range proxies {
 			if p.Name() == s.selected {
+				if isUDP && (s.disableUDP || !p.SupportUDP()) {
+					return s.unavailableProxy(s.unsupportedUDPError(p))
+				}
 				return p
 			}
 		}
 	}
 
-	pool := proxies
+	if isUDP && s.disableUDP {
+		return s.unavailableProxy(s.noCandidateError(true))
+	}
 	proxies, _ = s.selectProxies(metadata, proxies)
-
-	// Empty-candidate contract: when every node is filtered out (e.g. all
-	// TCP-only for a UDP request, or all soft-failed/cooled), selectProxies
-	// returns empty. Fall back to the first alive proxy from the raw pool —
-	// the connection will likely fail at the transport level, but the group
-	// and tracking remain consistent and the kernel does not panic.
 	if len(proxies) == 0 {
-		log.Debugln("[PLD] Group: [%s] Target: [%s] all candidates filtered, falling back to raw pool",
-			s.Name(), metadata.SmartTarget)
-		for _, p := range pool {
-			if p.AliveForTestUrl(s.testUrl) {
-				return p
-			}
-		}
-		if len(pool) > 0 {
-			return pool[0]
-		}
+		return s.unavailableProxy(s.noCandidateError(isUDP))
 	}
-
 	return proxies[0]
 }
 
@@ -627,6 +649,7 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 	c.AppendToChains(s)
 
 	start := time.Now()
+	shadowTTFR := &pldTTFRObservation{origin: start}
 
 	var firstReadErr atomic.TypedValue[error]
 	var firstReadLatency atomic.Int64
@@ -663,7 +686,7 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 	var pp *callback.PacketPairCallBackConn
 	if s.usePLD {
 		pp = callback.NewPacketPairCallBackConn(c)
-		c = pp
+		c = &pldTTFRConn{Conn: pp, observation: shadowTTFR}
 	}
 
 	// "Select with PLD, verify with the official system": post-connect
@@ -759,7 +782,7 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 					// stream, and a false positive would cool down healthy
 					// nodes on quiet targets.
 					rec := s.getPLDRecord(target, proxy.Name())
-				rec.RecordStall()
+					rec.RecordStall()
 					s.savePLDRecord(target, proxy.Name(), rec)
 					log.Infoln("%s", fmt.Sprintf("[PLD] Group: [%s] Node: [%s] Target: [%s] header-then-stall suspected (%d bytes up, %d bytes down, no progress for %s)",
 						s.Name(), proxy.Name(), target, upload1, download1, time.Since(firstSample).Round(time.Second)))
@@ -784,7 +807,7 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 		c, proxy, metadata, connectTime,
 		&firstReadLatency, &firstReadErr,
 		&observedReadErr, &observedWriteErr, pldFailureLatched,
-		pp,
+		pp, shadowTTFR,
 	)
 }
 
@@ -814,7 +837,11 @@ func (s *SmartPLD) WrapPacketConnWithMetric(pc C.PacketConn, proxy C.Proxy, meta
 		udpLatency.Store(latency)
 	})
 
-	return s.registerPacketClosureMetricsCallback(pc, proxy, metadata, connectTime, &udpLatency, &observedReadErr, &observedWriteErr)
+	shadowTTFR := &pldTTFRObservation{isUDP: true}
+	if s.usePLD {
+		pc = &pldTTFRPacketConn{PacketConn: pc, observation: shadowTTFR}
+	}
+	return s.registerPacketClosureMetricsCallback(pc, proxy, metadata, connectTime, &udpLatency, &observedReadErr, &observedWriteErr, shadowTTFR)
 }
 
 func (s *SmartPLD) Set(name string) error {
@@ -1339,6 +1366,7 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 	// 15%）且该 target 的切换冷却已过。否则把 primary 钉回首位：同一 target
 	// 的并发连接收敛单节点（避免 closeSameConnection 互杀长连接），同时避免
 	// A→B→A 抖动。
+	switchCommitted := false
 	if primary != "" && len(resultNames) > 1 && resultNames[0] != primary {
 		switchIdx := -1
 		for i, n := range resultNames {
@@ -1348,10 +1376,11 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 			}
 		}
 		allowSwitch := false
+		forceSwitch := false
 		switch {
 		case switchIdx < 0:
 			// primary 已被 filter 排除（blocked/dead/soft-fail）→ 直接切
-			allowSwitch = true
+			allowSwitch, forceSwitch = true, true
 			log.Debugln("[PLD] Group: [%s] Target: [%s] primary [%s] dropped from candidates, switching to [%s]",
 				s.Name(), target, primary, resultNames[0])
 		case switchIdx > 0:
@@ -1362,27 +1391,37 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 			}
 			if wCur <= 0 {
 				// 当前 primary 对该 target 负分（连续失败/硬惩罚）→ 立即弃用
-				allowSwitch = true
+				allowSwitch, forceSwitch = true, true
 				log.Debugln("[PLD] Group: [%s] Target: [%s] primary [%s] collapsed (score %.3f), switching to [%s]",
 					s.Name(), target, primary, wCur, resultNames[0])
-			} else if wNew > wCur*s.switchMargin && s.switchCooldownElapsed(target) {
+			} else if wNew > wCur*s.switchMargin {
 				allowSwitch = true
-				log.Debugln("[PLD] Group: [%s] Target: [%s] switch [%s](%.3f) -> [%s](%.3f) (lead %.2fx >= %.2fx)",
+				log.Debugln("[PLD] Group: [%s] Target: [%s] switch candidate [%s](%.3f) -> [%s](%.3f) (lead %.2fx >= %.2fx)",
 					s.Name(), target, primary, wCur, resultNames[0], wNew, wNew/wCur, s.switchMargin)
 			}
 		}
 		if allowSwitch {
-			// Atomically replace the primary: CAS on the observed unwrap
-			// version. Only consume the switch cooldown if the CAS succeeded —
-			// a failed CAS means another request already changed the primary,
-			// and the next request will evaluate fresh against that primary.
+			// Recheck the switch clock, compare the observed generation and
+			// publish the primary/clock under the same lifecycle/cache locks.
+			committed := false
 			for _, p := range proxies {
 				if p.Name() == resultNames[0] {
-					if s.store.CASStoreUnwrapResult(s.Name(), s.configName, target, []C.Proxy{p}, observedUnwrapVersion) {
-						s.markPrimarySwitch(target)
-					}
+					committed = s.rewardCache().TryPrimarySwitch(target, []C.Proxy{p}, observedUnwrapVersion, s.switchCooldown, forceSwitch)
 					break
 				}
+			}
+			switchCommitted = committed
+			if committed {
+				log.Debugln("[PLD] Group: [%s] Target: [%s] switch [%s] -> [%s] committed",
+					s.Name(), target, primary, resultNames[0])
+			} else if current, _, found := s.store.GetUnwrapSnapshotWithExpiry(s.Name(), s.configName, target); found {
+				// Follow the new primary in THIS invocation, not merely the next
+				// request. Keep the full comparison field in the names list so
+				// filterProxies' fill-up logic cannot prepend an old challenger
+				// ahead of an otherwise eligible fresh primary.
+				resultNames, resultWeights = publishedPrimaryOrder(current.Proxies, resultNames, proxies), nil
+				log.Debugln("[PLD] Group: [%s] Target: [%s] stale switch discarded; following primary %v",
+					s.Name(), target, current.Proxies)
 			}
 		} else {
 			// 保持当前 primary：把 primary 移回首位（若它仍在候选里）
@@ -1402,6 +1441,14 @@ func (s *SmartPLD) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.P
 		}
 	}
 
+	// A request that did not switch may still have raced a fresh publication
+	// while checking margins or filtering. Rebase at a final snapshot instead
+	// of restoring the now-obsolete primary from its initial observation.
+	if !switchCommitted {
+		if current, _, found := s.store.GetUnwrapSnapshotWithExpiry(s.Name(), s.configName, target); found && current.Version != observedUnwrapVersion {
+			resultNames, resultWeights = publishedPrimaryOrder(current.Proxies, resultNames, proxies), nil
+		}
+	}
 	result := s.filterProxies(metadata, wildcardTarget, resultNames, resultWeights, proxies, maxSelected, isUDP, largeMode)
 
 	return result, pinned
@@ -2239,7 +2286,7 @@ func (s *SmartPLD) collectConnectionData(input *smart.ModelInput, metadata *C.Me
 
 func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate,
-	connectionDuration int64, tcpStats *tcpstats.Stats, bytesTo64KMs int64, err error, pldFailureLatched *pldConnectionOutcome) {
+	connectionDuration int64, tcpStats *tcpstats.Stats, bytesTo64KMs int64, err error, pldFailureLatched *pldConnectionOutcome, shadowTTFR ...*pldTTFRObservation) {
 	if pldFailureLatched == nil {
 		pldFailureLatched = &pldConnectionOutcome{}
 	}
@@ -2265,6 +2312,7 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		tgt := metadata.SmartTarget
 		rec := s.getPLDRecord(tgt, proxy.Name())
 		rec.ObserveMetrics(smart.RewardedMetrics{
+			IsUDP:         metadata.NetWork == C.UDP,
 			ConnectTimeMs: connectTime,
 			Failed:        false,
 		})
@@ -2458,7 +2506,7 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		rm := smart.RewardedMetrics{
 			IsUDP:         isUDP,
 			ConnectTimeMs: connectTime,
-			FirstByteMs:   latency, // firstReadLatency == TTFR
+			FirstByteMs:   latency, // preserve legacy reward/training timer
 			BytesTo64KMs:  bytesTo64KMs,
 			DownloadMB:    downloadTotalMB,
 			DurationSec:   float64(connectionDuration) / 1000.0,
@@ -2466,6 +2514,9 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 			LossRate:      lossRate,
 			LossValid:     tcpStats != nil,
 			Failed:        connectionFailed,
+		}
+		if len(shadowTTFR) > 0 {
+			shadowTTFR[0].apply(&rm)
 		}
 		if pldFailureLatched.failed {
 			// a quality gate already recorded this connection's hard failure in
@@ -2486,6 +2537,15 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		// Phase 1 shadow observation: raw metric EMAs, independent of reward
 		// channels. Runs for ALL settlements (success/failure/gate/neutral).
 		rec.ObserveMetrics(rm)
+		if len(shadowTTFR) > 0 && isUDP && !rm.UDPResponseValid {
+			owner := s.rewardCache()
+			shadowTTFR[0].afterPacketSettlement(func(ms float64) {
+				rec.ObserveUDPResponse(ms)
+				// Save the captured live identity; Flush/Evict retirement rejects
+				// a late old reference instead of adopting/reloading fresh state.
+				_ = owner.Save(target, proxyName, rec)
+			})
+		}
 		s.savePLDRecord(target, proxyName, rec)
 		pldReward = r
 		pldParts = &parts
@@ -2524,7 +2584,7 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		pldReward, pldParts, pldEMA, pldVar, pldSamples, pldBWCeilKBps)
 }
 
-func (s *SmartPLD) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, firstReadLatency *atomic.Int64, firstReadErr *atomic.TypedValue[error], observedReadErr *atomic.TypedValue[error], observedWriteErr *atomic.TypedValue[error], pldFailureLatched *pldConnectionOutcome, pp *callback.PacketPairCallBackConn) C.Conn {
+func (s *SmartPLD) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, firstReadLatency *atomic.Int64, firstReadErr *atomic.TypedValue[error], observedReadErr *atomic.TypedValue[error], observedWriteErr *atomic.TypedValue[error], pldFailureLatched *pldConnectionOutcome, pp *callback.PacketPairCallBackConn, shadowTTFR ...*pldTTFRObservation) C.Conn {
 	return callback.NewCloseCallbackConn(c, func() {
 		pldFailureLatched.finish()
 		tracker := statistic.DefaultManager.Get(metadata.UUID)
@@ -2562,13 +2622,14 @@ func (s *SmartPLD) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metad
 			// Host punishment belongs to recordConnectionStats only; doing it
 			// here as well used to double-charge the same connection.
 
-			go s.recordConnectionStats(metadata, proxy, connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, tcpStats, bytesTo64KMs, closeErr, pldFailureLatched)
+			go s.recordConnectionStats(metadata, proxy, connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, tcpStats, bytesTo64KMs, closeErr, pldFailureLatched, shadowTTFR...)
 			return
 		}
 	})
 }
 
-func (s *SmartPLD) registerPacketClosureMetricsCallback(pc C.PacketConn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, udpLatency *atomic.Int64, observedReadErr *atomic.TypedValue[error], observedWriteErr *atomic.TypedValue[error]) C.PacketConn {
+func (s *SmartPLD) registerPacketClosureMetricsCallback(pc C.PacketConn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, udpLatency *atomic.Int64, observedReadErr *atomic.TypedValue[error], observedWriteErr *atomic.TypedValue[error], shadowTTFR ...*pldTTFRObservation) C.PacketConn {
+	pldOutcome := &pldConnectionOutcome{}
 	return callback.NewCloseCallbackPacketConn(pc, func() {
 		tracker := statistic.DefaultManager.Get(metadata.UUID)
 		if tracker != nil {
@@ -2587,7 +2648,7 @@ func (s *SmartPLD) registerPacketClosureMetricsCallback(pc C.PacketConn, proxy C
 			closeErr := callback.TransferError(readErr, writeErr)
 
 			go s.recordConnectionStats(metadata, proxy, connectTime, udpLatency.Load(),
-				uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, nil, 0, closeErr, nil)
+				uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, nil, 0, closeErr, pldOutcome, shadowTTFR...)
 			return
 		}
 	})
