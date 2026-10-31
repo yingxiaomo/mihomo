@@ -374,19 +374,21 @@ func (r *PLDRecord) ObserveMetrics(m RewardedMetrics) {
 	}
 
 	// ConnectionTTFR: time from conn wrap install to first successful
-	// downlink byte. Valid only when a first byte arrived and the connection
-	// did not end in a dial-level failure. EOF and read errors do not
-	// contribute a valid TTFR sample.
-	if m.FirstByteMs > 0 && !m.Failed {
+	// downlink byte. Valid whenever a first byte arrived — the connection's
+	// ultimate outcome does not invalidate this observation. EOF and read
+	// errors mean no valid first-byte sample (FirstByteMs stays 0).
+	if m.FirstByteMs > 0 {
 		newT, _, tCnt := UpdateRewardEMA(r.ConnectionTTFR_EMA, 0, r.ConnectionTTFR_Cnt, float64(m.FirstByteMs))
 		r.ConnectionTTFR_EMA, r.ConnectionTTFR_Cnt = newT, tCnt
 	}
 
-	// Loss rate: valid only for large transfers that completed with TCP stats
-	// available. Small transfers do not carry meaningful loss; failed
-	// connections may not have accurate loss measurements. A completed large
-	// transfer with zero loss IS a valid zero-loss observation.
-	if !m.SmallFlow() && !m.Failed {
+	// Loss rate: valid only for non-UDP large transfers. UDP does not carry
+	// TCP-style loss tracking; a zero LossRate on UDP means "not measured,"
+	// not "no loss." Small transfers do not carry meaningful loss either.
+	// Failed large transfers may still have valid partial loss observations
+	// (partial success semantics), but the current loss measurement from
+	// TCP stats requires a live connection — skip failed connections.
+	if !m.SmallFlow() && !m.Failed && !m.IsUDP {
 		newL, _, lCnt := UpdateRewardEMA(r.LossEMA, 0, r.LossCnt, m.LossRate)
 		r.LossEMA, r.LossCnt = newL, lCnt
 	}
@@ -420,23 +422,53 @@ func (r *PLDRecord) ScenarioScore(large bool) float64 {
 		return neutral
 	}
 
-	stallRate := float64(r.SuspectedStallCount) / float64(r.AttemptCount)
+	// Stall rate: clamped because SuspectedStallCount can exceed
+	// AttemptCount when a stall is observed on a connection that hasn't
+	// settled yet (the stall timer fires during the connection's lifetime,
+	// but AttemptCount only increments at settlement).
+	stallRate := math.Min(1.0, float64(r.SuspectedStallCount)/float64(r.AttemptCount))
 
 	if !large {
 		if r.ConnectCnt == 0 && r.ConnectionTTFR_Cnt == 0 {
 			return neutral
 		}
-		connectScore := 1.0 / (1.0 + r.ConnectEMA/500.0)
-		ttfrScore := 1.0 / (1.0 + r.ConnectionTTFR_EMA/500.0)
-		return 0.35*connectScore + 0.45*ttfrScore + 0.2*(1.0-stallRate)
+		// Only include metrics with actual observations — a zero-valued
+		// EMA from a missing observation would score as "perfect" and
+		// reward data absence.
+		var sum, weights float64
+		if r.ConnectCnt > 0 {
+			sum += 0.5 * (1.0 / (1.0 + r.ConnectEMA/500.0))
+			weights += 0.5
+		}
+		if r.ConnectionTTFR_Cnt > 0 {
+			sum += 0.5 * (1.0 / (1.0 + r.ConnectionTTFR_EMA/500.0))
+			weights += 0.5
+		}
+		if weights == 0 {
+			return neutral
+		}
+		score := sum/weights*(1.0-stallRate) + stallRate*0.0
+		return math.Min(1.0, math.Max(0.0, score))
 	}
 
 	if r.ThrCount == 0 && r.LossCnt == 0 {
 		return neutral
 	}
-	thrScore := r.ThrKBpsEMA / (r.ThrKBpsEMA + 3000.0)
-	lossScore := 1.0 - r.LossEMA
-	return 0.6*thrScore + 0.2*lossScore + 0.2*(1.0-stallRate)
+	// Only include metrics with actual observations.
+	var sum, weights float64
+	if r.ThrCount > 0 {
+		sum += 0.7 * (r.ThrKBpsEMA / (r.ThrKBpsEMA + 3000.0))
+		weights += 0.7
+	}
+	if r.LossCnt > 0 {
+		sum += 0.3 * (1.0 - math.Min(1.0, r.LossEMA))
+		weights += 0.3
+	}
+	if weights == 0 {
+		return neutral
+	}
+	score := sum/weights*(1.0-stallRate) + stallRate*0.0
+	return math.Min(1.0, math.Max(0.0, score))
 }
 
 // UpdateWithMetrics folds one completed connection into the channel-appropriate
