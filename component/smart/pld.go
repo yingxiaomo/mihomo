@@ -280,6 +280,21 @@ type PLDRecord struct {
 	// consecutive failures — both are far too slow when a node just went
 	// down and the user expects the next request to pick another candidate.
 	FailureUntil int64 `json:"failure_until,omitempty"`
+
+	// Raw metric observations (Phase 1 shadow-only): independent per-metric
+	// EMAs and validity counts for scenario-aware selection. Each metric has
+	// its own count because validity differs per metric type — a failed
+	// connection may still have a valid connect time but no valid TTFR or
+	// throughput observation. Shadow only in Phase 1: these fields are
+	// written and exposed via /cache/smart/pld, but do not affect selection.
+	ConnectEMA          float64 `json:"connect_ema,omitempty"`           // EMA of outbound dial path duration (ms)
+	ConnectCnt          int64   `json:"connect_cnt,omitempty"`            // completed dial observations
+	ConnectionTTFR_EMA  float64 `json:"conn_ttfr_ema,omitempty"`          // EMA: wrap install → first successful downlink byte (ms)
+	ConnectionTTFR_Cnt  int64   `json:"conn_ttfr_cnt,omitempty"`          // valid first-byte observations
+	LossEMA             float64 `json:"loss_ema,omitempty"`               // EMA of loss rate on large transfers with TCP stats
+	LossCnt             int64   `json:"loss_cnt,omitempty"`               // valid loss observations
+	SuspectedStallCount int64   `json:"suspected_stall_count,omitempty"`  // header-then-stall observations (not confirmed failures)
+	AttemptCount        int64   `json:"attempt_count,omitempty"`          // completed connection settlements (denominator for stall rate)
 }
 
 // FailureCooldownDefaultSec is the default cool-off window (seconds) applied
@@ -337,6 +352,91 @@ func (r *PLDRecord) SoftFailed() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.SampleCount >= 2 && r.Reward < 0
+}
+
+// ObserveMetrics records raw per-connection performance metrics independently
+// of the reward channels. Called exactly once per connection settlement from
+// recordConnectionStats, after reward and failure processing. Each metric
+// updates only when the observation is valid for that metric type.
+// This method is idempotent per connection: recordConnectionStats is called
+// once per completed connection settlement.
+func (r *PLDRecord) ObserveMetrics(m RewardedMetrics) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.AttemptCount++
+
+	// Connect time: valid whenever the outbound dial completed with a
+	// measurable duration. Includes DNS resolution, proxy handshake, and
+	// target connection setup as performed by the outbound implementation.
+	if m.ConnectTimeMs > 0 {
+		newC, _, cCnt := UpdateRewardEMA(r.ConnectEMA, 0, r.ConnectCnt, float64(m.ConnectTimeMs))
+		r.ConnectEMA, r.ConnectCnt = newC, cCnt
+	}
+
+	// ConnectionTTFR: time from conn wrap install to first successful
+	// downlink byte. Valid only when a first byte arrived and the connection
+	// did not end in a dial-level failure. EOF and read errors do not
+	// contribute a valid TTFR sample.
+	if m.FirstByteMs > 0 && !m.Failed {
+		newT, _, tCnt := UpdateRewardEMA(r.ConnectionTTFR_EMA, 0, r.ConnectionTTFR_Cnt, float64(m.FirstByteMs))
+		r.ConnectionTTFR_EMA, r.ConnectionTTFR_Cnt = newT, tCnt
+	}
+
+	// Loss rate: valid only for large transfers that completed with TCP stats
+	// available. Small transfers do not carry meaningful loss; failed
+	// connections may not have accurate loss measurements. A completed large
+	// transfer with zero loss IS a valid zero-loss observation.
+	if !m.SmallFlow() && !m.Failed {
+		newL, _, lCnt := UpdateRewardEMA(r.LossEMA, 0, r.LossCnt, m.LossRate)
+		r.LossEMA, r.LossCnt = newL, lCnt
+	}
+}
+
+// RecordStall increments the suspected stall counter. Called from the
+// zero-progress gate when header-then-stall is suspected. This is an
+// observation, not a confirmed failure — the count feeds ScenarioScore's
+// stall-rate penalty and the /cache/smart/pld display.
+func (r *PLDRecord) RecordStall() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.SuspectedStallCount++
+}
+
+// ScenarioScore computes a task-specific quality score [0, 1] from the raw
+// metric observations. SHADOW ONLY in Phase 1: the returned value is for
+// /cache/smart/pld display and diagnostic logging, it does NOT affect
+// selection, filtering, ranking, or failure judgment.
+//
+// large=true selects the throughput-focused formula (sustained throughput,
+// loss, stalls); large=false selects the latency-focused formula (connect
+// speed, first response, stalls). Returns 0.5 (neutral) when there are
+// fewer than 2 attempts (not enough observations for a meaningful score).
+func (r *PLDRecord) ScenarioScore(large bool) float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	const neutral = 0.5
+	if r.AttemptCount < 2 {
+		return neutral
+	}
+
+	stallRate := float64(r.SuspectedStallCount) / float64(r.AttemptCount)
+
+	if !large {
+		if r.ConnectCnt == 0 && r.ConnectionTTFR_Cnt == 0 {
+			return neutral
+		}
+		connectScore := 1.0 / (1.0 + r.ConnectEMA/500.0)
+		ttfrScore := 1.0 / (1.0 + r.ConnectionTTFR_EMA/500.0)
+		return 0.35*connectScore + 0.45*ttfrScore + 0.2*(1.0-stallRate)
+	}
+
+	if r.ThrCount == 0 && r.LossCnt == 0 {
+		return neutral
+	}
+	thrScore := r.ThrKBpsEMA / (r.ThrKBpsEMA + 3000.0)
+	lossScore := 1.0 - r.LossEMA
+	return 0.6*thrScore + 0.2*lossScore + 0.2*(1.0-stallRate)
 }
 
 // UpdateWithMetrics folds one completed connection into the channel-appropriate
@@ -469,14 +569,16 @@ func escapeKeyPart(s string) string {
 
 
 // PLDKeyState pairs one persisted PLDRecord with its storage-key parts for the
-// /smart/pld debug endpoint: the record is what selection reads, the parts
+// /cache/smart/pld debug endpoint: the record is what selection reads, the parts
 // identify which (config, group, target, node) it belongs to.
 type PLDKeyState struct {
-	Config string     `json:"config"`
-	Group  string     `json:"group"`
-	Target string     `json:"target"`
-	Node   string     `json:"node"`
-	Record *PLDRecord `json:"record"`
+	Config        string     `json:"config"`
+	Group         string     `json:"group"`
+	Target        string     `json:"target"`
+	Node          string     `json:"node"`
+	Record        *PLDRecord `json:"record"`
+	SmallScore    float64    `json:"small_score"`    // ScenarioScore(false) — latency-focused
+	LargeScore    float64    `json:"large_score"`    // ScenarioScore(true) — throughput-focused
 }
 
 // MarshalJSON snapshots the record under its lock so a concurrent mutation

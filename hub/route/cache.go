@@ -114,11 +114,13 @@ func getSmartPLDState(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		states = append(states, smart.PLDKeyState{
-			Config: config,
-			Group:  group,
-			Target: target,
-			Node:   node,
-			Record: &rec,
+			Config:     config,
+			Group:      group,
+			Target:     target,
+			Node:       node,
+			Record:     &rec,
+			SmallScore: rec.ScenarioScore(false),
+			LargeScore: rec.ScenarioScore(true),
 		})
 	}
 	render.JSON(w, r, states)

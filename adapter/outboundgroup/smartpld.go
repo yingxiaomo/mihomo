@@ -739,6 +739,8 @@ func (s *SmartPLD) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metad
 					// genuinely stalled node from a legitimately idle upgraded
 					// stream, and a false positive would cool down healthy
 					// nodes on quiet targets.
+					rec := s.getPLDRecord(target, proxy.Name())
+					rec.RecordStall()
 					log.Infoln("%s", fmt.Sprintf("[PLD] Group: [%s] Node: [%s] Target: [%s] header-then-stall suspected (%d bytes up, %d bytes down, no progress for %s)",
 						s.Name(), proxy.Name(), target, upload1, download1, time.Since(firstSample).Round(time.Second)))
 					return
@@ -2435,6 +2437,9 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		} else {
 			r, parts = rec.UpdateWithMetrics(rm, s.failureCooldownSec())
 		}
+		// Phase 1 shadow observation: raw metric EMAs, independent of reward
+		// channels. Runs for ALL settlements (success/failure/gate/neutral).
+		rec.ObserveMetrics(rm)
 		s.savePLDRecord(target, proxyName, rec)
 		pldReward = r
 		pldParts = &parts
