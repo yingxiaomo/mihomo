@@ -114,6 +114,16 @@ type SmartPLDOption struct {
 	// negative = off, positive = configured seconds. Pointer for the same
 	// absent-vs-zero reason as FirstByteGateMs.
 	FailureCooldownSec *int `group:"failure-cooldown-sec,omitempty"`
+	// ServiceStallDetect enables automatic application-layer outage
+	// detection: a TCP connection the CLIENT gave up on after the server
+	// sent (almost) nothing — while both quality gates stayed quiet because
+	// the client aborted before their timers — is the transport signature of
+	// a service that is dead behind an otherwise healthy node (expired
+	// unlock upstream, IP reputation block). Enough such aborts within the
+	// window, with no data-carrying settlement in between, charge the same
+	// failure transaction as a gate. Pointer semantics: nil = unset
+	// (default on), explicit true/false overrides.
+	ServiceStallDetect *bool `group:"service-stall-detect,omitempty"`
 }
 
 type SmartPLD struct {
@@ -151,6 +161,10 @@ type SmartPLD struct {
 	switchCooldown  time.Duration // minimum interval between primary switches per target (default 3min)
 	zeroProgressMs  int           // second-stage zero-progress gate (ms, 0=off, default 10000)
 	failureCooldown time.Duration // unselectable window per target after a hard failure (default 60s)
+
+	// serviceStallDetect arms the client-abort churn detector (default on):
+	// see ServiceStallDetect and the serviceStall constants below.
+	serviceStallDetect bool
 
 	// pldRecordCache caches per-(target,node) reward state in memory; persisted
 	// under the independent "pld:" key namespace of the shared smart.db.
@@ -256,6 +270,10 @@ func NewSmartPLD(option GroupCommonOption, smartOption SmartPLDOption, emptyFall
 	// reward or unwrap-primary status. The configured value is baked into the
 	// persisted FailureUntil at FillFailure time; <=0 disables the window.
 	s.failureCooldown = time.Duration(resolveGateOption(smartOption.FailureCooldownSec, smart.FailureCooldownDefaultSec)) * time.Second
+
+	// Service-stall detection (client-abort churn): default on; an explicit
+	// config value always wins so it can be disabled without a rebuild.
+	s.serviceStallDetect = smartOption.ServiceStallDetect == nil || *smartOption.ServiceStallDetect
 
 	if smartOption.PolicyPriority != "" {
 		applyPolicyPriorityPLD(s, smartOption.PolicyPriority)
@@ -2284,6 +2302,28 @@ func (s *SmartPLD) collectConnectionData(input *smart.ModelInput, metadata *C.Me
 	s.dataCollector.AddSample(input, metadata, baseWeight, reward, weightSource, nodeDelayMs, nodeType, sampleWeight)
 }
 
+// Service-stall (client-abort churn) signature thresholds. Conservative by
+// design: the trigger runs the exact same failure transaction as the quality
+// gates, so a false positive only costs one cool-off window on one
+// (target, node) pair while traffic immediately falls back to other nodes.
+const (
+	// stallChurnLimit client-abort settlements within stallChurnWindowSec,
+	// with no data-carrying settlement in between, trigger the failure.
+	stallChurnLimit = 4
+	stallChurnWindowSec int64 = 300
+	// The server may squeeze a few bytes past the first-byte gate (a bare
+	// response header, an obfuscation reply) and still be dead at the
+	// application layer; below this many download bytes a settlement counts
+	// as "no service data" for stall purposes.
+	stallMaxDownloadBytes int64 = 1024
+	// Client-aborted connections that lived longer than this are idle-close
+	// lifecycle noise (push channels, keepalives), not retry storms.
+	stallMaxLifetimeMs int64 = 30000
+	// blockCode charged by the service-stall detector (3 = first-byte gate,
+	// 7 = zero-progress gate), kept distinct for log greppability.
+	stallBlockCode int64 = 9
+)
+
 func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate,
 	connectionDuration int64, tcpStats *tcpstats.Stats, bytesTo64KMs int64, err error, pldFailureLatched *pldConnectionOutcome, shadowTTFR ...*pldTTFRObservation) {
@@ -2301,6 +2341,55 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		pldFailureLatched.localClose = true
 	}
 	err = callback.TransferError(err)
+
+	// Service-stall detection: a TCP connection the client itself gave up on
+	// with (almost) no server data is the transport signature of an
+	// application-layer outage behind an otherwise healthy node (dead unlock
+	// upstream, IP reputation block). Both quality gates miss it — the client
+	// usually aborts before their timers, and failPLDConnection refuses to
+	// punish a completed (localClose) connection — so the settlement looks
+	// like a healthy fast connect and the reward stays positive. Track the
+	// signature per (target, node); when the window fills with no data in
+	// between, run the same failure transaction as a gate (latch + host
+	// strike + unwrap evict + cool-off) so the failure settlement below
+	// records one consistent outcome and the next request re-selects away
+	// from the stalled pair immediately.
+	if s.serviceStallDetect && s.usePLD && pldFailureLatched.localClose && !pldFailureLatched.failed &&
+		metadata.NetWork == C.TCP && downloadTotal < stallMaxDownloadBytes &&
+		connectionDuration > 0 && connectionDuration < stallMaxLifetimeMs &&
+		proxy.Type() != C.Compatible && proxy.Type() != C.Reject &&
+		proxy.Type() != C.Pass && proxy.Type() != C.RejectDrop {
+		tgt := metadata.SmartTarget
+		if tgt == "" {
+			tgt = metadata.WildcardTarget
+		}
+		if tgt != "" {
+			rec := s.getPLDRecord(tgt, proxy.Name())
+			if rec.NoteServiceStallChurn(time.Now().Unix(), stallChurnWindowSec, stallChurnLimit) {
+				pldFailureLatched.failed = true
+				s.markNodeFailure(metadata, proxy.Name(), true, true, stallBlockCode)
+				// An old connection through A must not evict a newly
+				// selected B (same discipline as the gate transaction).
+				s.store.DeleteUnwrapResultIfPrimary(s.Name(), s.configName, tgt, proxy.Name())
+				rec.FillFailure(s.failureCooldownSec())
+				log.Warnln("[PLD] Group: [%s] Target: [%s] Node: [%s] service-stall detected (%d client-abort connects with <%dKB download within %ds, none carried data): cooling off %ds",
+					s.Name(), tgt, proxy.Name(), stallChurnLimit, stallMaxDownloadBytes/1024, stallChurnWindowSec, s.failureCooldownSec())
+				s.savePLDRecord(tgt, proxy.Name(), rec)
+			}
+		}
+	}
+	// A data-carrying settlement proves the service behind this pair is still
+	// alive — reset the churn window so stray aborted probes never accumulate.
+	if s.serviceStallDetect && s.usePLD && !pldFailureLatched.failed && downloadTotal >= stallMaxDownloadBytes {
+		tgt := metadata.SmartTarget
+		if tgt == "" {
+			tgt = metadata.WildcardTarget
+		}
+		if tgt != "" {
+			s.getPLDRecord(tgt, proxy.Name()).ResetServiceStallChurn()
+		}
+	}
+
 	// A local cancellation before any response is a neutral lifecycle event.
 	neutralClose := pldFailureLatched.localClose && !pldFailureLatched.failed && err == nil && downloadTotal == 0
 

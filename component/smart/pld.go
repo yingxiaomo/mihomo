@@ -310,6 +310,16 @@ type PLDRecord struct {
 	SuspectedStallCount   int64   `json:"suspected_stall_count,omitempty"` // header-then-stall observations (not confirmed failures)
 	AttemptCount          int64   `json:"attempt_count,omitempty"`         // completed connection settlements (denominator for stall rate)
 	FailureCount          int64   `json:"failure_count,omitempty"`         // hard failures charged to this record
+
+	// Service-stall (client-abort churn) sliding window: unix-second stamps of
+	// recent settlements where the client gave up on a TCP connection that the
+	// server answered with (almost) nothing. This is the transport signature
+	// of an application-layer outage behind an otherwise healthy node (dead
+	// unlock upstream, IP reputation block): the connection passes both
+	// quality gates yet the app gets no service and retries in a burst.
+	// In-memory only (not persisted): a restart drops the window, while
+	// FailureUntil above carries the resulting cool-off.
+	churnStamps []int64
 }
 
 // FailureCooldownDefaultSec is the default cool-off window (seconds) applied
@@ -352,6 +362,42 @@ func (r *PLDRecord) InFailureCooldown(now int64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.FailureUntil > 0 && now < r.FailureUntil
+}
+
+// NoteServiceStallChurn records a client-abort churn event for the sliding
+// window and reports whether the window has filled up (limit events within
+// windowSec). Firing consumes the window: the caller charges the failure
+// cooldown, and if the outage persists the next burst re-arms from scratch.
+// Stamps older than the window are pruned on every call.
+func (r *PLDRecord) NoteServiceStallChurn(nowSec, windowSec int64, limit int) bool {
+	if limit <= 0 {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cutoff := nowSec - windowSec
+	kept := r.churnStamps[:0]
+	for _, ts := range r.churnStamps {
+		if ts >= cutoff {
+			kept = append(kept, ts)
+		}
+	}
+	r.churnStamps = kept
+	r.churnStamps = append(r.churnStamps, nowSec)
+	if len(r.churnStamps) >= limit {
+		r.churnStamps = r.churnStamps[:0]
+		return true
+	}
+	return false
+}
+
+// ResetServiceStallChurn clears the client-abort churn window — called when a
+// data-carrying settlement proves the service behind this (target, node) pair
+// is still alive, so an occasional aborted probe does not accumulate.
+func (r *PLDRecord) ResetServiceStallChurn() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.churnStamps = nil
 }
 
 // GetLastUpdated returns the record's last update timestamp (locked).

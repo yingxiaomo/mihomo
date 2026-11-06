@@ -355,3 +355,78 @@ func TestLargeFlowRewardIndependentOfLatencySampleCount(t *testing.T) {
 		t.Fatalf("large transfer leaked into latency channel: n=%d reward=%v (want %v)", rec.SampleCount, rec.Reward, latencyBefore)
 	}
 }
+
+func TestPLDRecordServiceStallChurnWindow(t *testing.T) {
+	rec := &PLDRecord{}
+	const window = int64(300)
+
+	// Below the limit: no trigger.
+	for i := int64(0); i < 3; i++ {
+		if rec.NoteServiceStallChurn(1000+i, window, 4) {
+			t.Fatalf("event %d must not trigger before the limit", i+1)
+		}
+	}
+	// Fourth event within the window: trigger, and the window is consumed.
+	if !rec.NoteServiceStallChurn(1003, window, 4) {
+		t.Fatalf("4th event within the window must trigger")
+	}
+	// After firing, the window restarts from empty: the next event must not
+	// immediately re-trigger.
+	if rec.NoteServiceStallChurn(1004, window, 4) {
+		t.Fatalf("window must be consumed after firing")
+	}
+}
+
+func TestPLDRecordServiceStallChurnExpiry(t *testing.T) {
+	rec := &PLDRecord{}
+	const window = int64(300)
+
+	// Old stamps are pruned: three events, then a gap larger than the window
+	// resets the count, so the next single event must not trigger.
+	for i := int64(0); i < 3; i++ {
+		rec.NoteServiceStallChurn(1000+i, window, 4)
+	}
+	if rec.NoteServiceStallChurn(1000+window+10, window, 4) {
+		t.Fatalf("stamps outside the window must not count toward the limit")
+	}
+	// Filling the window again after the gap does trigger: two more events
+	// reach a count of three, the fourth triggers.
+	for i := int64(1); i < 3; i++ {
+		if rec.NoteServiceStallChurn(1000+window+10+i, window, 4) {
+			t.Fatalf("event %d after the gap must not trigger yet", i)
+		}
+	}
+	if !rec.NoteServiceStallChurn(1000+window+13, window, 4) {
+		t.Fatalf("4th event after the gap must trigger")
+	}
+}
+
+func TestPLDRecordServiceStallChurnReset(t *testing.T) {
+	rec := &PLDRecord{}
+	const window = int64(300)
+
+	for i := int64(0); i < 3; i++ {
+		rec.NoteServiceStallChurn(1000+i, window, 4)
+	}
+	// A data-carrying settlement clears the window: the next three aborted
+	// probes are not enough to trigger.
+	rec.ResetServiceStallChurn()
+	for i := int64(0); i < 3; i++ {
+		if rec.NoteServiceStallChurn(2000+i, window, 4) {
+			t.Fatalf("window must start empty after a data-carrying reset")
+		}
+	}
+	if !rec.NoteServiceStallChurn(2003, window, 4) {
+		t.Fatalf("4th event after reset must trigger")
+	}
+}
+
+func TestPLDRecordServiceStallChurnDisabled(t *testing.T) {
+	rec := &PLDRecord{}
+	// limit <= 0 disables the detector entirely.
+	for i := int64(0); i < 10; i++ {
+		if rec.NoteServiceStallChurn(1000+i, 300, 0) {
+			t.Fatalf("limit 0 must never trigger")
+		}
+	}
+}

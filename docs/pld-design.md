@@ -40,6 +40,7 @@ PLD 已从官方 smart 组中**彻底解耦**，目标：官方文件回滚到 v
 ### 开关（完全独立）
 - 官方 `smart` 组：`uselightgbm`/`collectdata`/`sample-rate`/`prefer-asn`/`tolerance`/`policy-priority`（上游原样）
 - `smart-pld` 组：`pld-collect`/`prior-weight`/`prior-decay-k`/`explore-strength`/`sample-rate`/`prefer-asn`/`tolerance`/`policy-priority`（PLD 专属，无官方开关）
+- `smart-pld` 质量门/服务失活：`first-byte-gate-ms`（默认 5000）/`zero-progress-ms`（默认 10000）/`failure-cooldown-sec`（默认 60）/`service-stall-detect`（默认开：客户端放弃型连接的滑动窗检测，应对"节点活着但服务已死"）
 
 ### 配置示例
 ```yaml
