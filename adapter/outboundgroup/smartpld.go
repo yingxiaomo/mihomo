@@ -2324,6 +2324,22 @@ const (
 	stallBlockCode int64 = 9
 )
 
+// isDnsBootstrapTarget reports whether the target is a DoH/DoT resolver
+// endpoint (the "*.<host>..." wildcard of a DNS service, e.g. the default
+// "doh.pub" bootstrap). Those endpoints produce chronic internal retry churn
+// (the known doh.pubdefault bootstrap noise, excluded from sampling for the
+// same reason) that would keep filling the churn window and cool off healthy
+// nodes for traffic whose experience the detector does not measure. When the
+// proper kernel-side DNS-bootstrap exclusion lands, key this off it instead.
+func isDnsBootstrapTarget(target string) bool {
+	for _, marker := range []string{"doh.", "dns.", "dot."} {
+		if strings.Contains(target, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate,
 	connectionDuration int64, tcpStats *tcpstats.Stats, bytesTo64KMs int64, err error, pldFailureLatched *pldConnectionOutcome, shadowTTFR ...*pldTTFRObservation) {
@@ -2363,7 +2379,7 @@ func (s *SmartPLD) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		if tgt == "" {
 			tgt = metadata.WildcardTarget
 		}
-		if tgt != "" {
+		if tgt != "" && !isDnsBootstrapTarget(tgt) {
 			rec := s.getPLDRecord(tgt, proxy.Name())
 			if rec.NoteServiceStallChurn(time.Now().Unix(), stallChurnWindowSec, stallChurnLimit) {
 				pldFailureLatched.failed = true
