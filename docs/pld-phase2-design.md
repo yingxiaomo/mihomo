@@ -1,6 +1,8 @@
-# Phase 2 设计规范：场景感知多指标选路（草案 v0.1，待评审）
+# Phase 2 设计规范：场景感知多指标选路（v0.2，影子已实现）
 
-状态：**草案**——设计决策待用户确认 + 并行 AI 审查后冻结，冻结前不动代码。
+状态：**v0.2 影子实现完成**（默认 shadow-only，行为零变更）。
+实现：`adapter/outboundgroup/scenario.go` + `computePLDWeights` 接入 +
+`scenario-weighting` 组选项。硬亲和延迟到 active 阶段（见 §4）。
 
 ## 0. 依据（观察期结论）
 
@@ -29,58 +31,54 @@
 - 不做每请求动态权重学习（静态分类表起步，regret 数据后续喂）。
 - 不动先验模型层（待 EB 基线结论：若查表可打平则考虑简化，默认保留）。
 
-## 2. 场景分类（静态起步）
+## 2. 场景分类（静态起步，已实现）
 
-复用内核已有域名分类器（`lightgbm.go` 的 domainKeywordEntry：dns/api/communication/
-game/streaming 五类 + 既有关键词表），按 target 归类：
+复用内核已有域名分类器（`ClassifyDomainFeature`，与模型 domain-type 特征同表），
+按 target 归类。**实现修订**：game 类目标落在 interactive 而非 bulk——游戏下载
+通常走 DIRECT 规则不进智能组，经 PLD 的游戏流量是会话型；bulk 只匹配显式
+下载信号（download/steamcontent/mirror/pkg 等保守关键词表）。
 
-| 场景类 | 典型目标 | 通道语义 |
-|---|---|---|
-| realtime | dns/api/communication（TG、IM、API） | 小流量：connect + ttfr + stall 惩罚 |
-| interactive | streaming/web 默认 | 混合：connect + thr 中庸 + stall |
-| bulk | game 下载/大文件 | 大流量：thr + loss |
+| 场景类 | 典型目标 | 小通道权重 | 语义 |
+|---|---|---|---|
+| realtime | dns/api/communication（TG、IM、API） | 0.75 | 信令主导，锚点选择偏延迟通道 |
+| interactive | streaming/game/未分类 | 0.50 | 混合，等同现行每请求通道行为 |
+| bulk | 显式下载端点 | 0.25 | 吞吐主导（+硬亲和，active 阶段） |
 
-映射规则：优先对 wildcardTarget 的 host 过既有分类器；集合级 target
-（如 `GeoSite [telegram]`）对 target 名做同表关键词匹配；未命中 → interactive。
-分类结果按 target 缓存（进程内 map，目标级，无每请求开销）。
+## 3. 评分合成（已实现，v0.2 修订）
 
-## 3. 评分合成
-
-Phase 1 的 `ScenarioScore(large bool)`（二通道）扩展为 `ScenarioScoreFor(class)`：
+实现采用**通道混合**而非独立三分量公式——复用已被验证的双通道数据结构：
 
 ```
-realtime:     0.45*connectScore + 0.30*ttfrScore + 0.25*(1-stallRate)
-interactive:  0.30*connectScore + 0.20*ttfrScore + 0.30*thrScore + 0.20*(1-stallRate)
-bulk:         0.65*thrScore + 0.25*lossScore + 0.10*(1-stallRate)
+ucbReward = wS*rewSmall + (1-wS)*rewLarge      // 按类混合通道 reward EMA
+w         = FinalWeight(prior, ucbReward, ...) // D-UCB 机制完全不动
+merged    = applyStallPenalty(merged, stallRate)
+          = merged * (1 - 0.5 * stallRate)     // 合并官方权重后统一降权
 ```
 
-- stallRate = SuspectedStallCount/AttemptCount（影子指标已有数据），上限 1.0，
-  样本 <5 时按 0 处理（不给冷节点无谓惩罚）。
-- 各分项沿用 Phase 1 的有效性规则（cnt>0 才计入，缺项权重重分配）。
+- 混合发生在 D-UCB exploit 输入上：prior、探索项、官方协同权重、滞回全部原样。
+- stallRate = SuspectedStallCount/AttemptCount（clamp [0,1]），样本 <5 为 0
+  （冷节点不吃薄证据惩罚）；停滞是"疑似"信号，降权而非冷却（硬失败有自己的路径）。
+- PredictPrior 的输入保持通道匹配 reward（模型自己知道请求上下文，不被混合污染）。
 
-**D-UCB 保留**：探索项不变；exploit 项的输入从 `ChannelStats(large).reward`
-改为场景加权分与 reward EMA 的混合：
-`exploit = w_scenario*ScenarioScoreFor(class) + (1-w_scenario)*rewardEMA`，
-`w_scenario` 按 class 配置（realtime 0.6 / interactive 0.5 / bulk 0.7，起步值）。
-混合而非替换：reward EMA 是在线反馈的兜底，场景分是结构化先验，缺数据时互相补位。
+**D-UCB 保留**：探索项不变；exploit 输入从"本请求通道 reward"变为场景混合 reward。
+混合而非替换：reward EMA 是在线反馈兜底，通道混合是结构化先验。
 
-## 4. 软锚点 / 硬亲和
+## 4. 软锚点 / 硬亲和（active 阶段实现）
 
-- 现状即软锚点（unwrap primary + 滞回 + margin）。**bulk 类升级硬亲和**：
-  同 target 会话粘性优先——只有当前锚点失败/冷却时才切换，不因 margin 竞争者
-  漂移（游戏会话换 IP 断连代价 > 吞吐优化收益）。
-- 硬亲和实现点：hysteresis 块中 bulk 类 target 的 challenger 门槛从
-  `margin` 提高为 `margin × 3`（实质等效不切，仍保留故障兜底）。
+- 现状即软锚点（unwrap primary + 滞回 + margin）。
+- **bulk 类硬亲和延迟到 active 切换时实现**（影子阶段 bulk 混合权重不生效，
+  硬亲和无对象）：同 target 会话粘性优先，challenger 门槛从 `margin` 提高为
+  `margin × 3`，故障/冷却兜底保留。
 
-## 5. 影子先行（灰度）
+## 5. 影子先行（灰度，已实现）
 
-1. 实现期：场景分与现行 FinalWeight **并行计算**，每个选择决策记一条
-   `[PLD-Phase2] shadow: group=%s target=%s class=%s current=%s scenario=%s agree=%v`
-   （debug 级，避免刷爆日志——采样 1/50）。
-2. 对比期 3-4 天：离线用影子数据重算 regret（同 analyze_regret 口径），
-   场景选择 ≤ 现行选择遗憾才准切换。
+1. 影子模式（默认）：每 50 次选路决策采样一条 debug 日志——
+   `[PLD-Phase2] shadow: Group/Target/Class/Current/Scenario/Agree`，
+   Current = 现行排序 top-1，Scenario = 场景混合+停滞惩罚重算的 top-1。
+2. 对比期 3-4 天：统计 Agree 率 + 离线用影子数据重算 regret（同
+   analyze_regret 口径），场景选择 ≤ 现行选择遗憾才准切换。
 3. 切换开关：`scenario-weighting: *bool`（指针语义，默认 false=影子），
-   每组可独立开关；`scenario-weights` 可选 JSON 覆盖默认权重表。
+   每组可独立开关。
 
 ## 6. 配置与兼容
 

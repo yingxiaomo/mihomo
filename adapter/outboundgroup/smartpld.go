@@ -124,6 +124,13 @@ type SmartPLDOption struct {
 	// failure transaction as a gate. Pointer semantics: nil = unset
 	// (default on), explicit true/false overrides.
 	ServiceStallDetect *bool `group:"service-stall-detect,omitempty"`
+	// ScenarioWeighting enables the Phase 2 scenario layer (see
+	// docs/pld-phase2-design.md): the D-UCB exploit reward is blended across
+	// the small/large channels per the target's demand class and demoted by
+	// the record's stall rate. Pointer semantics: nil = unset (default
+	// false = SHADOW ONLY — the scenario ranking is computed and logged at
+	// debug level 1/50 for comparison, but selection is unchanged).
+	ScenarioWeighting *bool `group:"scenario-weighting,omitempty"`
 }
 
 type SmartPLD struct {
@@ -165,6 +172,12 @@ type SmartPLD struct {
 	// serviceStallDetect arms the client-abort churn detector (default on):
 	// see ServiceStallDetect and the serviceStall constants below.
 	serviceStallDetect bool
+
+	// scenarioWeighting activates the Phase 2 scenario layer (default off =
+	// shadow-only comparison). See scenario.go for the classification and
+	// blending semantics.
+	scenarioWeighting bool
+	scenarioShadowN   atomic.Int64 // sampled shadow-comparison counter
 
 	// pldRecordCache caches per-(target,node) reward state in memory; persisted
 	// under the independent "pld:" key namespace of the shared smart.db.
@@ -274,6 +287,11 @@ func NewSmartPLD(option GroupCommonOption, smartOption SmartPLDOption, emptyFall
 	// Service-stall detection (client-abort churn): default on; an explicit
 	// config value always wins so it can be disabled without a rebuild.
 	s.serviceStallDetect = smartOption.ServiceStallDetect == nil || *smartOption.ServiceStallDetect
+
+	// Phase 2 scenario layer: default off (shadow-only comparison; the
+	// scenario ranking is computed and logged for evaluation but selection
+	// is unchanged). An explicit true activates it per group.
+	s.scenarioWeighting = smartOption.ScenarioWeighting != nil && *smartOption.ScenarioWeighting
 
 	if smartOption.PolicyPriority != "" {
 		applyPolicyPriorityPLD(s, smartOption.PolicyPriority)
@@ -1482,6 +1500,11 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 
 	target := metadata.SmartTarget
 
+	// Phase 2 scenario layer: the target's demand class drives the channel
+	// blend (active mode) and the stall-rate demotion. Classified once per
+	// call — the result is target-level, not per-candidate.
+	scenarioClass := classifyScenario(target)
+
 	type scoreEntry struct {
 		name     string
 		prior    float64 // 阶段一：PriorModel 先验分（标签域 [-2,1]，无模型时为中性 0）
@@ -1498,6 +1521,11 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 	delays := make(map[string]float64, len(names))
 	nodeTypes := make(map[string]float64, len(names))
 	thrByName := make(map[string]float64, len(names))
+	// Phase 2 scenario layer inputs: per-candidate channel rewards and stall
+	// rate, collected alongside the channel-matched reward.
+	rewSmallMap := make(map[string]float64, len(names))
+	rewLargeMap := make(map[string]float64, len(names))
+	stallMap := make(map[string]float64, len(names))
 
 	// 该 target 的累计流量统计（画像聚合用）：所有候选节点记录的
 	// downloadTotal / sampleCount / maxDownloadRate 汇总 → 平均单次下载量。
@@ -1518,10 +1546,15 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 		// feedback.
 		pldRec := s.getPLDRecord(target, name)
 		rew, rv, cnt := pldRec.ChannelStats(largeMode)
+		rewS, _, _ := pldRec.ChannelStats(false)
+		rewL, _, _ := pldRec.ChannelStats(true)
 		rewards[name] = rew
 		counts[name] = float64(cnt)
 		rewardVars[name] = rv
 		thrByName[name] = pldRec.ThrKBps()
+		rewSmallMap[name] = rewS
+		rewLargeMap[name] = rewL
+		stallMap[name] = pldRec.StallRate()
 		totalSamples += cnt
 		cntTotal += cnt
 		cacheKey := smart.FormatDBKey(smart.KeyTypeStats, s.configName, s.Name(), target, name)
@@ -1554,7 +1587,15 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 		} else {
 			prior = lightgbm.FlatPrior // flat prior when no model (reward-scale neutral)
 		}
-		w := smart.FinalWeight(prior, rewards[name], int64(counts[name]), totalSamples,
+		// Phase 2: in active mode the D-UCB exploit reward is the scenario-
+		// blended channel mix (realtime leans latency, bulk leans throughput)
+		// instead of this request's channel alone. Shadow mode keeps the
+		// channel-matched reward — identical to pre-Phase-2 behavior.
+		ucbReward := rewards[name]
+		if s.scenarioWeighting {
+			ucbReward = blendChannelRewards(scenarioClass, rewSmallMap[name], rewLargeMap[name])
+		}
+		w := smart.FinalWeight(prior, ucbReward, int64(counts[name]), totalSamples,
 			s.priorWeight, s.priorDecayK, s.exploreStrength)
 
 		// Cooperative scoring: blend the official rule weight (historical
@@ -1572,6 +1613,11 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 		merged := w
 		if s.officialWeight > 0 && officialW > 0 {
 			merged = (1-s.officialWeight)*w + s.officialWeight*officialW
+		}
+		// Phase 2: stall-rate demotion on the merged weight (active mode).
+		// Graded demotion — hard failures keep their own cool-off path.
+		if s.scenarioWeighting {
+			merged = applyStallPenalty(merged, stallMap[name])
 		}
 		entries = append(entries, scoreEntry{name: name, prior: prior, pld: w, official: officialW, w: merged})
 	}
@@ -1608,6 +1654,28 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 		}
 		log.Debugln("[PLD-Track] Group: [%s] Target: [%s] Ch:[%s] DomainLevel:[%d] Rank(%d): %s",
 			s.Name(), target, chStr, int(features.DomainTrafficLevel), len(entries), b.String())
+	}
+
+	// Phase 2 shadow: recompute the ranking under scenario blending + stall
+	// penalty and compare the top-1 against the active ranking. Sampled
+	// (1/50) debug log — zero selection impact (docs/pld-phase2-design.md §5).
+	if !s.scenarioWeighting && len(entries) > 1 && s.scenarioShadowN.Add(1)%50 == 1 {
+		curTop := entries[0].name
+		bestName, bestScore := curTop, math.Inf(-1)
+		for _, e := range entries {
+			sw := blendChannelRewards(scenarioClass, rewSmallMap[e.name], rewLargeMap[e.name])
+			swFinal := smart.FinalWeight(e.prior, sw, int64(counts[e.name]), totalSamples,
+				s.priorWeight, s.priorDecayK, s.exploreStrength)
+			if s.officialWeight > 0 && e.official > 0 {
+				swFinal = (1-s.officialWeight)*swFinal + s.officialWeight*e.official
+			}
+			swFinal = applyStallPenalty(swFinal, stallMap[e.name])
+			if swFinal > bestScore {
+				bestScore, bestName = swFinal, e.name
+			}
+		}
+		log.Debugln("[PLD-Phase2] shadow: Group: [%s] Target: [%s] Class: [%s] Current: [%s] Scenario: [%s] Agree: %v",
+			s.Name(), target, scenarioClass.String(), curTop, bestName, bestName == curTop)
 	}
 
 	outNames := make([]string, len(entries))

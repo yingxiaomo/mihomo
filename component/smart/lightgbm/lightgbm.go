@@ -839,6 +839,14 @@ func extractDomainTypeFeature(host string) int {
 	return 0
 }
 
+// ClassifyDomainFeature exposes the domain keyword classifier (the same
+// tables that build the model's domain-type feature) for the scenario
+// layer: 6=dns 5=api 4=communication 3=game 2=streaming 1=set/IP target
+// 0=unknown 10-15=TLD 30/31=generic domain.
+func ClassifyDomainFeature(host string) int {
+	return extractDomainTypeFeature(host)
+}
+
 func extractIPFeature(ipAddr string) int {
 	if ipAddr == "" {
 		return 0

@@ -430,3 +430,27 @@ func TestPLDRecordServiceStallChurnDisabled(t *testing.T) {
 		}
 	}
 }
+
+func TestPLDRecordStallRate(t *testing.T) {
+	rec := &PLDRecord{}
+	if rec.StallRate() != 0 {
+		t.Fatalf("empty record must report zero stall rate")
+	}
+	// Thin evidence: below the 5-settlement minimum the rate is suppressed.
+	rec.AttemptCount = 3
+	rec.SuspectedStallCount = 3
+	if rec.StallRate() != 0 {
+		t.Fatalf("thin-evidence record must report zero stall rate")
+	}
+	// Normal case.
+	rec.AttemptCount = 10
+	rec.SuspectedStallCount = 3
+	if got := rec.StallRate(); got < 0.2999 || got > 0.3001 {
+		t.Fatalf("stall rate = %v, want 0.3", got)
+	}
+	// Clamp: stall observations can exceed settled attempts (mid-flight).
+	rec.SuspectedStallCount = 20
+	if got := rec.StallRate(); got != 1.0 {
+		t.Fatalf("stall rate must clamp to 1.0, got %v", got)
+	}
+}

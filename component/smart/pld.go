@@ -496,6 +496,22 @@ func (r *PLDRecord) RecordStall() {
 // separate raw diagnostic, not a component of this TCP-oriented score.
 // Returns 0.5 (neutral) when there are
 // fewer than 2 attempts (not enough observations for a meaningful score).
+// StallRate returns the header-then-stall ratio over completed settlements,
+// clamped to [0,1] (the stall timer can fire mid-connection before the
+// settlement increments AttemptCount). Zero for records with fewer than
+// stallMinSamples settlements — cold nodes must not be penalized on thin
+// evidence.
+func (r *PLDRecord) StallRate() float64 {
+	const stallMinSamples = 5
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.AttemptCount < stallMinSamples {
+		return 0
+	}
+	rate := float64(r.SuspectedStallCount) / float64(r.AttemptCount)
+	return math.Min(1.0, rate)
+}
+
 func (r *PLDRecord) ScenarioScore(large bool) float64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
