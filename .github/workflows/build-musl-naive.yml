@@ -94,6 +94,7 @@ jobs:
         shell: bash
 
       - name: Cache Chromium toolchain
+        id: toolchain-cache
         uses: actions/cache@v4
         with:
           path: |
@@ -104,11 +105,23 @@ jobs:
           key: chromium-toolchain-${{ matrix.arch }}-musl-${{ env.CRONET_GO_VERSION }}
 
       - name: Regenerate Debian keyring
+        # Only needed when the toolchain cache misses (the sysroot build
+        # verifies Debian archive keys once, during toolchain download).
+        # The public keyserver has outages - retry with backoff instead of
+        # failing the whole 10-arch matrix.
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
         run: |
           set -xeuo pipefail
           rm -f ~/cronet-go/naiveproxy/src/build/linux/sysroot_scripts/keyring.gpg
           cd ~/cronet-go
-          GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh
+          for i in 1 2 3 4 5; do
+            if GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh; then
+              exit 0
+            fi
+            echo "keyring regeneration attempt $i failed, retrying in 30s"
+            sleep 30
+          done
+          exit 1
         shell: bash
 
       - name: Download Chromium toolchain
