@@ -1657,9 +1657,12 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 	}
 
 	// Phase 2 shadow: recompute the ranking under scenario blending + stall
-	// penalty and compare the top-1 against the active ranking. Sampled
-	// (1/50) debug log — zero selection impact (docs/pld-phase2-design.md §5).
-	if !s.scenarioWeighting && len(entries) > 1 && s.scenarioShadowN.Add(1)%50 == 1 {
+	// penalty and compare the top-1 against the active ranking. Every
+	// decision updates the per-class counters (readable via
+	// GET /cache/smart/scenario — survives log rotation); the debug log is
+	// additionally sampled (1/50). Zero selection impact
+	// (docs/pld-phase2-design.md §5).
+	if !s.scenarioWeighting && len(entries) > 1 {
 		curTop := entries[0].name
 		bestName, bestScore := curTop, math.Inf(-1)
 		for _, e := range entries {
@@ -1674,8 +1677,12 @@ func (s *SmartPLD) computePLDWeights(metadata *C.Metadata, names []string, proxi
 				bestScore, bestName = swFinal, e.name
 			}
 		}
-		log.Debugln("[PLD-Phase2] shadow: Group: [%s] Target: [%s] Class: [%s] Current: [%s] Scenario: [%s] Agree: %v",
-			s.Name(), target, scenarioClass.String(), curTop, bestName, bestName == curTop)
+		agree := bestName == curTop
+		recordShadowOutcome(scenarioClass, agree)
+		if s.scenarioShadowN.Add(1)%50 == 1 {
+			log.Debugln("[PLD-Phase2] shadow: Group: [%s] Target: [%s] Class: [%s] Current: [%s] Scenario: [%s] Agree: %v",
+				s.Name(), target, scenarioClass.String(), curTop, bestName, agree)
+		}
 	}
 
 	outNames := make([]string, len(entries))

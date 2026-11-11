@@ -2,6 +2,7 @@ package outboundgroup
 
 import (
 	"strings"
+	"sync/atomic"
 
 	"github.com/metacubex/mihomo/component/smart/lightgbm"
 )
@@ -131,4 +132,40 @@ func applyStallPenalty(weight, stallRate float64) float64 {
 		stallRate = 1
 	}
 	return weight * (1 - scenarioStallPenaltyWeight*stallRate)
+}
+
+// Shadow comparison counters: per class, how often the scenario ranking's
+// top-1 agrees with the active ranking's top-1. Accumulated on every
+// shadow-mode selection decision (in-memory, survives log rotation, resets
+// on restart). Read via GET /cache/smart/scenario. Arrays are indexed —
+// never copied — so the embedded atomics stay valid.
+var (
+	scenarioShadowAgree [3]uint64Counters
+	scenarioShadowTotal [3]uint64Counters
+)
+
+// uint64Counters is a tiny atomic pair used by index only.
+type uint64Counters struct {
+	agree atomic.Uint64
+	total atomic.Uint64
+}
+
+func recordShadowOutcome(sc ScenarioClass, agree bool) {
+	scenarioShadowTotal[sc].total.Add(1)
+	if agree {
+		scenarioShadowAgree[sc].agree.Add(1)
+	}
+}
+
+// ScenarioShadowStats returns a snapshot of the shadow comparison counters
+// keyed by class name: {"realtime": {"agree": n, "total": m}, ...}.
+func ScenarioShadowStats() map[string]map[string]uint64 {
+	out := make(map[string]map[string]uint64, 3)
+	for sc := ScenarioRealtime; sc <= ScenarioBulk; sc++ {
+		out[sc.String()] = map[string]uint64{
+			"agree": scenarioShadowAgree[sc].agree.Load(),
+			"total": scenarioShadowTotal[sc].total.Load(),
+		}
+	}
+	return out
 }

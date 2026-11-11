@@ -3,6 +3,7 @@ package route
 import (
 	"encoding/json"
 
+	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/smart"
@@ -18,6 +19,7 @@ func cacheRouter() http.Handler {
 	r.Post("/smart/flush", flushAllSmartCache)
 	r.Post("/smart/flush/{config}", flushSmartConfigCache)
 	r.Get("/smart/pld", getSmartPLDState)
+	r.Get("/smart/scenario", getSmartScenarioState)
 	r.Post("/dns/flush", flushDnsCache)
 	return r
 }
@@ -124,6 +126,14 @@ func getSmartPLDState(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	render.JSON(w, r, states)
+}
+
+// getSmartScenarioState exposes the Phase 2 shadow comparison counters
+// (per demand class: scenario top-1 agreement with the active ranking).
+// In-memory and reset on restart — this is the multi-day observation source
+// that survives the scheduled core-log clears.
+func getSmartScenarioState(w http.ResponseWriter, r *http.Request) {
+	render.JSON(w, r, outboundgroup.ScenarioShadowStats())
 }
 
 func flushDnsCache(w http.ResponseWriter, r *http.Request) {
